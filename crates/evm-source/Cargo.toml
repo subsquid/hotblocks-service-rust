@@ -1,0 +1,29 @@
+[package]
+name = "evm-source"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+data-service-core = { path = "../data-service-core" }
+rpc-client = { path = "../rpc-client" }
+
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+async-stream.workspace = true
+tokio-stream.workspace = true
+zstd.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-trie.workspace = true
+k256.workspace = true
+sha3.workspace = true
+hex.workspace = true
+
+async-recursion = "1"

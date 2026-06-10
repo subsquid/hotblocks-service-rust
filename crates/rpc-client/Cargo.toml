@@ -1,0 +1,21 @@
+[package]
+name = "rpc-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+async-recursion = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,29 @@
+[package]
+name = "data-service-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+zstd = { workspace = true }
+flate2 = { workspace = true }
+prometheus = { workspace = true }
+async-stream = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+async-stream = { workspace = true }
