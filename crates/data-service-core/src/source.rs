@@ -54,7 +54,8 @@ pub trait DataSource: Send + Sync + 'static {
     ///
     /// The stream yields batches until the source decides to stop or a fork is
     /// detected, at which point it emits `StreamError::Fork`.
-    fn get_stream(&self, req: StreamRequest) -> BoxStream<'static, Result<BlockBatch, StreamError>>;
+    fn get_stream(&self, req: StreamRequest)
+        -> BoxStream<'static, Result<BlockBatch, StreamError>>;
 
     /// Open a stream of finalized block batches up to `req.to`.
     fn get_finalized_stream(

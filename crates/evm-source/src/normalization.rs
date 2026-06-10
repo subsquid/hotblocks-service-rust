@@ -455,39 +455,54 @@ fn map_tempo_primitive_sig(src: &TempoPrimitiveSignature) -> NormalizedTempoPrim
                 v: v.as_deref().map(qty2_u64),
             }
         }
-        TempoPrimitiveSignature::P256 { r, s, pub_key_x, pub_key_y, pre_hash } => {
-            NormalizedTempoPrimitiveSig::P256 {
-                r: r.clone(),
-                s: s.clone(),
-                pub_key_x: pub_key_x.clone(),
-                pub_key_y: pub_key_y.clone(),
-                pre_hash: *pre_hash,
-            }
-        }
-        TempoPrimitiveSignature::WebAuthn { r, s, pub_key_x, pub_key_y, webauthn_data } => {
-            NormalizedTempoPrimitiveSig::WebAuthn {
-                r: r.clone(),
-                s: s.clone(),
-                pub_key_x: pub_key_x.clone(),
-                pub_key_y: pub_key_y.clone(),
-                webauthn_data: webauthn_data.clone(),
-            }
-        }
+        TempoPrimitiveSignature::P256 {
+            r,
+            s,
+            pub_key_x,
+            pub_key_y,
+            pre_hash,
+        } => NormalizedTempoPrimitiveSig::P256 {
+            r: r.clone(),
+            s: s.clone(),
+            pub_key_x: pub_key_x.clone(),
+            pub_key_y: pub_key_y.clone(),
+            pre_hash: *pre_hash,
+        },
+        TempoPrimitiveSignature::WebAuthn {
+            r,
+            s,
+            pub_key_x,
+            pub_key_y,
+            webauthn_data,
+        } => NormalizedTempoPrimitiveSig::WebAuthn {
+            r: r.clone(),
+            s: s.clone(),
+            pub_key_x: pub_key_x.clone(),
+            pub_key_y: pub_key_y.clone(),
+            webauthn_data: webauthn_data.clone(),
+        },
     }
 }
 
 fn map_tempo_sig(src: &TempoSignatureObject) -> NormalizedTempoSig {
     match src {
-        TempoSignatureObject::Keychain(k) => NormalizedTempoSig::Keychain(NormalizedTempoKeychainSig {
-            user_address: k.user_address.to_lowercase(),
-            signature: map_tempo_primitive_sig(&k.signature),
-            version: k.version.clone(),
-        }),
-        TempoSignatureObject::Primitive(p) => NormalizedTempoSig::Primitive(map_tempo_primitive_sig(p)),
+        TempoSignatureObject::Keychain(k) => {
+            NormalizedTempoSig::Keychain(NormalizedTempoKeychainSig {
+                user_address: k.user_address.to_lowercase(),
+                signature: map_tempo_primitive_sig(&k.signature),
+                version: k.version.clone(),
+            })
+        }
+        TempoSignatureObject::Primitive(p) => {
+            NormalizedTempoSig::Primitive(map_tempo_primitive_sig(p))
+        }
     }
 }
 
-pub fn map_transaction(src: &RpcTransaction, receipt: Option<&RpcReceipt>) -> NormalizedTransaction {
+pub fn map_transaction(
+    src: &RpcTransaction,
+    receipt: Option<&RpcReceipt>,
+) -> NormalizedTransaction {
     let tx_type = src.tx_type.as_deref().map(qty2_u64);
 
     NormalizedTransaction {
@@ -507,45 +522,72 @@ pub fn map_transaction(src: &RpcTransaction, receipt: Option<&RpcReceipt>) -> No
         r: src.r.clone(),
         s: src.s.clone(),
         y_parity: src.y_parity.as_deref().map(qty2_u64),
-        access_list: src.access_list.as_deref().map(|al| al.iter().map(map_access_list_item).collect()),
+        access_list: src
+            .access_list
+            .as_deref()
+            .map(|al| al.iter().map(map_access_list_item).collect()),
         chain_id: src.chain_id.as_deref().and_then(safe_qty2_u64),
         max_fee_per_blob_gas: src.max_fee_per_blob_gas.clone(),
         blob_versioned_hashes: src.blob_versioned_hashes.clone(),
-        authorization_list: src.authorization_list.as_deref().map(|al| al.iter().map(map_eip7702_auth).collect()),
-        calls: src.calls.as_deref().map(|calls| calls.iter().map(|c| NormalizedTempoCall {
-            to: c.to.as_deref().map(|s| s.to_lowercase()),
-            value: c.value.clone(),
-            input: c.input.clone(),
-        }).collect()),
+        authorization_list: src
+            .authorization_list
+            .as_deref()
+            .map(|al| al.iter().map(map_eip7702_auth).collect()),
+        calls: src.calls.as_deref().map(|calls| {
+            calls
+                .iter()
+                .map(|c| NormalizedTempoCall {
+                    to: c.to.as_deref().map(|s| s.to_lowercase()),
+                    value: c.value.clone(),
+                    input: c.input.clone(),
+                })
+                .collect()
+        }),
         nonce_key: src.nonce_key.clone(),
         signature: src.signature.as_ref().map(map_tempo_sig),
         fee_token: src.fee_token.as_deref().map(|s| s.to_lowercase()),
-        fee_payer_signature: src.fee_payer_signature.as_ref().map(|fp| NormalizedFeePayerSig {
-            v: qty2_u64(&fp.v),
-            r: fp.r.clone(),
-            s: fp.s.clone(),
-        }),
+        fee_payer_signature: src
+            .fee_payer_signature
+            .as_ref()
+            .map(|fp| NormalizedFeePayerSig {
+                v: qty2_u64(&fp.v),
+                r: fp.r.clone(),
+                s: fp.s.clone(),
+            }),
         valid_before: src.valid_before.clone(),
         valid_after: src.valid_after.clone(),
-        aa_authorization_list: src.aa_authorization_list.as_deref().map(|al| al.iter().map(|a| NormalizedTempoSignedAuth {
-            chain_id: a.chain_id.clone(),
-            address: a.address.to_lowercase(),
-            nonce: qty2_u64(&a.nonce),
-            signature: map_tempo_sig(&a.signature),
-        }).collect()),
-        key_authorization: src.key_authorization.as_ref().map(|ka| NormalizedTempoKeyAuth {
-            chain_id: ka.chain_id.clone(),
-            key_type: ka.key_type.clone(),
-            key_id: ka.key_id.to_lowercase(),
-            expiry: ka.expiry.clone(),
-            limits: ka.limits.as_deref().map(|lims| lims.iter().map(|l| NormalizedTempoTokenLimit {
-                token: l.token.to_lowercase(),
-                limit: l.limit.clone(),
-            }).collect()),
-            signature: map_tempo_primitive_sig(&ka.signature),
+        aa_authorization_list: src.aa_authorization_list.as_deref().map(|al| {
+            al.iter()
+                .map(|a| NormalizedTempoSignedAuth {
+                    chain_id: a.chain_id.clone(),
+                    address: a.address.to_lowercase(),
+                    nonce: qty2_u64(&a.nonce),
+                    signature: map_tempo_sig(&a.signature),
+                })
+                .collect()
         }),
+        key_authorization: src
+            .key_authorization
+            .as_ref()
+            .map(|ka| NormalizedTempoKeyAuth {
+                chain_id: ka.chain_id.clone(),
+                key_type: ka.key_type.clone(),
+                key_id: ka.key_id.to_lowercase(),
+                expiry: ka.expiry.clone(),
+                limits: ka.limits.as_deref().map(|lims| {
+                    lims.iter()
+                        .map(|l| NormalizedTempoTokenLimit {
+                            token: l.token.to_lowercase(),
+                            limit: l.limit.clone(),
+                        })
+                        .collect()
+                }),
+                signature: map_tempo_primitive_sig(&ka.signature),
+            }),
         // Receipt fields
-        contract_address: receipt.and_then(|r| r.contract_address.as_deref()).map(|s| s.to_lowercase()),
+        contract_address: receipt
+            .and_then(|r| r.contract_address.as_deref())
+            .map(|s| s.to_lowercase()),
         cumulative_gas_used: receipt.map(|r| r.cumulative_gas_used.clone()),
         effective_gas_price: receipt.and_then(|r| r.effective_gas_price.clone()),
         gas_used: receipt.map(|r| r.gas_used.clone()),
@@ -553,11 +595,17 @@ pub fn map_transaction(src: &RpcTransaction, receipt: Option<&RpcReceipt>) -> No
         status: receipt.map(|r| qty2_u64(&r.status)),
         blob_gas_used: receipt.and_then(|r| r.blob_gas_used.clone()),
         blob_gas_price: receipt.and_then(|r| r.blob_gas_price.clone()),
-        l1_base_fee_scalar: receipt.and_then(|r| r.l1_base_fee_scalar.as_deref()).map(qty2_u64),
+        l1_base_fee_scalar: receipt
+            .and_then(|r| r.l1_base_fee_scalar.as_deref())
+            .map(qty2_u64),
         l1_blob_base_fee: receipt.and_then(|r| r.l1_blob_base_fee.clone()),
-        l1_blob_base_fee_scalar: receipt.and_then(|r| r.l1_blob_base_fee_scalar.as_deref()).map(qty2_u64),
+        l1_blob_base_fee_scalar: receipt
+            .and_then(|r| r.l1_blob_base_fee_scalar.as_deref())
+            .map(qty2_u64),
         l1_fee: receipt.and_then(|r| r.l1_fee.clone()),
-        l1_fee_scalar: receipt.and_then(|r| r.l1_fee_scalar.as_deref()).and_then(|s| s.parse::<f64>().ok()),
+        l1_fee_scalar: receipt
+            .and_then(|r| r.l1_fee_scalar.as_deref())
+            .and_then(|s| s.parse::<f64>().ok()),
         l1_gas_price: receipt.and_then(|r| r.l1_gas_price.clone()),
         l1_gas_used: receipt.and_then(|r| r.l1_gas_used.clone()),
     }
@@ -596,11 +644,13 @@ fn map_trace_action(src: &TraceAction) -> NormalizedTraceAction {
             value: r.value.clone(),
             reward_type: r.reward_type.clone(),
         }),
-        TraceAction::Selfdestruct(s) => NormalizedTraceAction::Selfdestruct(NormalizedTraceSelfdestructAction {
-            address: s.address.to_lowercase(),
-            refund_address: s.refund_address.to_lowercase(),
-            balance: Some(s.balance.clone()),
-        }),
+        TraceAction::Selfdestruct(s) => {
+            NormalizedTraceAction::Selfdestruct(NormalizedTraceSelfdestructAction {
+                address: s.address.to_lowercase(),
+                refund_address: s.refund_address.to_lowercase(),
+                balance: Some(s.balance.clone()),
+            })
+        }
     }
 }
 
@@ -611,11 +661,13 @@ fn map_trace_result(src: Option<&TraceResult>) -> Option<NormalizedTraceResult> 
             gas_used: Some(c.gas_used.clone()),
             output: Some(c.output.clone()),
         })),
-        TraceResult::Create(c) => Some(NormalizedTraceResult::Create(NormalizedTraceCreateResult {
-            gas_used: c.gas_used.clone(),
-            code: Some(c.code.clone()),
-            address: Some(c.address.to_lowercase()),
-        })),
+        TraceResult::Create(c) => {
+            Some(NormalizedTraceResult::Create(NormalizedTraceCreateResult {
+                gas_used: c.gas_used.clone(),
+                code: Some(c.code.clone()),
+                address: Some(c.address.to_lowercase()),
+            }))
+        }
     }
 }
 
@@ -703,9 +755,15 @@ pub fn map_debug_frame(
     // STOP type with no subcalls produces no traces
     let frame_type = frame_result.result.frame_type.as_str();
     if frame_type == "STOP"
-        && frame_result.result.calls.as_deref().unwrap_or(&[]).is_empty() {
-            return vec![];
-        }
+        && frame_result
+            .result
+            .calls
+            .as_deref()
+            .unwrap_or(&[])
+            .is_empty()
+    {
+        return vec![];
+    }
 
     let mut traces = Vec::new();
     for item in traverse_debug_frame(&frame_result.result, vec![]) {
@@ -724,15 +782,16 @@ pub fn map_debug_frame(
                     creation_method: None,
                 });
 
-                let result = if frame.gas_used.is_some() || frame.output.is_some() || frame.to.is_some() {
-                    Some(NormalizedTraceResult::Create(NormalizedTraceCreateResult {
-                        gas_used: frame.gas_used.clone().unwrap_or_default(),
-                        code: frame.output.clone(),
-                        address: frame.to.as_deref().map(|s| s.to_lowercase()),
-                    }))
-                } else {
-                    None
-                };
+                let result =
+                    if frame.gas_used.is_some() || frame.output.is_some() || frame.to.is_some() {
+                        Some(NormalizedTraceResult::Create(NormalizedTraceCreateResult {
+                            gas_used: frame.gas_used.clone().unwrap_or_default(),
+                            code: frame.output.clone(),
+                            address: frame.to.as_deref().map(|s| s.to_lowercase()),
+                        }))
+                    } else {
+                        None
+                    };
 
                 Some(NormalizedTrace {
                     transaction_index,
@@ -786,11 +845,12 @@ pub fn map_debug_frame(
                     Some(t) => t.to_lowercase(),
                     None => continue,
                 };
-                let action = NormalizedTraceAction::Selfdestruct(NormalizedTraceSelfdestructAction {
-                    address: frame.from.to_lowercase(),
-                    refund_address: to,
-                    balance: frame.value.clone(),
-                });
+                let action =
+                    NormalizedTraceAction::Selfdestruct(NormalizedTraceSelfdestructAction {
+                        address: frame.from.to_lowercase(),
+                        refund_address: to,
+                        balance: frame.value.clone(),
+                    });
                 Some(NormalizedTrace {
                     transaction_index,
                     trace_address: item.trace_address,
@@ -834,11 +894,17 @@ pub fn map_debug_state_diff(
     // Process all addresses in pre
     for (address, pre_val) in pre {
         let empty_map = serde_json::Map::new();
-        let post_val = post.get(address)
+        let post_val = post
+            .get(address)
             .and_then(|v| v.as_object())
             .unwrap_or(&empty_map);
         let pre_obj = pre_val.as_object().unwrap_or(&empty_map);
-        diffs.extend(map_debug_state_map(transaction_index, address, pre_obj, post_val));
+        diffs.extend(map_debug_state_map(
+            transaction_index,
+            address,
+            pre_obj,
+            post_val,
+        ));
     }
 
     // Process addresses only in post
@@ -846,7 +912,12 @@ pub fn map_debug_state_diff(
         if !pre.contains_key(address) {
             let empty_map = serde_json::Map::new();
             let post_obj = post_val.as_object().unwrap_or(&empty_map);
-            diffs.extend(map_debug_state_map(transaction_index, address, &empty_map, post_obj));
+            diffs.extend(map_debug_state_map(
+                transaction_index,
+                address,
+                &empty_map,
+                post_obj,
+            ));
         }
     }
 
@@ -911,7 +982,9 @@ fn map_debug_state_map(
         for (key, val) in prev_storage {
             let prev_val = val.as_str();
             let next_storage = next.get("storage").and_then(|v| v.as_object());
-            let next_val = next_storage.and_then(|s| s.get(key)).and_then(|v| v.as_str());
+            let next_val = next_storage
+                .and_then(|s| s.get(key))
+                .and_then(|v| v.as_str());
             diffs.push(make_debug_state_diff_record(
                 transaction_index,
                 address,
@@ -958,15 +1031,26 @@ fn make_debug_state_diff_record(
     };
 
     match (prev, next) {
-        (None, Some(n)) => NormalizedStateDiff { kind: "+".to_string(), next: Some(n.to_string()), ..base },
-        (Some(p), None) => NormalizedStateDiff { kind: "-".to_string(), prev: Some(p.to_string()), ..base },
+        (None, Some(n)) => NormalizedStateDiff {
+            kind: "+".to_string(),
+            next: Some(n.to_string()),
+            ..base
+        },
+        (Some(p), None) => NormalizedStateDiff {
+            kind: "-".to_string(),
+            prev: Some(p.to_string()),
+            ..base
+        },
         (Some(p), Some(n)) => NormalizedStateDiff {
             kind: "*".to_string(),
             prev: Some(p.to_string()),
             next: Some(n.to_string()),
             ..base
         },
-        (None, None) => NormalizedStateDiff { kind: "=".to_string(), ..base },
+        (None, None) => NormalizedStateDiff {
+            kind: "=".to_string(),
+            ..base
+        },
     }
 }
 
@@ -984,7 +1068,8 @@ pub fn map_replay_state_diff(
 
         for key in ["code", "balance", "nonce"] {
             if let Some(diff) = diffs_obj.get(key) {
-                if let Some(d) = make_state_diff_from_replay(transaction_index, address, key, diff) {
+                if let Some(d) = make_state_diff_from_replay(transaction_index, address, key, diff)
+                {
                     if d.kind != "=" {
                         diffs.push(d);
                     }
@@ -994,7 +1079,9 @@ pub fn map_replay_state_diff(
 
         if let Some(storage) = diffs_obj.get("storage").and_then(|v| v.as_object()) {
             for (slot_key, diff) in storage {
-                if let Some(d) = make_state_diff_from_replay(transaction_index, address, slot_key, diff) {
+                if let Some(d) =
+                    make_state_diff_from_replay(transaction_index, address, slot_key, diff)
+                {
                     if d.kind != "=" {
                         diffs.push(d);
                     }
@@ -1022,7 +1109,10 @@ fn make_state_diff_from_replay(
     };
 
     if diff.as_str() == Some("=") {
-        return Some(NormalizedStateDiff { kind: "=".to_string(), ..base });
+        return Some(NormalizedStateDiff {
+            kind: "=".to_string(),
+            ..base
+        });
     }
 
     if let Some(obj) = diff.as_object() {
@@ -1079,12 +1169,16 @@ pub fn map_block_header(src: &RpcBlock) -> NormalizedHeader {
         total_difficulty: src.total_difficulty.clone(),
         base_fee_per_gas: src.base_fee_per_gas.clone(),
         uncles: Some(src.uncles.clone()),
-        withdrawals: src.withdrawals.as_deref().map(|ws| ws.iter().map(|w| NormalizedWithdrawal {
-            address: w.address.clone(),
-            amount: w.amount.clone(),
-            index: w.index.clone(),
-            validator_index: w.validator_index.clone(),
-        }).collect()),
+        withdrawals: src.withdrawals.as_deref().map(|ws| {
+            ws.iter()
+                .map(|w| NormalizedWithdrawal {
+                    address: w.address.clone(),
+                    amount: w.amount.clone(),
+                    index: w.index.clone(),
+                    validator_index: w.validator_index.clone(),
+                })
+                .collect()
+        }),
         withdrawals_root: src.withdrawals_root.clone(),
         blob_gas_used: src.blob_gas_used.clone(),
         excess_blob_gas: src.excess_blob_gas.clone(),
@@ -1111,8 +1205,16 @@ pub fn map_rpc_block(raw: &RawRpcBlock, options: &MappingOptions) -> NormalizedB
         header: map_block_header(block),
         transactions: Vec::new(),
         logs: Vec::new(),
-        traces: if options.with_traces { Some(Vec::new()) } else { None },
-        state_diffs: if options.with_state_diffs { Some(Vec::new()) } else { None },
+        traces: if options.with_traces {
+            Some(Vec::new())
+        } else {
+            None
+        },
+        state_diffs: if options.with_state_diffs {
+            Some(Vec::new())
+        } else {
+            None
+        },
     };
 
     // Build tx index: hash → position

@@ -118,13 +118,34 @@ struct Args {
     auto_adjust_finalized_head: bool,
 }
 
+fn sqd_log_filter() -> tracing_subscriber::EnvFilter {
+    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        return filter;
+    }
+
+    // SQD_<LEVEL> env vars (set to a non-empty value, typically "*").
+    // Pick the most verbose level that is set.
+    let levels = [
+        ("SQD_TRACE", "trace"),
+        ("SQD_DEBUG", "debug"),
+        ("SQD_INFO", "info"),
+        ("SQD_WARN", "warn"),
+        ("SQD_ERROR", "error"),
+        ("SQD_FATAL", "error"),
+    ];
+    for (var, level) in &levels {
+        if std::env::var(var).map(|v| !v.is_empty()).unwrap_or(false) {
+            return tracing_subscriber::EnvFilter::new(*level);
+        }
+    }
+
+    tracing_subscriber::EnvFilter::new("info")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(sqd_log_filter())
         .json()
         .init();
 
@@ -184,8 +205,25 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("listening on port {}", handle.port);
 
-    tokio::signal::ctrl_c().await?;
+    // Wait for SIGINT or SIGTERM.
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = sigint.recv() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
     tracing::info!("shutting down");
+
+    // Spawn a task that hard-exits on a second SIGINT while we drain.
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::warn!("second interrupt — forcing exit");
+        std::process::exit(130);
+    });
+
     handle.shutdown().await;
     Ok(())
 }

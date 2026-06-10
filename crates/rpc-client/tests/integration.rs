@@ -1,13 +1,13 @@
 //! Integration tests against a local mock JSON-RPC HTTP server (axum).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use axum::{routing::post, Router, Json, extract::State};
+use axum::{extract::State, routing::post, Json, Router};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-use rpc_client::{RpcClient, RpcClientConfig, CallOptions};
+use rpc_client::{CallOptions, RpcClient, RpcClientConfig};
 
 // ─── Mock server helpers ──────────────────────────────────────────────────────
 
@@ -35,9 +35,10 @@ fn client(url: &str) -> RpcClient {
 async fn echo_handler(Json(body): Json<Value>) -> Json<Value> {
     if let Some(arr) = body.as_array() {
         // batch: respond to each with its id and a result
-        let responses: Vec<Value> = arr.iter().map(|req| {
-            json!({ "jsonrpc": "2.0", "id": req["id"], "result": req["method"] })
-        }).collect();
+        let responses: Vec<Value> = arr
+            .iter()
+            .map(|req| json!({ "jsonrpc": "2.0", "id": req["id"], "result": req["method"] }))
+            .collect();
         Json(Value::Array(responses))
     } else {
         Json(json!({
@@ -54,7 +55,10 @@ async fn test_single_call_success() {
     let url = spawn_server(app).await;
     let c = client(&url);
 
-    let result = c.call("eth_blockNumber", None, CallOptions::default()).await.unwrap();
+    let result = c
+        .call("eth_blockNumber", None, CallOptions::default())
+        .await
+        .unwrap();
     assert_eq!(result, json!("eth_blockNumber"));
 }
 
@@ -63,9 +67,10 @@ async fn test_single_call_success() {
 async fn reorder_handler(Json(body): Json<Value>) -> Json<Value> {
     if let Some(arr) = body.as_array() {
         // Respond in REVERSE order to test id-based reordering
-        let mut responses: Vec<Value> = arr.iter().map(|req| {
-            json!({ "jsonrpc": "2.0", "id": req["id"], "result": req["method"] })
-        }).collect();
+        let mut responses: Vec<Value> = arr
+            .iter()
+            .map(|req| json!({ "jsonrpc": "2.0", "id": req["id"], "result": req["method"] }))
+            .collect();
         responses.reverse();
         Json(Value::Array(responses))
     } else {
@@ -85,7 +90,10 @@ async fn test_batch_out_of_order_ids() {
     });
 
     let calls = vec![
-        ("eth_getBlockByNumber".to_string(), Some(json!(["0x1", true]))),
+        (
+            "eth_getBlockByNumber".to_string(),
+            Some(json!(["0x1", true])),
+        ),
         ("eth_getLogs".to_string(), Some(json!([{}]))),
         ("eth_chainId".to_string(), None),
     ];
@@ -108,8 +116,8 @@ async fn retry_429_handler(
     State(state): State<RetryState>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
 
     let n = state.attempts.fetch_add(1, Ordering::SeqCst);
     if n == 0 {
@@ -124,7 +132,9 @@ async fn retry_429_handler(
 
 #[tokio::test]
 async fn test_retry_on_429() {
-    let state = RetryState { attempts: Arc::new(AtomicUsize::new(0)) };
+    let state = RetryState {
+        attempts: Arc::new(AtomicUsize::new(0)),
+    };
     let app = Router::new()
         .route("/", post(retry_429_handler))
         .with_state(state.clone());
@@ -141,7 +151,10 @@ async fn test_retry_on_429() {
         ..Default::default()
     });
 
-    let result = c.call("eth_blockNumber", None, CallOptions::default()).await.unwrap();
+    let result = c
+        .call("eth_blockNumber", None, CallOptions::default())
+        .await
+        .unwrap();
     assert_eq!(result, json!("ok"));
     assert_eq!(state.attempts.load(Ordering::SeqCst), 2);
 }
@@ -171,7 +184,9 @@ async fn rpc_32005_handler(
 
 #[tokio::test]
 async fn test_rpc_32005_retried() {
-    let state = RpcRetryState { attempts: Arc::new(AtomicUsize::new(0)) };
+    let state = RpcRetryState {
+        attempts: Arc::new(AtomicUsize::new(0)),
+    };
     let app = Router::new()
         .route("/", post(rpc_32005_handler))
         .with_state(state.clone());
@@ -185,7 +200,10 @@ async fn test_rpc_32005_retried() {
         ..Default::default()
     });
 
-    let result = c.call("eth_blockNumber", None, CallOptions::default()).await.unwrap();
+    let result = c
+        .call("eth_blockNumber", None, CallOptions::default())
+        .await
+        .unwrap();
     assert_eq!(result, json!("ok"));
     assert_eq!(state.attempts.load(Ordering::SeqCst), 2);
 }
@@ -211,7 +229,9 @@ async fn non_retryable_handler(
 
 #[tokio::test]
 async fn test_non_retryable_not_retried() {
-    let state = NonRetryState { attempts: Arc::new(AtomicUsize::new(0)) };
+    let state = NonRetryState {
+        attempts: Arc::new(AtomicUsize::new(0)),
+    };
     let app = Router::new()
         .route("/", post(non_retryable_handler))
         .with_state(state.clone());
@@ -225,7 +245,9 @@ async fn test_non_retryable_not_retried() {
         ..Default::default()
     });
 
-    let result = c.call("eth_blockNumber", None, CallOptions::default()).await;
+    let result = c
+        .call("eth_blockNumber", None, CallOptions::default())
+        .await;
     assert!(result.is_err());
     // Should only have been called once (no retries)
     assert_eq!(state.attempts.load(Ordering::SeqCst), 1);
@@ -242,24 +264,29 @@ async fn reduce_handler(
     State(state): State<ReduceState>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
 
     if let Some(arr) = body.as_array() {
         let size = arr.len();
         state.calls.lock().await.push(size);
         if size > 2 {
             // pretend too large
-            return (StatusCode::OK, axum::Json(json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": { "code": -32000, "message": "response too large" }
-            }))).into_response();
+            return (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32000, "message": "response too large" }
+                })),
+            )
+                .into_response();
         }
         // respond normally
-        let responses: Vec<Value> = arr.iter().map(|req| {
-            json!({ "jsonrpc": "2.0", "id": req["id"], "result": "ok" })
-        }).collect();
+        let responses: Vec<Value> = arr
+            .iter()
+            .map(|req| json!({ "jsonrpc": "2.0", "id": req["id"], "result": "ok" }))
+            .collect();
         Json(Value::Array(responses)).into_response()
     } else {
         state.calls.lock().await.push(1);
@@ -269,7 +296,9 @@ async fn reduce_handler(
 
 #[tokio::test]
 async fn test_batch_reduce_on_retry() {
-    let state = ReduceState { calls: Arc::new(tokio::sync::Mutex::new(vec![])) };
+    let state = ReduceState {
+        calls: Arc::new(tokio::sync::Mutex::new(vec![])),
+    };
     let app = Router::new()
         .route("/", post(reduce_handler))
         .with_state(state.clone());
@@ -283,9 +312,8 @@ async fn test_batch_reduce_on_retry() {
     });
 
     // 4 calls: first attempt as batch of 4 → fails → split to 2+2 → each succeeds
-    let calls: Vec<(String, Option<Value>)> = (0..4)
-        .map(|i| (format!("method_{i}"), None))
-        .collect();
+    let calls: Vec<(String, Option<Value>)> =
+        (0..4).map(|i| (format!("method_{i}"), None)).collect();
 
     let results = c
         .batch_call_reduce_on_retry(calls, &CallOptions::default())
@@ -300,5 +328,8 @@ async fn test_batch_reduce_on_retry() {
     let seen = state.calls.lock().await.clone();
     // Should have seen batch of 4 (fails), then 2 sub-batches
     assert!(seen.contains(&4), "expected batch of 4, got {seen:?}");
-    assert!(seen.iter().filter(|&&s| s == 2).count() >= 2, "expected two batches of 2, got {seen:?}");
+    assert!(
+        seen.iter().filter(|&&s| s == 2).count() >= 2,
+        "expected two batches of 2, got {seen:?}"
+    );
 }

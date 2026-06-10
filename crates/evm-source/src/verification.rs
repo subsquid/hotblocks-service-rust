@@ -5,7 +5,10 @@ use alloy_primitives::keccak256;
 use anyhow::{anyhow, bail};
 use sha3::{Digest, Keccak256};
 
-use crate::rpc_data::{RpcBlock, RpcLog, RpcReceipt, RpcTransaction, RpcWithdrawal, AccessListItem, EIP7702AuthorizationItem};
+use crate::rpc_data::{
+    AccessListItem, EIP7702AuthorizationItem, RpcBlock, RpcLog, RpcReceipt, RpcTransaction,
+    RpcWithdrawal,
+};
 
 // ─── Helper: decode 0x-hex to bytes ──────────────────────────────────────────
 
@@ -298,10 +301,7 @@ pub fn transactions_root(txs: &[&RpcTransaction]) -> anyhow::Result<String> {
     Ok(format!("0x{}", hex::encode(root.as_slice())))
 }
 
-pub fn receipts_root(
-    receipts: &[&RpcReceipt],
-    use_gas_used: bool,
-) -> anyhow::Result<String> {
+pub fn receipts_root(receipts: &[&RpcReceipt], use_gas_used: bool) -> anyhow::Result<String> {
     let mut keys_values: Vec<(Vec<u8>, Vec<u8>)> = receipts
         .iter()
         .enumerate()
@@ -403,7 +403,11 @@ fn decode_authorization_list(auth_list: &[EIP7702AuthorizationItem]) -> Vec<u8> 
                 a.chain_id as u128,
                 decode_hex_or_empty(&a.address),
                 parse_qty_u128(&a.nonce),
-                if a.signature.odd_y_parity { 1u128 } else { 0u128 },
+                if a.signature.odd_y_parity {
+                    1u128
+                } else {
+                    0u128
+                },
                 decode_hex_or_empty(&a.signature.r),
                 decode_hex_or_empty(&a.signature.s),
             ),
@@ -457,9 +461,7 @@ pub fn encode_transaction(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
         "0x3" => encode_eip4844_tx(tx),
         "0x4" => encode_eip7702_tx(tx),
         // Arbitrum and others — unsupported for root verification (TS also skips sender recovery for these)
-        "0x64" | "0x65" | "0x66" | "0x68" | "0x69" | "0x6a" => {
-            encode_arbitrum_tx(tx, tx_type)
-        }
+        "0x64" | "0x65" | "0x66" | "0x68" | "0x69" | "0x6a" => encode_arbitrum_tx(tx, tx_type),
         // Optimism deposit
         "0x7e" => encode_optimism_deposit_tx(tx),
         // Tempo
@@ -749,10 +751,19 @@ fn encode_arbitrum_tx(tx: &RpcTransaction, tx_type: &str) -> anyhow::Result<Vec<
 
     let payload = match tx_type {
         "0x64" => {
-            let chain_id = tx.chain_id.as_deref().ok_or_else(|| anyhow!("chainId missing"))?;
-            let request_id = tx.request_id.as_deref().ok_or_else(|| anyhow!("requestId missing"))?;
+            let chain_id = tx
+                .chain_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("chainId missing"))?;
+            let request_id = tx
+                .request_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("requestId missing"))?;
             let to = tx.to.as_deref().ok_or_else(|| anyhow!("to missing"))?;
-            let value = tx.value.as_deref().ok_or_else(|| anyhow!("value missing"))?;
+            let value = tx
+                .value
+                .as_deref()
+                .ok_or_else(|| anyhow!("value missing"))?;
 
             let mut p = Vec::new();
             p.extend(encode_rlp_uint(parse_qty_u128(chain_id)));
@@ -763,10 +774,23 @@ fn encode_arbitrum_tx(tx: &RpcTransaction, tx_type: &str) -> anyhow::Result<Vec<
             p
         }
         "0x65" => {
-            let chain_id = tx.chain_id.as_deref().ok_or_else(|| anyhow!("chainId missing"))?;
-            let value = tx.value.as_deref().ok_or_else(|| anyhow!("value missing"))?;
-            let input = tx.input.as_deref().ok_or_else(|| anyhow!("input missing"))?;
-            let to_bytes = if let Some(to) = &tx.to { decode_hex(to)? } else { vec![] };
+            let chain_id = tx
+                .chain_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("chainId missing"))?;
+            let value = tx
+                .value
+                .as_deref()
+                .ok_or_else(|| anyhow!("value missing"))?;
+            let input = tx
+                .input
+                .as_deref()
+                .ok_or_else(|| anyhow!("input missing"))?;
+            let to_bytes = if let Some(to) = &tx.to {
+                decode_hex(to)?
+            } else {
+                vec![]
+            };
             let gas_price = tx.gas_price.as_deref().unwrap_or("0x0");
 
             let mut p = Vec::new();
@@ -910,11 +934,7 @@ fn encode_logs(logs: &[RpcLog]) -> Vec<u8> {
     let mut items = Vec::new();
     for log in logs {
         let addr = decode_hex_or_empty(&log.address);
-        let topics: Vec<Vec<u8>> = log
-            .topics
-            .iter()
-            .map(|t| decode_hex_or_empty(t))
-            .collect();
+        let topics: Vec<Vec<u8>> = log.topics.iter().map(|t| decode_hex_or_empty(t)).collect();
         let data = decode_hex_or_empty(&log.data);
 
         let topics_encoded: Vec<u8> = topics.iter().flat_map(|t| encode_rlp_bytes(t)).collect();
@@ -1039,12 +1059,19 @@ fn serialize_transaction_for_signing(tx: &RpcTransaction) -> anyhow::Result<Opti
     match tx_type {
         "0x0" => {
             let gas_price = tx.gas_price.as_deref().unwrap_or("0x0");
-            let value = tx.value.as_deref().ok_or_else(|| anyhow!("tx.value missing"))?;
+            let value = tx
+                .value
+                .as_deref()
+                .ok_or_else(|| anyhow!("tx.value missing"))?;
             let input = tx.input.as_deref().unwrap_or("0x");
             let v = tx.v.as_deref().unwrap_or("0x0");
             let v_int = parse_qty_u128(v);
 
-            let to_bytes = if let Some(to) = &tx.to { decode_hex(to)? } else { vec![] };
+            let to_bytes = if let Some(to) = &tx.to {
+                decode_hex(to)?
+            } else {
+                vec![]
+            };
 
             let mut fields = Vec::new();
             fields.push(encode_rlp_uint(parse_qty_u128(&tx.nonce)));
@@ -1056,7 +1083,10 @@ fn serialize_transaction_for_signing(tx: &RpcTransaction) -> anyhow::Result<Opti
 
             // EIP-155
             if v_int != 27 && v_int != 28 && v_int != 0 && v_int != 1 {
-                let chain_id = tx.chain_id.as_deref().ok_or_else(|| anyhow!("chainId missing"))?;
+                let chain_id = tx
+                    .chain_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("chainId missing"))?;
                 fields.push(encode_rlp_uint(parse_qty_u128(chain_id)));
                 fields.push(encode_rlp_uint(0));
                 fields.push(encode_rlp_uint(0));
@@ -1069,11 +1099,21 @@ fn serialize_transaction_for_signing(tx: &RpcTransaction) -> anyhow::Result<Opti
             Ok(Some(out))
         }
         "0x1" => {
-            let chain_id = tx.chain_id.as_deref().ok_or_else(|| anyhow!("chainId missing"))?;
+            let chain_id = tx
+                .chain_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("chainId missing"))?;
             let gas_price = tx.gas_price.as_deref().unwrap_or("0x0");
-            let value = tx.value.as_deref().ok_or_else(|| anyhow!("value missing"))?;
+            let value = tx
+                .value
+                .as_deref()
+                .ok_or_else(|| anyhow!("value missing"))?;
             let input = tx.input.as_deref().unwrap_or("0x");
-            let to_bytes = if let Some(to) = &tx.to { decode_hex(to)? } else { vec![] };
+            let to_bytes = if let Some(to) = &tx.to {
+                decode_hex(to)?
+            } else {
+                vec![]
+            };
             let access_list = tx.access_list.as_deref().unwrap_or(&[]);
 
             let mut payload = Vec::new();
@@ -1095,12 +1135,28 @@ fn serialize_transaction_for_signing(tx: &RpcTransaction) -> anyhow::Result<Opti
             Ok(Some(out))
         }
         "0x2" => {
-            let chain_id = tx.chain_id.as_deref().ok_or_else(|| anyhow!("chainId missing"))?;
-            let max_prio = tx.max_priority_fee_per_gas.as_deref().ok_or_else(|| anyhow!("maxPriorityFeePerGas missing"))?;
-            let max_fee = tx.max_fee_per_gas.as_deref().ok_or_else(|| anyhow!("maxFeePerGas missing"))?;
-            let value = tx.value.as_deref().ok_or_else(|| anyhow!("value missing"))?;
+            let chain_id = tx
+                .chain_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("chainId missing"))?;
+            let max_prio = tx
+                .max_priority_fee_per_gas
+                .as_deref()
+                .ok_or_else(|| anyhow!("maxPriorityFeePerGas missing"))?;
+            let max_fee = tx
+                .max_fee_per_gas
+                .as_deref()
+                .ok_or_else(|| anyhow!("maxFeePerGas missing"))?;
+            let value = tx
+                .value
+                .as_deref()
+                .ok_or_else(|| anyhow!("value missing"))?;
             let input = tx.input.as_deref().unwrap_or("0x");
-            let to_bytes = if let Some(to) = &tx.to { decode_hex(to)? } else { vec![] };
+            let to_bytes = if let Some(to) = &tx.to {
+                decode_hex(to)?
+            } else {
+                vec![]
+            };
             let access_list = tx.access_list.as_deref().unwrap_or(&[]);
 
             let mut payload = Vec::new();
@@ -1123,14 +1179,36 @@ fn serialize_transaction_for_signing(tx: &RpcTransaction) -> anyhow::Result<Opti
             Ok(Some(out))
         }
         "0x3" => {
-            let chain_id = tx.chain_id.as_deref().ok_or_else(|| anyhow!("chainId missing"))?;
-            let max_prio = tx.max_priority_fee_per_gas.as_deref().ok_or_else(|| anyhow!("maxPriorityFeePerGas missing"))?;
-            let max_fee = tx.max_fee_per_gas.as_deref().ok_or_else(|| anyhow!("maxFeePerGas missing"))?;
-            let value = tx.value.as_deref().ok_or_else(|| anyhow!("value missing"))?;
+            let chain_id = tx
+                .chain_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("chainId missing"))?;
+            let max_prio = tx
+                .max_priority_fee_per_gas
+                .as_deref()
+                .ok_or_else(|| anyhow!("maxPriorityFeePerGas missing"))?;
+            let max_fee = tx
+                .max_fee_per_gas
+                .as_deref()
+                .ok_or_else(|| anyhow!("maxFeePerGas missing"))?;
+            let value = tx
+                .value
+                .as_deref()
+                .ok_or_else(|| anyhow!("value missing"))?;
             let input = tx.input.as_deref().unwrap_or("0x");
-            let max_fee_blob = tx.max_fee_per_blob_gas.as_deref().ok_or_else(|| anyhow!("maxFeePerBlobGas missing"))?;
-            let blob_hashes = tx.blob_versioned_hashes.as_ref().ok_or_else(|| anyhow!("blobVersionedHashes missing"))?;
-            let to_bytes = if let Some(to) = &tx.to { decode_hex(to)? } else { vec![] };
+            let max_fee_blob = tx
+                .max_fee_per_blob_gas
+                .as_deref()
+                .ok_or_else(|| anyhow!("maxFeePerBlobGas missing"))?;
+            let blob_hashes = tx
+                .blob_versioned_hashes
+                .as_ref()
+                .ok_or_else(|| anyhow!("blobVersionedHashes missing"))?;
+            let to_bytes = if let Some(to) = &tx.to {
+                decode_hex(to)?
+            } else {
+                vec![]
+            };
             let access_list = tx.access_list.as_deref().unwrap_or(&[]);
 
             let blob_encoded: Vec<u8> = blob_hashes
@@ -1163,12 +1241,28 @@ fn serialize_transaction_for_signing(tx: &RpcTransaction) -> anyhow::Result<Opti
             Ok(Some(out))
         }
         "0x4" => {
-            let chain_id = tx.chain_id.as_deref().ok_or_else(|| anyhow!("chainId missing"))?;
-            let max_prio = tx.max_priority_fee_per_gas.as_deref().ok_or_else(|| anyhow!("maxPriorityFeePerGas missing"))?;
-            let max_fee = tx.max_fee_per_gas.as_deref().ok_or_else(|| anyhow!("maxFeePerGas missing"))?;
-            let value = tx.value.as_deref().ok_or_else(|| anyhow!("value missing"))?;
+            let chain_id = tx
+                .chain_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("chainId missing"))?;
+            let max_prio = tx
+                .max_priority_fee_per_gas
+                .as_deref()
+                .ok_or_else(|| anyhow!("maxPriorityFeePerGas missing"))?;
+            let max_fee = tx
+                .max_fee_per_gas
+                .as_deref()
+                .ok_or_else(|| anyhow!("maxFeePerGas missing"))?;
+            let value = tx
+                .value
+                .as_deref()
+                .ok_or_else(|| anyhow!("value missing"))?;
             let input = tx.input.as_deref().unwrap_or("0x");
-            let to_bytes = if let Some(to) = &tx.to { decode_hex(to)? } else { vec![] };
+            let to_bytes = if let Some(to) = &tx.to {
+                decode_hex(to)?
+            } else {
+                vec![]
+            };
             let access_list = tx.access_list.as_deref().unwrap_or(&[]);
             let auth_list = tx.authorization_list.as_deref().unwrap_or(&[]);
 
@@ -1193,9 +1287,7 @@ fn serialize_transaction_for_signing(tx: &RpcTransaction) -> anyhow::Result<Opti
             Ok(Some(out))
         }
         // Arbitrum, Optimism deposit, Polygon state-sync: no sender recovery
-        "0x64" | "0x65" | "0x66" | "0x68" | "0x69" | "0x6a" | "0x7e" | "0x7f" | "0x76" => {
-            Ok(None)
-        }
+        "0x64" | "0x65" | "0x66" | "0x68" | "0x69" | "0x6a" | "0x7e" | "0x7f" | "0x76" => Ok(None),
         _ => Ok(None),
     }
 }

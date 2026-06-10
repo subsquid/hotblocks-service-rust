@@ -39,7 +39,18 @@ fn make_block(number: u64, hash: &str, parent_number: u64, parent_hash: &str) ->
 
 fn simple_chain(len: u64) -> Vec<Block> {
     (0..len)
-        .map(|i| make_block(i, &format!("h{i}"), i.saturating_sub(1), &if i == 0 { "".to_string() } else { format!("h{}", i - 1) }))
+        .map(|i| {
+            make_block(
+                i,
+                &format!("h{i}"),
+                i.saturating_sub(1),
+                &if i == 0 {
+                    "".to_string()
+                } else {
+                    format!("h{}", i - 1)
+                },
+            )
+        })
         .collect()
 }
 
@@ -55,7 +66,10 @@ impl DataSource for MockSource {
         Ok(self.chain[0].block_ref())
     }
 
-    fn get_finalized_stream(&self, req: StreamRequest) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+    fn get_finalized_stream(
+        &self,
+        req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
         let chain = Arc::clone(&self.chain);
         let from = req.from;
         let to = req.to;
@@ -71,7 +85,10 @@ impl DataSource for MockSource {
         })
     }
 
-    fn get_stream(&self, req: StreamRequest) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+    fn get_stream(
+        &self,
+        req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
         let chain = Arc::clone(&self.chain);
         let fork_after = self.fork_after;
         let from = req.from;
@@ -195,7 +212,12 @@ async fn test_stream_zstd_response() {
     );
 
     if status == 200 {
-        let encoding = resp.headers().get("content-encoding").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let encoding = resp
+            .headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         assert_eq!(encoding, "zstd");
         let bytes = resp.bytes().await.unwrap();
         // Decode zstd frames.
@@ -241,10 +263,18 @@ async fn test_stream_gzip_response() {
         .unwrap();
 
     let status = resp.status();
-    assert!(status == 200 || status == 204, "unexpected status: {status}");
+    assert!(
+        status == 200 || status == 204,
+        "unexpected status: {status}"
+    );
 
     if status == 200 {
-        let encoding = resp.headers().get("content-encoding").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let encoding = resp
+            .headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         assert_eq!(encoding, "gzip");
         let gz_bytes = resp.bytes().await.unwrap();
         // Decode gzip.
@@ -343,7 +373,10 @@ async fn test_metrics_endpoint() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
-    assert!(text.contains("sqd_hotblocks"), "missing sqd metrics: {text}");
+    assert!(
+        text.contains("sqd_hotblocks"),
+        "missing sqd metrics: {text}"
+    );
 }
 
 #[tokio::test]
@@ -381,6 +414,81 @@ async fn test_block_time_endpoint() {
 }
 
 // ---------------------------------------------------------------------------
+// Shutdown promptness test
+// ---------------------------------------------------------------------------
+
+/// A DataSource whose `get_stream` yields one batch then parks forever,
+/// simulating a hot stream that has reached the head and is waiting for
+/// the next block.
+#[derive(Clone)]
+struct PendingSource {
+    seed: Arc<Vec<Block>>,
+}
+
+#[async_trait]
+impl DataSource for PendingSource {
+    async fn get_head(&self) -> anyhow::Result<BlockRef> {
+        Ok(self.seed[0].block_ref())
+    }
+    async fn get_finalized_head(&self) -> anyhow::Result<BlockRef> {
+        Ok(self.seed[0].block_ref())
+    }
+    fn get_finalized_stream(
+        &self,
+        req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+        let seed = Arc::clone(&self.seed);
+        Box::pin(async_stream::stream! {
+            for block in seed.iter() {
+                if block.number < req.from { continue; }
+                if let Some(t) = req.to { if block.number > t { break; } }
+                yield Ok(BlockBatch { blocks: vec![block.clone()], finalized_head: Some(block.block_ref()) });
+            }
+        })
+    }
+    fn get_stream(
+        &self,
+        req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+        let seed = Arc::clone(&self.seed);
+        Box::pin(async_stream::stream! {
+            // Yield blocks that exist in the seed beyond `from`.
+            for block in seed.iter() {
+                if block.number < req.from { continue; }
+                yield Ok(BlockBatch { blocks: vec![block.clone()], finalized_head: Some(block.block_ref()) });
+            }
+            // Then park forever — simulates waiting for the next block.
+            futures::future::pending::<()>().await;
+        })
+    }
+}
+
+/// Prove that `DataServiceHandle::shutdown()` completes in <2 s even while
+/// the ingestion loop is parked inside a never-ending `stream.next()`.
+#[tokio::test]
+async fn test_shutdown_completes_promptly() {
+    let source = PendingSource {
+        seed: Arc::new(simple_chain(2)),
+    };
+    let handle = run_data_service(DataServiceOptions {
+        source,
+        block_cache_size: 100,
+        port: 0,
+        auto_adjust_finalized_head: false,
+    })
+    .await
+    .unwrap();
+
+    // Let ingestion reach the pending state.
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Shutdown must complete within 2 s despite the stream being parked.
+    tokio::time::timeout(tokio::time::Duration::from_secs(2), handle.shutdown())
+        .await
+        .expect("shutdown did not complete within 2 s — ingestion loop is stuck");
+}
+
+// ---------------------------------------------------------------------------
 // End-to-end fork recovery
 // ---------------------------------------------------------------------------
 
@@ -403,10 +511,7 @@ struct ForkingSource {
 impl ForkingSource {
     fn new() -> Self {
         let common = simple_chain(3); // 0,1,2 with h-hashes
-        let branch_a = vec![
-            make_block(3, "a3", 2, "h2"),
-            make_block(4, "a4", 3, "a3"),
-        ];
+        let branch_a = vec![make_block(3, "a3", 2, "h2"), make_block(4, "a4", 3, "a3")];
         let branch_b = vec![
             make_block(3, "b3", 2, "h2"),
             make_block(4, "b4", 3, "b3"),
@@ -431,7 +536,10 @@ impl DataSource for ForkingSource {
         Ok(self.common[0].block_ref())
     }
 
-    fn get_finalized_stream(&self, req: StreamRequest) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+    fn get_finalized_stream(
+        &self,
+        req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
         let common = Arc::clone(&self.common);
         Box::pin(async_stream::stream! {
             for block in common.iter() {
@@ -445,10 +553,17 @@ impl DataSource for ForkingSource {
         })
     }
 
-    fn get_stream(&self, req: StreamRequest) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+    fn get_stream(
+        &self,
+        req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let common = Arc::clone(&self.common);
-        let branch = if call == 0 { Arc::clone(&self.branch_a) } else { Arc::clone(&self.branch_b) };
+        let branch = if call == 0 {
+            Arc::clone(&self.branch_a)
+        } else {
+            Arc::clone(&self.branch_b)
+        };
         let branch_b = Arc::clone(&self.branch_b);
         Box::pin(async_stream::stream! {
             for block in common.iter().chain(branch.iter()) {
@@ -490,11 +605,19 @@ async fn test_end_to_end_fork_recovery() {
     loop {
         let head: serde_json::Value = client
             .get(format!("http://127.0.0.1:{port}/head"))
-            .send().await.unwrap().json().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         if head["number"] == 5 && head["hash"] == "b5" {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "never reached branch B head, got {head}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never reached branch B head, got {head}"
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 
@@ -503,7 +626,9 @@ async fn test_end_to_end_fork_recovery() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/stream"))
         .json(&serde_json::json!({"fromBlock": 5, "parentBlockHash": "a4"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 409);
     let body: serde_json::Value = resp.json().await.unwrap();
     let prev = body["previousBlocks"].as_array().unwrap();
@@ -516,7 +641,9 @@ async fn test_end_to_end_fork_recovery() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/stream"))
         .json(&serde_json::json!({"fromBlock": 3, "parentBlockHash": "h2"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().await.unwrap();
     let text = {
@@ -530,7 +657,11 @@ async fn test_end_to_end_fork_recovery() {
     };
     let numbers: Vec<u64> = text
         .lines()
-        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["number"].as_u64().unwrap())
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["number"]
+                .as_u64()
+                .unwrap()
+        })
         .collect();
     assert_eq!(numbers, vec![3, 4, 5], "should serve branch B after reorg");
 }

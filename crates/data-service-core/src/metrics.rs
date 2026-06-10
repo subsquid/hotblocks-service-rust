@@ -72,12 +72,8 @@ impl BlockTimestampCache {
 static BLOCK_TIMESTAMP_CACHE: OnceLock<Mutex<BlockTimestampCache>> = OnceLock::new();
 
 fn block_timestamp_cache() -> &'static Mutex<BlockTimestampCache> {
-    BLOCK_TIMESTAMP_CACHE.get_or_init(|| {
-        Mutex::new(BlockTimestampCache::new(
-            1000,
-            Duration::from_secs(30 * 60),
-        ))
-    })
+    BLOCK_TIMESTAMP_CACHE
+        .get_or_init(|| Mutex::new(BlockTimestampCache::new(1000, Duration::from_secs(30 * 60))))
 }
 
 pub fn record_block_ingestion(block_number: u64) {
@@ -153,8 +149,8 @@ impl Metrics {
                 "Time to process a block from creation to end of processing in ms",
             )
             .buckets(vec![
-                100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 15000.0, 20000.0,
-                30000.0, 60000.0, 300000.0, 600000.0, 1200000.0, 3600000.0,
+                100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 15000.0, 20000.0, 30000.0,
+                60000.0, 300000.0, 600000.0, 1200000.0, 3600000.0,
             ]),
         )
         .unwrap();
@@ -165,14 +161,17 @@ impl Metrics {
                 "Time taken to process a block in milliseconds",
             )
             .buckets(vec![
-                0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0,
-                500.0, 1000.0,
+                0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0,
+                1000.0,
             ]),
         )
         .unwrap();
 
         let queries_total = CounterVec::new(
-            Opts::new("sqd_hotblocks_queries_total", "Total number of queries by type"),
+            Opts::new(
+                "sqd_hotblocks_queries_total",
+                "Total number of queries by type",
+            ),
             &["type"],
         )
         .unwrap();

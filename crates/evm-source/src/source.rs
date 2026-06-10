@@ -5,8 +5,8 @@ use std::time::Duration;
 use anyhow::Result;
 use async_stream::stream;
 use async_trait::async_trait;
-use data_service_core::{Block, BlockBatch, BlockRef, StreamError};
 use data_service_core::source::{DataSource, StreamRequest};
+use data_service_core::{Block, BlockBatch, BlockRef, StreamError};
 use futures::stream::{BoxStream, StreamExt};
 use tracing::warn;
 
@@ -155,6 +155,15 @@ impl EvmRpcDataSource {
         Box::pin(s)
     }
 
+    /// Wrap a stream so that finalization probes run *concurrently* with
+    /// passthrough of fresh batches — fixing the stall where an in-flight
+    /// probe RTT delays emission of new blocks.
+    ///
+    /// Design:
+    /// - A background task owns the probe queue and fires rounds (≤5 probes,
+    ///   ≥500 ms between rounds) over a watch channel.
+    /// - The stream loop does `tokio::select!` over the ingest stream and the
+    ///   probe result channel, forwarding fresh batches immediately.
     fn finalize_stream<S>(
         rpc: Arc<Rpc>,
         stream: S,
@@ -163,86 +172,166 @@ impl EvmRpcDataSource {
         S: futures::Stream<Item = Result<BlockBatch, StreamError>> + Send + 'static,
     {
         use std::collections::VecDeque;
-        use tokio::sync::Mutex;
+        use tokio::sync::mpsc;
 
-        let output = Arc::new(Mutex::new(VecDeque::<Result<BlockBatch, StreamError>>::new()));
-        let notify = Arc::new(tokio::sync::Notify::new());
+        // Channel from prober task → stream loop.
+        // The prober sends the newly confirmed finalized BlockRef (or nothing on
+        // error/no-advance).
+        let (probe_tx, mut probe_rx) = mpsc::channel::<Option<BlockRef>>(8);
 
-        let s = stream! {
-            let mut current_finalized: Option<BlockRef> = None;
+        // Channel from stream loop → prober: new refs to enqueue.
+        let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<BlockRef>();
+
+        // Spawn prober background task.
+        tokio::spawn(async move {
             let mut probe_queue: VecDeque<BlockRef> = VecDeque::new();
             let mut last_probe_time = std::time::Instant::now() - Duration::from_secs(1);
-            let mut stream = Box::pin(stream);
 
             loop {
-                // First drain any finalization probes if enough time has passed
-                if !probe_queue.is_empty()
-                    && last_probe_time.elapsed() >= Duration::from_millis(500)
-                {
-                    last_probe_time = std::time::Instant::now();
-                    let probes: Vec<BlockRef> = probe_queue.drain(..probe_queue.len().min(5)).collect();
-                    let probe_numbers: Vec<u64> = probes.iter().map(|p| p.number).collect();
-
-                    match rpc.get_finalized_block_batch(&probe_numbers).await {
-                        Ok(infos) => {
-                            // Find highest finalized
-                            for i in (0..infos.len()).rev() {
-                                if let Some(ref cur) = current_finalized {
-                                    if cur.number >= probes[i].number {
-                                        break;
-                                    }
-                                }
-                                if let Some(ref info) = infos[i] {
-                                    if info.1 == probes[i].hash {
-                                        // Finalized!
-                                        let unfinalized: Vec<BlockRef> = probes[i + 1..].to_vec();
-                                        for r in unfinalized {
-                                            probe_queue.push_front(r);
-                                        }
-                                        current_finalized = Some(probes[i].clone());
-                                        yield Ok(BlockBatch {
-                                            blocks: vec![],
-                                            finalized_head: Some(probes[i].clone()),
-                                        });
-                                        break;
-                                    }
-                                }
+                // Drain any new refs from the queue channel (non-blocking)
+                loop {
+                    match queue_rx.try_recv() {
+                        Ok(r) => {
+                            if probe_queue.len() >= 50 {
+                                *probe_queue.back_mut().unwrap() = r;
+                            } else {
+                                probe_queue.push_back(r);
                             }
                         }
-                        Err(e) => {
-                            warn!("finalizer probe error: {e}");
-                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => return,
                     }
                 }
 
-                // Get next batch from stream
-                match stream.next().await {
-                    None => break,
-                    Some(Err(e)) => {
-                        yield Err(e);
-                        return;
-                    }
-                    Some(Ok(batch)) => {
-                        if let Some(ref fh) = batch.finalized_head {
-                            // Already finalized
-                            probe_queue.clear();
-                            current_finalized = Some(fh.clone());
-                        } else {
-                            // Queue for probing
-                            for block in &batch.blocks {
+                if probe_queue.is_empty() || last_probe_time.elapsed() < Duration::from_millis(500)
+                {
+                    // Wait for a new ref or for the 500ms window to open.
+                    // Use a short sleep to avoid busy-looping.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    // Re-drain the queue
+                    loop {
+                        match queue_rx.try_recv() {
+                            Ok(r) => {
                                 if probe_queue.len() >= 50 {
-                                    *probe_queue.back_mut().unwrap() = block.block_ref();
+                                    *probe_queue.back_mut().unwrap() = r;
                                 } else {
-                                    probe_queue.push_back(block.block_ref());
+                                    probe_queue.push_back(r);
+                                }
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => return,
+                        }
+                    }
+                    continue;
+                }
+
+                last_probe_time = std::time::Instant::now();
+                let probes: Vec<BlockRef> = probe_queue.drain(..probe_queue.len().min(5)).collect();
+                let probe_numbers: Vec<u64> = probes.iter().map(|p| p.number).collect();
+
+                match rpc.get_finalized_block_batch(&probe_numbers).await {
+                    Ok(infos) => {
+                        let mut confirmed: Option<BlockRef> = None;
+                        let mut confirmed_idx: Option<usize> = None;
+
+                        for i in (0..infos.len()).rev() {
+                            if let Some(ref info) = infos[i] {
+                                if info.1 == probes[i].hash {
+                                    confirmed = Some(probes[i].clone());
+                                    confirmed_idx = Some(i);
+                                    break;
                                 }
                             }
                         }
 
-                        let finalized_head = batch.finalized_head.or_else(|| current_finalized.clone());
-                        yield Ok(BlockBatch {
-                            blocks: batch.blocks,
-                            finalized_head,
-                        });
+                        if let (Some(_), Some(idx)) = (&confirmed, confirmed_idx) {
+                            // Put back unfinalized refs
+                            for r in probes[idx + 1..].iter().rev() {
+                                probe_queue.push_front(r.clone());
+                            }
+                            // Send confirmed finalized ref
+                            if probe_tx.send(confirmed).await.is_err() {
+                                return;
+                            }
+                        } else {
+                            // None confirmed — put all back
+                            for r in probes.into_iter().rev() {
+                                probe_queue.push_front(r);
+                            }
+                            if probe_tx.send(None).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("finalizer probe error: {e}");
+                        // Put refs back
+                        for r in probes.into_iter().rev() {
+                            probe_queue.push_front(r);
+                        }
+                        if probe_tx.send(None).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let s = stream! {
+            let mut current_finalized: Option<BlockRef> = None;
+            let mut stream = Box::pin(stream);
+
+            loop {
+                tokio::select! {
+                    // Fresh batch from the ingest stream — forward immediately
+                    batch_opt = stream.next() => {
+                        match batch_opt {
+                            None => break,
+                            Some(Err(e)) => {
+                                yield Err(e);
+                                return;
+                            }
+                            Some(Ok(batch)) => {
+                                if let Some(ref fh) = batch.finalized_head {
+                                    // Already finalized (finalized stream path)
+                                    current_finalized = Some(fh.clone());
+                                } else {
+                                    // Queue refs for probing
+                                    for block in &batch.blocks {
+                                        let _ = queue_tx.send(block.block_ref());
+                                    }
+                                }
+
+                                let finalized_head = batch.finalized_head.or_else(|| current_finalized.clone());
+                                yield Ok(BlockBatch {
+                                    blocks: batch.blocks,
+                                    finalized_head,
+                                });
+                            }
+                        }
+                    }
+
+                    // Probe result from prober task
+                    probe_result = probe_rx.recv() => {
+                        match probe_result {
+                            None => {
+                                // Prober task exited — no more probes
+                            }
+                            Some(None) => {
+                                // Probe round: nothing confirmed, continue
+                            }
+                            Some(Some(finalized_ref)) => {
+                                // New finalized head confirmed
+                                if current_finalized.as_ref().is_none_or(|c| finalized_ref.number > c.number) {
+                                    current_finalized = Some(finalized_ref.clone());
+                                    // Emit a finalized-head-only batch
+                                    yield Ok(BlockBatch {
+                                        blocks: vec![],
+                                        finalized_head: Some(finalized_ref),
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -264,7 +353,10 @@ impl DataSource for EvmRpcDataSource {
         Ok(BlockRef { number, hash })
     }
 
-    fn get_stream(&self, req: StreamRequest) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+    fn get_stream(
+        &self,
+        req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
         let parent_hash = req.parent_hash.clone();
         let from = req.from;
         let inner = self.make_stream(req, "latest");

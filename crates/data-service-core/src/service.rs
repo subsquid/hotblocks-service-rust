@@ -24,13 +24,19 @@ pub struct DataServiceHandle {
     pub port: u16,
     pub started: tokio::sync::oneshot::Receiver<anyhow::Result<()>>,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    cancel_tx: watch::Sender<bool>,
     server_task: tokio::task::JoinHandle<()>,
     service_task: tokio::task::JoinHandle<()>,
 }
 
 impl DataServiceHandle {
     pub async fn shutdown(self) {
+        // Signal the HTTP server to stop accepting new connections.
         let _ = self.shutdown_tx.send(());
+        // Signal the ingestion loop to stop (wakes it even if blocked on stream.next()).
+        let _ = self.cancel_tx.send(true);
+        // Abort the service task so we don't wait for a stuck stream.next().
+        self.service_task.abort();
         let _ = self.service_task.await;
         let _ = self.server_task.await;
     }
@@ -41,10 +47,13 @@ impl DataServiceHandle {
 pub async fn run_data_service<S: DataSource>(
     opts: DataServiceOptions<S>,
 ) -> anyhow::Result<DataServiceHandle> {
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+
     let service = Arc::new(DataService::new(
         opts.source,
         opts.block_cache_size,
         opts.auto_adjust_finalized_head,
+        cancel_rx,
     ));
 
     service.init().await?;
@@ -92,6 +101,7 @@ pub async fn run_data_service<S: DataSource>(
         port,
         started: started_rx,
         shutdown_tx,
+        cancel_tx,
         server_task,
         service_task,
     })
@@ -116,10 +126,17 @@ pub struct DataService<S> {
     started_tx: watch::Sender<Result<(), ()>>,
     started_rx: watch::Receiver<Result<(), ()>>,
     stopped: std::sync::atomic::AtomicBool,
+    /// Fires `true` when shutdown has been requested.
+    cancel_rx: watch::Receiver<bool>,
 }
 
 impl<S: DataSource> DataService<S> {
-    pub fn new(source: S, buffer_size: usize, auto_adjust_finalized_head: bool) -> Self {
+    pub fn new(
+        source: S,
+        buffer_size: usize,
+        auto_adjust_finalized_head: bool,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> Self {
         let (block_watch_tx, block_watch_rx) = watch::channel(0u64);
         let (started_tx, started_rx) = watch::channel(Err(()));
         Self {
@@ -133,6 +150,7 @@ impl<S: DataSource> DataService<S> {
             started_tx,
             started_rx,
             stopped: std::sync::atomic::AtomicBool::new(false),
+            cancel_rx,
         }
     }
 
@@ -253,15 +271,17 @@ impl<S: DataSource> DataService<S> {
                     };
                     base = head;
                     let pause = if stacked > 1 { 30 } else { 0 };
-                    error!("data ingestion terminated, will restart in {} seconds", pause);
+                    error!(
+                        "data ingestion terminated, will restart in {} seconds",
+                        pause
+                    );
                     if pause > 0 {
                         tokio::time::sleep(tokio::time::Duration::from_secs(pause)).await;
                     }
                 }
                 Err(StreamError::Fork { previous_blocks }) => {
                     stacked = 0;
-                    let fork_base =
-                        self.get_chain_ref(|c| c.get_fork_base(&previous_blocks));
+                    let fork_base = self.get_chain_ref(|c| c.get_fork_base(&previous_blocks));
                     match fork_base {
                         Some(fb) => {
                             info!(
@@ -322,7 +342,17 @@ impl<S: DataSource> DataService<S> {
             parent_hash: Some(base.hash.clone()),
         });
 
-        while let Some(batch_result) = stream.next().await {
+        let mut cancel_rx = self.cancel_rx.clone();
+
+        loop {
+            let batch_result = tokio::select! {
+                biased;
+                _ = cancel_rx.wait_for(|v| *v) => return Ok(()),
+                item = stream.next() => match item {
+                    None => break,
+                    Some(r) => r,
+                },
+            };
             let batch: BlockBatch = batch_result?;
 
             if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
@@ -604,11 +634,7 @@ fn log_block_info(block: &BlockHeader, msg: &str) {
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn assert_chain_continuity(
-    parent_hash: Option<&str>,
-    prev: Option<&Block>,
-    next: &Block,
-) {
+fn assert_chain_continuity(parent_hash: Option<&str>, prev: Option<&Block>, next: &Block) {
     let ok = match (prev, parent_hash) {
         (Some(p), _) => p.number == next.parent_number && p.hash == next.parent_hash,
         (None, Some(ph)) => ph == next.parent_hash,

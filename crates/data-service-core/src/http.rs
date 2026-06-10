@@ -79,9 +79,7 @@ async fn handle_head<S: DataSource>(state: State<SharedService<S>>) -> impl Into
     Json(state.get_head())
 }
 
-async fn handle_finalized_head<S: DataSource>(
-    state: State<SharedService<S>>,
-) -> impl IntoResponse {
+async fn handle_finalized_head<S: DataSource>(state: State<SharedService<S>>) -> impl IntoResponse {
     Json(state.get_finalized_head())
 }
 
@@ -104,10 +102,7 @@ async fn handle_metrics<S: DataSource>(
         match state.metrics.gather_text() {
             Ok(text) => (
                 StatusCode::OK,
-                [(
-                    "content-type",
-                    "text/plain; version=0.0.4; charset=utf-8",
-                )],
+                [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
                 text,
             )
                 .into_response(),
@@ -153,10 +148,7 @@ async fn handle_block_time<S: DataSource>(
 /// - 409 JSON `{"previousBlocks": [...]}` on base-block mismatch
 /// - 204 if nothing to send
 /// - 200 streaming body (zstd or gzip per Accept-Encoding)
-async fn handle_stream<S: DataSource>(
-    state: State<SharedService<S>>,
-    req: Request,
-) -> Response {
+async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let accept_encoding = parts
         .headers
@@ -169,7 +161,10 @@ async fn handle_stream<S: DataSource>(
     let body_bytes = match axum::body::to_bytes(body, 1024).await {
         Ok(b) => b,
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, "request body too large or unreadable")
+            return (
+                StatusCode::BAD_REQUEST,
+                "request body too large or unreadable",
+            )
                 .into_response()
         }
     };
@@ -185,7 +180,10 @@ async fn handle_stream<S: DataSource>(
     let max_duration = std::time::Duration::from_secs(60);
 
     let result = state
-        .query(stream_req.from_block, stream_req.parent_block_hash.as_deref())
+        .query(
+            stream_req.from_block,
+            stream_req.parent_block_hash.as_deref(),
+        )
         .await;
 
     let data_response: DataResponse = match result {
@@ -215,8 +213,12 @@ async fn handle_stream<S: DataSource>(
         );
     }
 
-    let has_content =
-        data_response.head.is_some() || data_response.tail.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+    let has_content = data_response.head.is_some()
+        || data_response
+            .tail
+            .as_ref()
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
 
     if !has_content {
         return (StatusCode::NO_CONTENT, resp_headers).into_response();
@@ -249,9 +251,7 @@ async fn handle_stream<S: DataSource>(
                 // Decompress zstd, then recompress gzip level 1.
                 let raw = tokio::task::spawn_blocking({
                     let zstd_bytes = block.json_line_zstd.clone();
-                    move || {
-                        zstd::decode_all(std::io::Cursor::new(zstd_bytes.as_ref()))
-                    }
+                    move || zstd::decode_all(std::io::Cursor::new(zstd_bytes.as_ref()))
                 })
                 .await??;
 

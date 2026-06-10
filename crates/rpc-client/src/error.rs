@@ -15,7 +15,11 @@ pub struct RpcErrorInfo {
 pub enum RpcError {
     /// Server returned a JSON-RPC error object
     #[error("RPC error {code}: {message}")]
-    Rpc { code: i64, message: String, data: Option<serde_json::Value> },
+    Rpc {
+        code: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
 
     /// HTTP-level error (non-2xx)
     #[error("HTTP error {status}")]
@@ -44,7 +48,11 @@ pub enum RpcError {
 
 impl RpcError {
     pub(crate) fn from_info(info: RpcErrorInfo) -> Self {
-        RpcError::Rpc { code: info.code, message: info.message, data: info.data }
+        RpcError::Rpc {
+            code: info.code,
+            message: info.message,
+            data: info.data,
+        }
     }
 
     /// Is this error retryable for a plain call?

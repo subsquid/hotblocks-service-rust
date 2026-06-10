@@ -497,7 +497,9 @@ pub struct DebugStateDiffResult {
 
 // ─── RpcBlock with attached data ──────────────────────────────────────────────
 
-fn default_false() -> bool { false }
+fn default_false() -> bool {
+    false
+}
 
 /// The full raw block as produced by the fetch layer,
 /// analogous to TS `Block` type in types.ts.

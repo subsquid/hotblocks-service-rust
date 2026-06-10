@@ -1,0 +1,17 @@
+name: docker
+
+on:
+  push:
+    tags:
+      - v**
+
+jobs:
+  docker:
+    name: Build and publish docker image
+    uses: subsquid/github-workflows/.github/workflows/docker-on-tag.yml@main
+    with:
+      image_name: subsquid/evm-data-service-rs
+      push_latest: true
+    secrets:
+      DOCKER_LOGIN: ${{ secrets.DOCKER_LOGIN }}
+      DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}

@@ -182,8 +182,9 @@ impl RpcClient {
 
             match result {
                 Ok(v) => return Ok(v),
-                Err(e) if attempt < retry_attempts
-                    && e.is_retryable(self.config.retry_internal_server_errors) =>
+                Err(e)
+                    if attempt < retry_attempts
+                        && e.is_retryable(self.config.retry_internal_server_errors) =>
                 {
                     let pause = retry_pause(&self.config.retry_schedule, attempt);
                     warn!(
@@ -249,13 +250,14 @@ impl RpcClient {
         options: &CallOptions,
     ) -> Result<Value, RpcError> {
         self.wait_for_rate(1).await;
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .expect("semaphore closed");
+        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
-        let req = RpcRequest { jsonrpc: "2.0", id, method, params };
+        let req = RpcRequest {
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+        };
         let body = serde_json::to_vec(&req).expect("serialize");
 
         let raw = self.post_raw(body, timeout).await?;
@@ -306,14 +308,14 @@ impl RpcClient {
             let result = self.execute_batch(calls, timeout, options).await;
             match result {
                 Ok(v) => return Ok(v),
-                Err(e) if attempt < retry_attempts
-                    && e.is_retryable(self.config.retry_internal_server_errors) =>
+                Err(e)
+                    if attempt < retry_attempts
+                        && e.is_retryable(self.config.retry_internal_server_errors) =>
                 {
                     let pause = retry_pause(&self.config.retry_schedule, attempt);
                     warn!(
                         pause_ms = pause.as_millis(),
-                        attempt,
-                        "RPC batch failed, retrying"
+                        attempt, "RPC batch failed, retrying"
                     );
                     tokio::time::sleep(pause).await;
                     attempt += 1;
@@ -336,11 +338,7 @@ impl RpcClient {
     ) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
         let count = calls.len();
         self.wait_for_rate(count).await;
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .expect("semaphore closed");
+        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
         let base_id = self.counter.fetch_add(count as u64, Ordering::Relaxed) + 1;
         let requests: Vec<RpcRequest<'_>> = calls
@@ -431,7 +429,10 @@ impl RpcClient {
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let body_text = response.text().await.unwrap_or_default();
-            return Err(RpcError::Http { status, body: body_text });
+            return Err(RpcError::Http {
+                status,
+                body: body_text,
+            });
         }
 
         response.bytes().await.map(|b| b.to_vec()).map_err(|e| {
@@ -506,7 +507,10 @@ impl RpcClient {
 
 fn retry_pause(schedule: &[Duration], attempt: usize) -> Duration {
     let idx = attempt.min(schedule.len().saturating_sub(1));
-    schedule.get(idx).copied().unwrap_or(Duration::from_millis(20_000))
+    schedule
+        .get(idx)
+        .copied()
+        .unwrap_or(Duration::from_millis(20_000))
 }
 
 fn now_millis() -> u64 {
@@ -548,13 +552,21 @@ mod tests {
     fn retry_http_status() {
         for status in [408u16, 429, 502, 503, 504, 529] {
             assert!(
-                RpcError::Http { status, body: String::new() }.is_retryable(false),
+                RpcError::Http {
+                    status,
+                    body: String::new()
+                }
+                .is_retryable(false),
                 "status {status} should be retryable"
             );
         }
         for status in [200u16, 400, 404, 500] {
             assert!(
-                !RpcError::Http { status, body: String::new() }.is_retryable(false),
+                !RpcError::Http {
+                    status,
+                    body: String::new()
+                }
+                .is_retryable(false),
                 "status {status} should NOT be retryable"
             );
         }

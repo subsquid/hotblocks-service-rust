@@ -17,8 +17,7 @@ use crate::rpc_data::{
 use crate::types::{qty2_u64, to_qty};
 
 /// Options for the Rpc fetch layer.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RpcOptions {
     pub finality_confirmation: Option<u64>,
     pub verify_block_hash: bool,
@@ -31,7 +30,6 @@ pub struct RpcOptions {
     pub check_cumulative_gas_used: bool,
     pub use_gas_used_for_receipts_root: bool,
 }
-
 
 /// Fetch state for the Rpc layer.
 pub struct Rpc {
@@ -67,16 +65,16 @@ impl Rpc {
                     .map_err(|e| anyhow!("eth_chainId: {e}"))?;
                 let chain_id_str = chain_id.as_str().unwrap_or("0x1");
                 let chain_id_num = qty2_u64(chain_id_str);
-                Ok(ChainUtils::new(chain_id_num, self.options.use_gas_used_for_receipts_root))
+                Ok(ChainUtils::new(
+                    chain_id_num,
+                    self.options.use_gas_used_for_receipts_root,
+                ))
             })
             .await
     }
 
     /// Get the chain head block ref.
-    pub async fn get_latest_blockhash(
-        &self,
-        commitment: &str,
-    ) -> Result<(u64, String)> {
+    pub async fn get_latest_blockhash(&self, commitment: &str) -> Result<(u64, String)> {
         let tag: Value = if commitment == "finalized" {
             if let Some(conf) = self.options.finality_confirmation {
                 // Use offset from head
@@ -120,17 +118,35 @@ impl Rpc {
         Ok(qty2_u64(height.as_str().unwrap_or("0x0")))
     }
 
+    /// Fetch a single block by number (body + txs). Returns None if not yet available.
+    pub async fn get_single_block(&self, number: u64) -> Result<Option<RawRpcBlock>> {
+        let results = self.get_blocks(&[number], true).await?;
+        Ok(results.into_iter().next().flatten())
+    }
+
     /// Fetch finalized blocks for given numbers (used by finalizer).
-    pub async fn get_finalized_block_batch(&self, numbers: &[u64]) -> Result<Vec<Option<(u64, String)>>> {
+    pub async fn get_finalized_block_batch(
+        &self,
+        numbers: &[u64],
+    ) -> Result<Vec<Option<(u64, String)>>> {
         let (finalized_num, _) = self.get_latest_blockhash("finalized").await?;
-        let numbers: Vec<u64> = numbers.iter().filter(|&&n| n <= finalized_num).copied().collect();
+        let numbers: Vec<u64> = numbers
+            .iter()
+            .filter(|&&n| n <= finalized_num)
+            .copied()
+            .collect();
         if numbers.is_empty() {
             return Ok(vec![]);
         }
 
         let calls: Vec<(String, Option<Value>)> = numbers
             .iter()
-            .map(|n| ("eth_getBlockByNumber".to_string(), Some(json!([to_qty(*n), false]))))
+            .map(|n| {
+                (
+                    "eth_getBlockByNumber".to_string(),
+                    Some(json!([to_qty(*n), false])),
+                )
+            })
             .collect();
 
         let results = self
@@ -190,6 +206,74 @@ impl Rpc {
         Ok(chain)
     }
 
+    /// Enrich a slice of block bodies with logs/receipts/traces.
+    /// This is the second phase of the two-phase fetch for the speculative poll path.
+    /// Each block's enrichment is retried independently on not-ready conditions.
+    /// Blocks must be provided in order; returns them in the same order.
+    pub async fn enrich_blocks(
+        self: &Arc<Self>,
+        blocks: Vec<RawRpcBlock>,
+        req: &crate::types::DataRequest,
+    ) -> Result<Vec<RawRpcBlock>> {
+        let mut blocks = blocks;
+        self.add_requested_data(&mut blocks, req).await?;
+        Ok(blocks)
+    }
+
+    /// Enrich a single block with retry for not-ready conditions.
+    /// Returns the enriched block once consistent data is available.
+    /// This is the per-block retry loop for the pipeline overlap path.
+    pub async fn enrich_block_with_retry(
+        self: &Arc<Self>,
+        body: RawRpcBlock,
+        req: &crate::types::DataRequest,
+    ) -> Result<RawRpcBlock> {
+        let needs_enrichment = req.logs || req.receipts || req.traces || req.state_diffs;
+        if !needs_enrichment {
+            return Ok(body);
+        }
+
+        // Retry loop with mild backoff: 50ms → 100ms → 200ms → 500ms (capped)
+        let mut delay_ms: u64 = 50;
+        loop {
+            let mut attempt = vec![body.clone()];
+            match self.add_requested_data(&mut attempt, req).await {
+                Err(e) => {
+                    // Network/RPC error — propagate
+                    return Err(e);
+                }
+                Ok(()) => {
+                    let block = attempt.remove(0);
+                    if block.is_invalid {
+                        // Not ready: null receipts/mismatched hash — retry
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        delay_ms = (delay_ms * 2).min(500);
+                        continue;
+                    }
+                    // Validate hash consistency for logs
+                    if let Some(ref logs) = block.logs {
+                        let mismatch = logs.iter().any(|l| l.block_hash != block.hash);
+                        if mismatch {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            delay_ms = (delay_ms * 2).min(500);
+                            continue;
+                        }
+                    }
+                    // Validate hash consistency for receipts
+                    if let Some(ref receipts) = block.receipts {
+                        let mismatch = receipts.iter().any(|r| r.block_hash != block.hash);
+                        if mismatch {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            delay_ms = (delay_ms * 2).min(500);
+                            continue;
+                        }
+                    }
+                    return Ok(block);
+                }
+            }
+        }
+    }
+
     async fn get_blocks(
         &self,
         numbers: &[u64],
@@ -209,21 +293,26 @@ impl Rpc {
             })
             .collect();
 
-        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> = Box::new(|info: &RpcErrorInfo| {
-            // Avalanche: out-of-range returns this error
-            if info.message.contains("cannot query unfinalized data") {
-                return Ok(Value::Null);
-            }
-            // Hyperliquid: invalid block height — retry
-            if info.message.contains("invalid block height") {
-                return Err(RpcError::RetryRequested("invalid block height".into()));
-            }
-            // Alchemy/Sei -32000 internal error — retry
-            if info.code == -32000 {
-                return Err(RpcError::RetryRequested("internal error -32000".into()));
-            }
-            Err(RpcError::Rpc { code: info.code, message: info.message.clone(), data: info.data.clone() })
-        });
+        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> =
+            Box::new(|info: &RpcErrorInfo| {
+                // Avalanche: out-of-range returns this error
+                if info.message.contains("cannot query unfinalized data") {
+                    return Ok(Value::Null);
+                }
+                // Hyperliquid: invalid block height — retry
+                if info.message.contains("invalid block height") {
+                    return Err(RpcError::RetryRequested("invalid block height".into()));
+                }
+                // Alchemy/Sei -32000 internal error — retry
+                if info.code == -32000 {
+                    return Err(RpcError::RetryRequested("internal error -32000".into()));
+                }
+                Err(RpcError::Rpc {
+                    code: info.code,
+                    message: info.message.clone(),
+                    data: info.data.clone(),
+                })
+            });
 
         let options = CallOptions {
             validate_error: Some(validate_error),
@@ -275,7 +364,9 @@ impl Rpc {
                         match computed {
                             Ok(h) if h == hash => {}
                             Ok(h) => {
-                                raw.mark_invalid(format!("block hash mismatch: expected {hash} got {h}"));
+                                raw.mark_invalid(format!(
+                                    "block hash mismatch: expected {hash} got {h}"
+                                ));
                             }
                             Err(e) => {
                                 warn!("block hash verification error: {e}");
@@ -296,7 +387,7 @@ impl Rpc {
         blocks: &mut Vec<RawRpcBlock>,
         req: &crate::types::DataRequest,
     ) -> Result<()> {
-        let tasks: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>> =
+        let _tasks: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>> =
             Vec::new();
 
         // We need to add data sequentially since we can't easily split the &mut vec
@@ -324,12 +415,17 @@ impl Rpc {
         let from = &blocks[0].block.number;
         let to = &blocks[blocks.len() - 1].block.number;
 
-        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> = Box::new(|info: &RpcErrorInfo| {
-            if info.message.contains("after last accepted block") {
-                return Ok(json!([]));
-            }
-            Err(RpcError::Rpc { code: info.code, message: info.message.clone(), data: info.data.clone() })
-        });
+        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> =
+            Box::new(|info: &RpcErrorInfo| {
+                if info.message.contains("after last accepted block") {
+                    return Ok(json!([]));
+                }
+                Err(RpcError::Rpc {
+                    code: info.code,
+                    message: info.message.clone(),
+                    data: info.data.clone(),
+                })
+            });
 
         let result = self
             .client
@@ -360,6 +456,17 @@ impl Rpc {
         for block in blocks.iter_mut() {
             let mut block_logs = logs_by_block.remove(&block.hash).unwrap_or_default();
 
+            // If logs are empty but logsBloom is non-zero, logs are not yet available
+            // (mirrors TS addLogs: only considers bloom to check readiness).
+            // We mark the block invalid so the enrich retry loop will retry.
+            // Note: an empty result for a block with no logs (bloom == 0x0...0) is correct.
+            if block_logs.is_empty() && !is_zero_bloom(&block.block.logs_bloom) {
+                block.mark_invalid(
+                    "eth_getLogs returned empty result but logsBloom is non-zero (not ready)",
+                );
+                continue;
+            }
+
             if utils.is_stable {
                 fix_log_indexes(&mut block_logs);
             }
@@ -368,7 +475,10 @@ impl Rpc {
                 for (i, log) in block_logs.iter().enumerate() {
                     let actual = qty2_u64(&log.log_index);
                     if actual != i as u64 {
-                        bail!("log index check failed at block {}: expected {i} got {actual}", block.number);
+                        bail!(
+                            "log index check failed at block {}: expected {i} got {actual}",
+                            block.number
+                        );
                     }
                 }
             }
@@ -429,12 +539,24 @@ impl Rpc {
             })
             .collect();
 
-        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> = Box::new(|info: &RpcErrorInfo| {
-            if info.message.contains("invalid block height") {
-                return Err(RpcError::RetryRequested("invalid block height".into()));
-            }
-            Err(RpcError::Rpc { code: info.code, message: info.message.clone(), data: info.data.clone() })
-        });
+        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> =
+            Box::new(|info: &RpcErrorInfo| {
+                if info.message.contains("invalid block height") {
+                    return Err(RpcError::RetryRequested("invalid block height".into()));
+                }
+                // Not found / unknown block — treat as not-ready (null)
+                if info.message.contains("unknown block")
+                    || info.message.contains("not found")
+                    || info.message.contains("header not found")
+                {
+                    return Ok(Value::Null);
+                }
+                Err(RpcError::Rpc {
+                    code: info.code,
+                    message: info.message.clone(),
+                    data: info.data.clone(),
+                })
+            });
 
         let options = CallOptions {
             validate_error: Some(validate_error),
@@ -456,24 +578,20 @@ impl Rpc {
                     continue;
                 }
                 Ok(v) if v.is_null() => {
-                    block.mark_invalid("eth_getBlockReceipts returned null");
+                    block.mark_invalid("eth_getBlockReceipts returned null (block not ready)");
                     continue;
                 }
                 Ok(v) => {
                     // Parse receipts, filtering nulls
                     let raw_receipts: Vec<Option<RpcReceipt>> =
                         serde_json::from_value(v).unwrap_or_default();
-                    let mut receipts: Vec<RpcReceipt> = raw_receipts.into_iter().flatten().collect();
+                    let mut receipts: Vec<RpcReceipt> =
+                        raw_receipts.into_iter().flatten().collect();
 
-                    // Check all receipts belong to this block
-                    for receipt in &receipts {
-                        if receipt.block_hash != block.hash {
-                            block.mark_invalid("eth_getBlockReceipts returned receipts for a different block");
-                            break;
-                        }
-                    }
-
-                    if block.is_invalid {
+                    // Check all receipts belong to this block (hash consistency)
+                    let hash_mismatch = receipts.iter().any(|r| r.block_hash != block.hash);
+                    if hash_mismatch {
+                        block.mark_invalid("eth_getBlockReceipts returned receipts for a different block (load-balanced inconsistency, will retry)");
                         continue;
                     }
 
@@ -486,7 +604,8 @@ impl Rpc {
                     }
 
                     if utils.is_stable {
-                        let mut all_logs: Vec<RpcLog> = receipts.iter().flat_map(|r| r.logs.clone()).collect();
+                        let mut all_logs: Vec<RpcLog> =
+                            receipts.iter().flat_map(|r| r.logs.clone()).collect();
                         fix_log_indexes(&mut all_logs);
                         let mut idx = 0;
                         for receipt in receipts.iter_mut() {
@@ -497,7 +616,8 @@ impl Rpc {
                         }
                     }
 
-                    let all_logs: Vec<RpcLog> = receipts.iter().flat_map(|r| r.logs.clone()).collect();
+                    let all_logs: Vec<RpcLog> =
+                        receipts.iter().flat_map(|r| r.logs.clone()).collect();
 
                     if self.options.check_log_index {
                         for (j, log) in all_logs.iter().enumerate() {
@@ -528,15 +648,20 @@ impl Rpc {
 
                     if self.options.verify_receipts_root {
                         let receipt_refs: Vec<&RpcReceipt> = receipts.iter().collect();
-                        let computed = crate::verification::receipts_root(&receipt_refs, self.options.use_gas_used_for_receipts_root)
-                            .map_err(|e| anyhow!("block {}: {e}", block.number))?;
+                        let computed = crate::verification::receipts_root(
+                            &receipt_refs,
+                            self.options.use_gas_used_for_receipts_root,
+                        )
+                        .map_err(|e| anyhow!("block {}: {e}", block.number))?;
                         if computed != block.block.receipts_root {
                             bail!("block {}: receipts root mismatch", block.number);
                         }
                     }
 
                     if block.block.transactions.len() != receipts.len() {
-                        block.mark_invalid("got invalid number of receipts from eth_getBlockReceipts");
+                        block.mark_invalid(
+                            "got invalid number of receipts from eth_getBlockReceipts",
+                        );
                         continue;
                     }
 
@@ -587,6 +712,13 @@ impl Rpc {
                 continue;
             }
 
+            // Hash consistency check
+            let hash_mismatch = receipts.iter().any(|r| r.block_hash != block.hash);
+            if hash_mismatch {
+                block.mark_invalid("eth_getTransactionReceipt returned receipts for a different block (load-balanced inconsistency, will retry)");
+                continue;
+            }
+
             let all_logs: Vec<RpcLog> = receipts.iter().flat_map(|r| r.logs.clone()).collect();
 
             if utils.is_stable {
@@ -624,12 +756,15 @@ impl Rpc {
             if self.options.verify_logs_bloom {
                 let log_refs: Vec<&RpcLog> = all_logs.iter().collect();
                 crate::verification::verify_logs_bloom(&block.block, &log_refs)
-                    .map_err(|e| anyhow!("block {}: {e}", block.number))?;
+                    .map_err(|e| anyhow!("block {}: {e}", block.block.number))?;
             }
 
             if self.options.verify_receipts_root {
                 let receipt_refs: Vec<&RpcReceipt> = receipts.iter().collect();
-                let computed = crate::verification::receipts_root(&receipt_refs, self.options.use_gas_used_for_receipts_root)?;
+                let computed = crate::verification::receipts_root(
+                    &receipt_refs,
+                    self.options.use_gas_used_for_receipts_root,
+                )?;
                 if computed != block.block.receipts_root {
                     bail!("block {}: receipts root mismatch", block.number);
                 }
@@ -751,7 +886,10 @@ impl Rpc {
             .iter()
             .map(|b| {
                 let (method, param) = if req.use_debug_trace_block_by_number {
-                    ("debug_traceBlockByNumber".to_string(), json!(b.block.number))
+                    (
+                        "debug_traceBlockByNumber".to_string(),
+                        json!(b.block.number),
+                    )
                 } else {
                     ("debug_traceBlockByHash".to_string(), json!(b.hash))
                 };
@@ -759,15 +897,20 @@ impl Rpc {
             })
             .collect();
 
-        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> = Box::new(|info: &RpcErrorInfo| {
-            if info.message.contains("not found") {
-                return Ok(Value::Null);
-            }
-            if info.message.contains("cannot query unfinalized data") {
-                return Ok(Value::Null);
-            }
-            Err(RpcError::Rpc { code: info.code, message: info.message.clone(), data: info.data.clone() })
-        });
+        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> =
+            Box::new(|info: &RpcErrorInfo| {
+                if info.message.contains("not found") {
+                    return Ok(Value::Null);
+                }
+                if info.message.contains("cannot query unfinalized data") {
+                    return Ok(Value::Null);
+                }
+                Err(RpcError::Rpc {
+                    code: info.code,
+                    message: info.message.clone(),
+                    data: info.data.clone(),
+                })
+            });
 
         let options = CallOptions {
             validate_error: Some(validate_error),
@@ -821,7 +964,10 @@ impl Rpc {
                         let mut mapped: Vec<Option<DebugFrameResult>> =
                             vec![None; block.block.transactions.len()];
                         for item in arr {
-                            let tx_hash = item.get("txHash").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let tx_hash = item
+                                .get("txHash")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
                             if let Some(hash) = tx_hash {
                                 if let Some(&idx) = tx_hash_to_idx.get(&hash) {
                                     mapped[idx] = serde_json::from_value(item).ok();
@@ -862,7 +1008,10 @@ impl Rpc {
             .iter()
             .map(|b| {
                 let (method, param) = if req.use_debug_trace_block_by_number {
-                    ("debug_traceBlockByNumber".to_string(), json!(b.block.number))
+                    (
+                        "debug_traceBlockByNumber".to_string(),
+                        json!(b.block.number),
+                    )
                 } else {
                     ("debug_traceBlockByHash".to_string(), json!(b.hash))
                 };
@@ -870,15 +1019,20 @@ impl Rpc {
             })
             .collect();
 
-        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> = Box::new(|info: &RpcErrorInfo| {
-            if info.message.contains("not found") {
-                return Ok(Value::Null);
-            }
-            if info.message.contains("cannot query unfinalized data") {
-                return Ok(Value::Null);
-            }
-            Err(RpcError::Rpc { code: info.code, message: info.message.clone(), data: info.data.clone() })
-        });
+        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> =
+            Box::new(|info: &RpcErrorInfo| {
+                if info.message.contains("not found") {
+                    return Ok(Value::Null);
+                }
+                if info.message.contains("cannot query unfinalized data") {
+                    return Ok(Value::Null);
+                }
+                Err(RpcError::Rpc {
+                    code: info.code,
+                    message: info.message.clone(),
+                    data: info.data.clone(),
+                })
+            });
 
         let options = CallOptions {
             validate_error: Some(validate_error),
@@ -919,7 +1073,10 @@ impl Rpc {
                         let mut mapped: Vec<Option<DebugStateDiffResult>> =
                             vec![None; block.block.transactions.len()];
                         for item in arr {
-                            let tx_hash = item.get("txHash").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let tx_hash = item
+                                .get("txHash")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
                             if let Some(hash) = tx_hash {
                                 if let Some(&idx) = tx_hash_to_idx.get(&hash) {
                                     mapped[idx] = serde_json::from_value(item).ok();
@@ -964,7 +1121,8 @@ impl Rpc {
             match result {
                 Err(_) => out.push(vec![]),
                 Ok(v) => {
-                    let mut replays: Vec<TraceTransactionReplay> = serde_json::from_value(v).unwrap_or_default();
+                    let mut replays: Vec<TraceTransactionReplay> =
+                        serde_json::from_value(v).unwrap_or_default();
 
                     // Resolve transactionHash from trace frames if not set
                     for rep in replays.iter_mut() {
@@ -1043,9 +1201,9 @@ impl Rpc {
                     }
 
                     // Check all frames belong to this block
-                    let all_match = frames.iter().all(|f| {
-                        f.block_hash.as_deref() == Some(&block.hash)
-                    });
+                    let all_match = frames
+                        .iter()
+                        .all(|f| f.block_hash.as_deref() == Some(&block.hash));
 
                     if !all_match {
                         out.push(vec![]);
@@ -1053,8 +1211,10 @@ impl Rpc {
                     }
 
                     // Group by transactionHash → TraceTransactionReplay
-                    let mut by_tx: std::collections::HashMap<String, Vec<crate::rpc_data::TraceFrame>> =
-                        std::collections::HashMap::new();
+                    let mut by_tx: std::collections::HashMap<
+                        String,
+                        Vec<crate::rpc_data::TraceFrame>,
+                    > = std::collections::HashMap::new();
                     for frame in frames {
                         if let Some(hash) = &frame.transaction_hash {
                             by_tx.entry(hash.clone()).or_default().push(frame);
@@ -1078,6 +1238,13 @@ impl Rpc {
 
         Ok(out)
     }
+}
+
+/// Check if a logsBloom string is all zeros (no logs).
+/// logsBloom is a 256-byte (512 hex char) field.
+pub fn is_zero_bloom(bloom: &str) -> bool {
+    let s = bloom.strip_prefix("0x").unwrap_or(bloom);
+    s.chars().all(|c| c == '0')
 }
 
 fn fix_log_indexes(logs: &mut Vec<RpcLog>) {

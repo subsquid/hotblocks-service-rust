@@ -15,7 +15,12 @@ pub struct RateMeter {
 impl RateMeter {
     pub fn new(window_size: usize, slot_time: u64) -> Self {
         let buf = vec![0u64; window_size + 1];
-        RateMeter { window: buf, time: 0, window_size, slot_time }
+        RateMeter {
+            window: buf,
+            time: 0,
+            window_size,
+            slot_time,
+        }
     }
 
     fn to_time(&self, now_ms: u64) -> i64 {

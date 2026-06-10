@@ -49,8 +49,7 @@ fn run_fixture_file(path: &Path, options: MappingOptions) {
 
 #[test]
 fn parity_base_logs() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/base-logs.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/base-logs.json");
     run_fixture_file(
         &path,
         MappingOptions {
@@ -62,8 +61,7 @@ fn parity_base_logs() {
 
 #[test]
 fn parity_base_receipts() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/base-receipts.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/base-receipts.json");
     run_fixture_file(
         &path,
         MappingOptions {
@@ -75,8 +73,7 @@ fn parity_base_receipts() {
 
 #[test]
 fn parity_base_traces() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/base-traces.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/base-traces.json");
     run_fixture_file(
         &path,
         MappingOptions {

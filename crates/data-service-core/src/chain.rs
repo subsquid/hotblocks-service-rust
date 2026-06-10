@@ -329,7 +329,12 @@ mod tests {
     fn chain_of(n: u64) -> Chain {
         let mut c = Chain::new(genesis(), 1000, false);
         for i in 1..n {
-            c.push(make_block(i, &format!("h{i}"), i - 1, &format!("h{}", i - 1)));
+            c.push(make_block(
+                i,
+                &format!("h{i}"),
+                i - 1,
+                &format!("h{}", i - 1),
+            ));
         }
         c
     }
@@ -356,7 +361,7 @@ mod tests {
     #[test]
     fn push_reorg() {
         let mut c = chain_of(5); // 0..=4
-        // Reorg: replace blocks 3 and 4 with an alternate chain.
+                                 // Reorg: replace blocks 3 and 4 with an alternate chain.
         c.push(make_block(3, "h3b", 2, "h2")); // reorg at pos 3
         assert_eq!(c.size(), 4);
         assert_eq!(c.last_block().hash, "h3b");
@@ -369,7 +374,10 @@ mod tests {
     #[should_panic(expected = "attempt to revert finalized head")]
     fn push_reorg_below_finalized() {
         let mut c = chain_of(5);
-        c.finalize(&BlockRef { number: 3, hash: "h3".into() });
+        c.finalize(&BlockRef {
+            number: 3,
+            hash: "h3".into(),
+        });
         // Try to reorg back to block 2.
         c.push(make_block(3, "h3b", 2, "h2"));
     }
@@ -387,7 +395,10 @@ mod tests {
     #[test]
     fn finalize_advances() {
         let mut c = chain_of(5);
-        assert!(c.finalize(&BlockRef { number: 3, hash: "h3".into() }));
+        assert!(c.finalize(&BlockRef {
+            number: 3,
+            hash: "h3".into()
+        }));
         assert_eq!(c.get_finalized_head().number, 3);
     }
 
@@ -399,7 +410,10 @@ mod tests {
         // Test: finalized head number below first block number.
         let mut c2 = Chain::new(make_block(10, "h10", 9, "h9"), 100, false);
         // head.number = 5 < first_block_number (10) → no-op
-        assert!(!c2.finalize(&BlockRef { number: 5, hash: "h5".into() }));
+        assert!(!c2.finalize(&BlockRef {
+            number: 5,
+            hash: "h5".into()
+        }));
         assert_eq!(c2.get_finalized_head().number, 10);
         let _ = c;
     }
@@ -407,16 +421,25 @@ mod tests {
     #[test]
     fn finalize_above_last_finalizes_all() {
         let mut c = chain_of(5); // blocks 0..=4
-        assert!(c.finalize(&BlockRef { number: 100, hash: "nonexistent".into() }));
+        assert!(c.finalize(&BlockRef {
+            number: 100,
+            hash: "nonexistent".into()
+        }));
         assert_eq!(c.get_finalized_head().number, 4);
     }
 
     #[test]
     fn finalize_monotonic() {
         let mut c = chain_of(10);
-        c.finalize(&BlockRef { number: 5, hash: "h5".into() });
+        c.finalize(&BlockRef {
+            number: 5,
+            hash: "h5".into(),
+        });
         // Finalize at a lower number — must be a no-op (returns false).
-        assert!(!c.finalize(&BlockRef { number: 3, hash: "h3".into() }));
+        assert!(!c.finalize(&BlockRef {
+            number: 3,
+            hash: "h3".into()
+        }));
         assert_eq!(c.get_finalized_head().number, 5);
     }
 
@@ -425,13 +448,24 @@ mod tests {
     #[test]
     fn compact_trims_finalized() {
         let mut c = chain_of(10); // blocks 0..=9
-        c.finalize(&BlockRef { number: 7, hash: "h7".into() });
+        c.finalize(&BlockRef {
+            number: 7,
+            hash: "h7".into(),
+        });
         // max_size was set to 1000 in chain_of, use small max_size.
         let mut c2 = Chain::new(genesis(), 5, false);
         for i in 1..10u64 {
-            c2.push(make_block(i, &format!("h{i}"), i - 1, &format!("h{}", i - 1)));
+            c2.push(make_block(
+                i,
+                &format!("h{i}"),
+                i - 1,
+                &format!("h{}", i - 1),
+            ));
         }
-        c2.finalize(&BlockRef { number: 7, hash: "h7".into() });
+        c2.finalize(&BlockRef {
+            number: 7,
+            hash: "h7".into(),
+        });
         // size is 10, max_size is 5 → need to trim 5 entries.
         assert!(c2.compact());
         // finalized_head was at index 7; after trimming 5 it should be at 2.
@@ -443,7 +477,12 @@ mod tests {
     fn compact_blocked_without_auto_adjust() {
         let mut c = Chain::new(genesis(), 3, false);
         for i in 1..5u64 {
-            c.push(make_block(i, &format!("h{i}"), i - 1, &format!("h{}", i - 1)));
+            c.push(make_block(
+                i,
+                &format!("h{i}"),
+                i - 1,
+                &format!("h{}", i - 1),
+            ));
         }
         // finalized head still at 0, size=5 > max=3 → cannot trim.
         assert!(!c.compact());
@@ -453,7 +492,12 @@ mod tests {
     fn compact_auto_adjust() {
         let mut c = Chain::new(genesis(), 3, true);
         for i in 1..5u64 {
-            c.push(make_block(i, &format!("h{i}"), i - 1, &format!("h{}", i - 1)));
+            c.push(make_block(
+                i,
+                &format!("h{i}"),
+                i - 1,
+                &format!("h{}", i - 1),
+            ));
         }
         assert!(c.compact());
         // After auto-adjust, the buffer should be within max_size.
@@ -481,7 +525,10 @@ mod tests {
         let res2 = c.query(8, None).unwrap();
         assert!(res2.tail.is_none());
         // finalize so we can test the second branch
-        c.finalize(&BlockRef { number: 10, hash: "h10".into() });
+        c.finalize(&BlockRef {
+            number: 10,
+            hash: "h10".into(),
+        });
     }
 
     #[test]
@@ -522,7 +569,12 @@ mod tests {
         // Build a chain of 200 blocks.
         let mut c = Chain::new(genesis(), 1000, false);
         for i in 1..200u64 {
-            c.push(make_block(i, &format!("h{i}"), i - 1, &format!("h{}", i - 1)));
+            c.push(make_block(
+                i,
+                &format!("h{i}"),
+                i - 1,
+                &format!("h{}", i - 1),
+            ));
         }
         // Query at block 150 with wrong hash.
         let err = c.query(150, Some("bad")).unwrap_err();
@@ -536,8 +588,14 @@ mod tests {
     fn fork_base_found() {
         let c = chain_of(5); // 0..=4 with hashes h0..h4
         let prev = vec![
-            BlockRef { number: 3, hash: "h3".into() },
-            BlockRef { number: 4, hash: "h4_fork".into() }, // diverges here
+            BlockRef {
+                number: 3,
+                hash: "h3".into(),
+            },
+            BlockRef {
+                number: 4,
+                hash: "h4_fork".into(),
+            }, // diverges here
         ];
         let base = c.get_fork_base(&prev).unwrap();
         assert_eq!(base.number, 3);
@@ -547,11 +605,20 @@ mod tests {
     #[test]
     fn fork_base_not_found_below_finalized() {
         let mut c = chain_of(5);
-        c.finalize(&BlockRef { number: 4, hash: "h4".into() });
+        c.finalize(&BlockRef {
+            number: 4,
+            hash: "h4".into(),
+        });
         // All upstream blocks are unknown (different hashes).
         let prev = vec![
-            BlockRef { number: 0, hash: "alien0".into() },
-            BlockRef { number: 1, hash: "alien1".into() },
+            BlockRef {
+                number: 0,
+                hash: "alien0".into(),
+            },
+            BlockRef {
+                number: 1,
+                hash: "alien1".into(),
+            },
         ];
         assert!(c.get_fork_base(&prev).is_none());
     }
