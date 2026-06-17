@@ -14,8 +14,15 @@ reqwest = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 async-recursion = "1"
+async-trait = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+url = { workspace = true }
+socket2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

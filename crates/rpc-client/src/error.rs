@@ -29,6 +29,11 @@ pub enum RpcError {
     #[error("connection error: {0}")]
     Connection(#[source] reqwest::Error),
 
+    /// WebSocket connection was lost or reset (transport-level).
+    /// Retryable: the retry layer re-sends on a fresh connection.
+    #[error("disconnected: {0}")]
+    Disconnected(String),
+
     /// Request timed out
     #[error("request timed out")]
     Timeout,
@@ -62,6 +67,7 @@ impl RpcError {
             RpcError::RetryRequested(_) => true,
             RpcError::Timeout => true,
             RpcError::Connection(_) => true,
+            RpcError::Disconnected(_) => true,
             RpcError::Http { status, .. } => matches!(status, 408 | 429 | 502 | 503 | 504 | 529),
             RpcError::Rpc { code, message, .. } => {
                 // code -32005, 429

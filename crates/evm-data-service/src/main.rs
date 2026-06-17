@@ -167,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
             .map(Duration::from_millis)
             .collect(),
         retry_internal_server_errors: args.http_retry_internal_server_errors,
+        ws_pool_size: None,
     }));
 
     let source = EvmRpcDataSource::new(

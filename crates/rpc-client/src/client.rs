@@ -1,33 +1,15 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::warn;
 
 use crate::error::{RpcError, RpcErrorInfo};
 use crate::rate::RateMeter;
-
-// ─── Wire types ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize)]
-struct RpcRequest<'a> {
-    jsonrpc: &'static str,
-    id: u64,
-    method: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<&'a Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcResponse {
-    id: Option<Value>,
-    result: Option<Value>,
-    error: Option<RpcErrorInfo>,
-}
+use crate::transport::ws::{WsTransport, DEFAULT_POOL_SIZE};
+use crate::transport::{HttpTransport, OwnedRpcRequest, RpcResponse, RpcTransport};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -52,12 +34,18 @@ pub struct RpcClientConfig {
     pub retry_schedule: Vec<Duration>,
     /// Retry RPC errors with code -32000/-32603 / "internal error" messages.
     pub retry_internal_server_errors: bool,
+    /// Size of the round-robin connection pool for the WebSocket transport.
+    /// Ignored for HTTP. `None` → default (4). Min 1.
+    pub ws_pool_size: Option<usize>,
 }
 
 impl Default for RpcClientConfig {
     fn default() -> Self {
         RpcClientConfig {
-            url: String::new(),
+            // A valid, parseable URL so `RpcClient::new(Default::default())`
+            // does not panic on the scheme check (see `RpcClient::new` panics
+            // contract). Real callers always override this.
+            url: "http://localhost".into(),
             max_batch_call_size: None,
             capacity: 10,
             rate_limit: None,
@@ -72,6 +60,7 @@ impl Default for RpcClientConfig {
                 Duration::from_millis(20000),
             ],
             retry_internal_server_errors: false,
+            ws_pool_size: None,
         }
     }
 }
@@ -111,8 +100,7 @@ struct RateState {
 /// Async JSON-RPC 2.0 client over HTTP with batching, rate limiting,
 /// concurrency control, and retry.
 pub struct RpcClient {
-    url: Arc<String>,
-    http: reqwest::Client,
+    transport: Arc<dyn RpcTransport>,
     config: Arc<RpcClientConfig>,
     max_batch_call_size: usize,
     semaphore: Arc<Semaphore>,
@@ -121,7 +109,22 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
+    /// Build a client, selecting the transport by URL scheme:
+    /// `http`/`https` → HTTP; `ws`/`wss` → WebSocket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.url` cannot be parsed as a URL or uses an unsupported
+    /// scheme (anything other than `http`/`https`/`ws`/`wss`). This mirrors the
+    /// prior `reqwest`-based constructor, which also panicked on a bad client
+    /// build. Use [`RpcClient::try_new`] for the fallible variant that returns
+    /// the error instead of panicking.
     pub fn new(config: RpcClientConfig) -> Self {
+        Self::try_new(config).expect("failed to build RpcClient")
+    }
+
+    /// Fallible constructor: errors on an unsupported / unparseable URL scheme.
+    pub fn try_new(config: RpcClientConfig) -> Result<Self, RpcError> {
         let rate_limit = config.rate_limit;
 
         let max_batch_call_size = config.max_batch_call_size.unwrap_or_else(|| {
@@ -145,28 +148,20 @@ impl RpcClient {
             }))
         });
 
-        // Keep connections warm and reused. A fresh HTTPS connection pays the
-        // TCP + TLS handshake and starts with a cold congestion window, so a
-        // reused connection is faster, especially for large receipts payloads.
-        // TCP keepalive stops the provider's load balancer / NAT from silently
-        // dropping idle connections (which would force such a reconnect), and a
-        // generous idle timeout keeps the pool warm through quieter chains.
-        let http = reqwest::Client::builder()
-            .pool_max_idle_per_host(config.capacity.min(64))
-            .pool_idle_timeout(Duration::from_secs(120))
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()
-            .expect("failed to build reqwest client");
+        let transport = build_transport(
+            &config.url,
+            config.capacity,
+            config.ws_pool_size.unwrap_or(DEFAULT_POOL_SIZE),
+        )?;
 
-        RpcClient {
-            url: Arc::new(config.url.clone()),
-            http,
+        Ok(RpcClient {
+            transport,
             max_batch_call_size,
             semaphore: Arc::new(Semaphore::new(config.capacity.min(Semaphore::MAX_PERMITS))),
             counter: Arc::new(AtomicU64::new(0)),
             rate,
             config: Arc::new(config),
-        }
+        })
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -260,25 +255,13 @@ impl RpcClient {
         self.wait_for_rate(1).await;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
-        let req = RpcRequest {
-            jsonrpc: "2.0",
+        let req = OwnedRpcRequest {
             id,
-            method,
-            params,
+            method: method.to_string(),
+            params: params.cloned(),
         };
-        let body = serde_json::to_vec(&req).expect("serialize");
 
-        let raw = self.post_raw(body, timeout).await?;
-        let resp: RpcResponse = serde_json::from_slice(&raw)
-            .map_err(|e| RpcError::Protocol(format!("invalid JSON: {e}")))?;
-
-        let resp_id = resp.id.as_ref().and_then(|v| v.as_u64()).unwrap_or(0);
-        if resp_id != id {
-            return Err(RpcError::Protocol(format!(
-                "Got response for unknown request {resp_id}"
-            )));
-        }
-
+        let resp = self.transport.send_single(req, timeout).await?;
         self.process_response(resp, options)
     }
 
@@ -349,47 +332,24 @@ impl RpcClient {
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
         let base_id = self.counter.fetch_add(count as u64, Ordering::Relaxed) + 1;
-        let requests: Vec<RpcRequest<'_>> = calls
+        let requests: Vec<OwnedRpcRequest> = calls
             .iter()
             .enumerate()
-            .map(|(i, (method, params))| RpcRequest {
-                jsonrpc: "2.0",
+            .map(|(i, (method, params))| OwnedRpcRequest {
                 id: base_id + i as u64,
-                method: method.as_str(),
-                params: params.as_ref(),
+                method: method.clone(),
+                params: params.clone(),
             })
             .collect();
 
-        let body = serde_json::to_vec(&requests).expect("serialize");
-        let raw = self.post_raw(body, timeout).await?;
+        // The transport returns responses in request order (HTTP reorders via an
+        // id→response map + length check; WS guarantees order by construction).
+        let responses = self.transport.send_batch(requests, timeout).await?;
 
-        let responses: Vec<RpcResponse> = serde_json::from_slice(&raw)
-            .map_err(|e| RpcError::Protocol(format!("invalid JSON in batch response: {e}")))?;
-
-        if responses.len() != count {
-            return Err(RpcError::Protocol(format!(
-                "Invalid length of a batch response: expected {count}, got {}",
-                responses.len()
-            )));
-        }
-
-        // Build id→response map (server may reorder, as in TS http.ts)
-        let mut map: HashMap<u64, RpcResponse> = responses
+        let results = responses
             .into_iter()
-            .map(|r| {
-                let rid = r.id.as_ref().and_then(|v| v.as_u64()).unwrap_or(0);
-                (rid, r)
-            })
+            .map(|resp| self.process_response(resp, options))
             .collect();
-
-        let mut results = Vec::with_capacity(count);
-        for i in 0..count {
-            let id = base_id + i as u64;
-            let resp = map.remove(&id).ok_or_else(|| {
-                RpcError::Protocol(format!("Missing result for call id {id} in batch response"))
-            })?;
-            results.push(self.process_response(resp, options));
-        }
 
         Ok(results)
     }
@@ -413,43 +373,6 @@ impl RpcClient {
                 Ok(result)
             }
         }
-    }
-
-    async fn post_raw(&self, body: Vec<u8>, timeout: Duration) -> Result<Vec<u8>, RpcError> {
-        let mut req = self
-            .http
-            .post(self.url.as_str())
-            .header("content-type", "application/json")
-            .body(body);
-
-        if !timeout.is_zero() {
-            req = req.timeout(timeout);
-        }
-
-        let response = req.send().await.map_err(|e| {
-            if e.is_timeout() {
-                RpcError::Timeout
-            } else {
-                RpcError::Connection(e)
-            }
-        })?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(RpcError::Http {
-                status,
-                body: body_text,
-            });
-        }
-
-        response.bytes().await.map(|b| b.to_vec()).map_err(|e| {
-            if e.is_timeout() {
-                RpcError::Timeout
-            } else {
-                RpcError::Connection(e)
-            }
-        })
     }
 
     /// Wait until the sliding-window rate allows `count` more items.
@@ -510,6 +433,23 @@ impl RpcClient {
         let mut out = left?;
         out.extend(right?);
         Ok(out)
+    }
+}
+
+/// Select and build a transport based on the URL scheme.
+fn build_transport(
+    url: &str,
+    capacity: usize,
+    ws_pool_size: usize,
+) -> Result<Arc<dyn RpcTransport>, RpcError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| RpcError::Protocol(format!("invalid RPC URL {url:?}: {e}")))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(Arc::new(HttpTransport::new(url.to_string(), capacity))),
+        "ws" | "wss" => Ok(Arc::new(WsTransport::new(url.to_string(), ws_pool_size))),
+        other => Err(RpcError::Protocol(format!(
+            "unsupported RPC URL scheme {other:?} (expected http/https/ws/wss)"
+        ))),
     }
 }
 
