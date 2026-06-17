@@ -1,5 +1,27 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
+
+/// Per-block pipeline timing stamps.
+/// All fields are wall-clock `Instant` values except `compress_duration` which
+/// is measured inside `map_raw_block` and stored as a pre-computed `Duration`.
+#[derive(Clone, Debug)]
+pub struct BlockTimings {
+    /// When the block body was returned by `get_single_block`.
+    pub body_received: Instant,
+    /// When `enrich_block_with_retry` finished.
+    pub enrich_done: Instant,
+    /// When JSON serialization + normalization finished (before zstd).
+    pub normalize_done: Instant,
+    /// How long the zstd compression step inside `map_raw_block` took.
+    pub compress_duration: Duration,
+}
+
+impl BlockTimings {
+    pub fn compress_done(&self) -> Instant {
+        self.normalize_done + self.compress_duration
+    }
+}
 
 /// A reference to a block (number + hash).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +61,8 @@ pub struct Block {
     pub timestamp: Option<u64>,
     /// Zstd-compressed JSON line (single \n-terminated JSON object).
     pub json_line_zstd: Bytes,
+    /// Pipeline timing stamps (only set for hot/speculative blocks).
+    pub timings: Option<BlockTimings>,
 }
 
 impl Block {

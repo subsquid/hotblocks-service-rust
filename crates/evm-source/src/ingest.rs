@@ -92,17 +92,22 @@ impl Default for CadencePredictor {
 // ─── Mapping helpers ──────────────────────────────────────────────────────────
 
 /// Map raw rpc blocks to core blocks using spawn_blocking for CPU work.
+///
+/// `timings`: optional per-block `(body_received, enrich_done)` pairs — must
+/// have the same length as `raw_blocks` when `Some`.
 async fn map_blocks_cpu(
     raw_blocks: Vec<RawRpcBlock>,
     options: Arc<NormOptions>,
+    timings: Option<Vec<(std::time::Instant, std::time::Instant)>>,
 ) -> Result<Vec<Block>> {
     if raw_blocks.is_empty() {
         return Ok(vec![]);
     }
     tokio::task::spawn_blocking(move || {
         let mut blocks = Vec::with_capacity(raw_blocks.len());
-        for raw in &raw_blocks {
-            blocks.push(map_raw_block(raw, &options)?);
+        for (i, raw) in raw_blocks.iter().enumerate() {
+            let t = timings.as_ref().and_then(|v| v.get(i).copied());
+            blocks.push(map_raw_block(raw, &options, t)?);
         }
         Ok(blocks)
     })
@@ -122,6 +127,7 @@ pub async fn ingest_range(
     stride_size: usize,
     stride_concurrency: usize,
     commitment: &str, // "finalized" or "latest"
+    profile_block_timings: bool,
 ) -> impl futures::Stream<Item = Result<IngestBatch>> {
     let commitment = commitment.to_string();
 
@@ -195,7 +201,7 @@ pub async fn ingest_range(
                     let last_num = raw_blocks.last().map(|b| b.number).unwrap_or(s);
                     beg = last_num + 1;
 
-                    let mapped = map_blocks_cpu(raw_blocks, mapping_options.clone()).await?;
+                    let mapped = map_blocks_cpu(raw_blocks, mapping_options.clone(), None).await?;
                     yield IngestBatch { blocks: mapped, finalized: finalized_ref.clone() };
                 }
 
@@ -222,13 +228,17 @@ pub async fn ingest_range(
                 // fall back to stride backfill.
                 let mut hot_streak: u64 = 0;
 
-                let spawn_enrich = |body: RawRpcBlock| -> EnrichTask {
+                let spawn_enrich = |body: RawRpcBlock, body_received: Option<Instant>| -> EnrichTask {
                     let rpc2 = rpc.clone();
                     let req2 = req.clone();
                     let opts2 = mapping_options.clone();
                     tokio::spawn(async move {
                         let enriched = rpc2.enrich_block_with_retry(body, &req2).await?;
-                        map_blocks_cpu(vec![enriched], opts2).await
+                        let timings = body_received.map(|br| {
+                            let enrich_done = Instant::now();
+                            vec![(br, enrich_done)]
+                        });
+                        map_blocks_cpu(vec![enriched], opts2, timings).await
                     })
                 };
 
@@ -258,9 +268,11 @@ pub async fn ingest_range(
 
                     match rpc.get_single_block(next_num).await? {
                         Some(body) if !body.is_invalid => {
-                            cadence.record_block(Instant::now());
+                            let now = Instant::now();
+                            cadence.record_block(now);
                             hot_streak += 1;
-                            pending.push_back((next_num, spawn_enrich(body)));
+                            let body_received = if profile_block_timings { Some(now) } else { None };
+                            pending.push_back((next_num, spawn_enrich(body, body_received)));
                             next_num += 1;
                         }
                         _ => {
@@ -337,7 +349,7 @@ pub async fn ingest_range(
 
                 let finalized = raw_blocks.last().map(|b| BlockRef { number: b.number, hash: b.hash.clone() });
 
-                let mapped = map_blocks_cpu(raw_blocks, mapping_options.clone()).await?;
+                let mapped = map_blocks_cpu(raw_blocks, mapping_options.clone(), None).await?;
                 yield IngestBatch { blocks: mapped, finalized };
             }
         }

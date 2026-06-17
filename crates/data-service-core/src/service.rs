@@ -377,7 +377,9 @@ impl<S: DataSource> DataService<S> {
                         "batch block received on main thread {}#{}", block.number, block.hash
                     );
                     record_block_ingestion(block.number);
+                    let insert_start = Instant::now();
                     chain.push(block.clone());
+                    let insert_elapsed = insert_start.elapsed();
                     tracing::debug!(
                         stage = "block-queryable",
                         block_number = block.number,
@@ -386,6 +388,31 @@ impl<S: DataSource> DataService<S> {
                     );
                     if let Some(ts) = block.timestamp {
                         self.metrics.observe_block_lag(ts);
+                    }
+                    // Emit per-block pipeline timing log (speculative hot blocks only).
+                    if let Some(ref t) = block.timings {
+                        let compress_done = t.compress_done();
+                        let now = Instant::now();
+                        let enrich_ms =
+                            t.enrich_done.duration_since(t.body_received).as_secs_f64() * 1000.0;
+                        let normalize_ms =
+                            t.normalize_done.duration_since(t.enrich_done).as_secs_f64() * 1000.0;
+                        let compress_ms = t.compress_duration.as_secs_f64() * 1000.0;
+                        let queue_ms =
+                            insert_start.duration_since(compress_done).as_secs_f64() * 1000.0;
+                        let insert_ms = insert_elapsed.as_secs_f64() * 1000.0;
+                        let total_ms = now.duration_since(t.body_received).as_secs_f64() * 1000.0;
+                        tracing::info!(
+                            target: "block_timing",
+                            block_number = block.number,
+                            enrich_ms,
+                            normalize_ms,
+                            compress_ms,
+                            queue_ms,
+                            insert_ms,
+                            total_ms,
+                            "block_timing"
+                        );
                     }
                 }
 
@@ -546,7 +573,9 @@ impl<S: DataSource> DataService<S> {
         // Eagerly await the first batch.
         let first_batch = match stream.next().await {
             None => {
-                return Err(QueryError::InvalidBaseBlock(InvalidBaseBlock { prev: vec![] }));
+                return Err(QueryError::InvalidBaseBlock(InvalidBaseBlock {
+                    prev: vec![],
+                }));
             }
             Some(Err(StreamError::Fork { previous_blocks })) => {
                 return Err(QueryError::InvalidBaseBlock(InvalidBaseBlock {

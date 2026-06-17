@@ -34,6 +34,7 @@ fn make_block(number: u64, hash: &str, parent_number: u64, parent_hash: &str) ->
         parent_hash: parent_hash.to_string(),
         timestamp: Some(number * 1000),
         json_line_zstd: Bytes::from(zstd_bytes),
+        timings: None,
     }
 }
 

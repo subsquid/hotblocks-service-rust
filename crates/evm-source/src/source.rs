@@ -23,6 +23,8 @@ pub struct EvmRpcDataSourceOptions {
     pub data_request: DataRequest,
     pub stride_size: usize,
     pub stride_concurrency: usize,
+    /// Emit per-block pipeline timing logs (target=block_timing) for latency profiling.
+    pub profile_block_timings: bool,
 }
 
 impl Default for EvmRpcDataSourceOptions {
@@ -32,6 +34,7 @@ impl Default for EvmRpcDataSourceOptions {
             data_request: DataRequest::default(),
             stride_size: 5,
             stride_concurrency: 5,
+            profile_block_timings: false,
         }
     }
 }
@@ -43,6 +46,7 @@ pub struct EvmRpcDataSource {
     norm_options: Arc<NormOptions>,
     stride_size: usize,
     stride_concurrency: usize,
+    profile_block_timings: bool,
 }
 
 impl EvmRpcDataSource {
@@ -60,6 +64,7 @@ impl EvmRpcDataSource {
             norm_options,
             stride_size: options.stride_size.max(1),
             stride_concurrency: options.stride_concurrency.max(1),
+            profile_block_timings: options.profile_block_timings,
         }
     }
 
@@ -74,6 +79,7 @@ impl EvmRpcDataSource {
         let stride_size = self.stride_size;
         let stride_concurrency = self.stride_concurrency;
         let commitment = commitment.to_string();
+        let profile_block_timings = self.profile_block_timings;
 
         let s = stream! {
             let mut inner = Box::pin(ingest_range(
@@ -85,6 +91,7 @@ impl EvmRpcDataSource {
                 stride_size,
                 stride_concurrency,
                 &commitment,
+                profile_block_timings,
             ).await);
 
             while let Some(item) = inner.next().await {

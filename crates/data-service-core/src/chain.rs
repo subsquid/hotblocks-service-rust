@@ -319,6 +319,7 @@ mod tests {
             parent_hash: parent_hash.to_string(),
             timestamp: Some(number * 1000),
             json_line_zstd: Bytes::new(),
+            timings: None,
         }
     }
 

@@ -116,6 +116,10 @@ struct Args {
     /// and finalized head is not in the new range
     #[arg(long)]
     auto_adjust_finalized_head: bool,
+
+    /// Emit per-block pipeline timing logs (target=block_timing) for latency profiling
+    #[arg(long)]
+    profile_block_timings: bool,
 }
 
 fn sqd_log_filter() -> tracing_subscriber::EnvFilter {
@@ -192,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
             },
             stride_size: args.http_rpc_stride_size,
             stride_concurrency: args.http_rpc_stride_concurrency,
+            profile_block_timings: args.profile_block_timings,
         },
     );
 
