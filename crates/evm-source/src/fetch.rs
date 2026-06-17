@@ -233,8 +233,10 @@ impl Rpc {
             return Ok(body);
         }
 
-        // Retry loop with mild backoff: 50ms → 100ms → 200ms → 500ms (capped)
-        let mut delay_ms: u64 = 50;
+        // Flat aggressive retry: the not-ready window is typically short
+        // (provider serves receipts a few hundred ms after the header),
+        // so a constant 50ms poll beats exponential backoff on the tail.
+        let delay_ms: u64 = 50;
         loop {
             let mut attempt = vec![body.clone()];
             match self.add_requested_data(&mut attempt, req).await {
@@ -247,7 +249,6 @@ impl Rpc {
                     if block.is_invalid {
                         // Not ready: null receipts/mismatched hash — retry
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        delay_ms = (delay_ms * 2).min(500);
                         continue;
                     }
                     // Validate hash consistency for logs
@@ -255,7 +256,6 @@ impl Rpc {
                         let mismatch = logs.iter().any(|l| l.block_hash != block.hash);
                         if mismatch {
                             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            delay_ms = (delay_ms * 2).min(500);
                             continue;
                         }
                     }
@@ -264,7 +264,6 @@ impl Rpc {
                         let mismatch = receipts.iter().any(|r| r.block_hash != block.hash);
                         if mismatch {
                             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            delay_ms = (delay_ms * 2).min(500);
                             continue;
                         }
                     }
