@@ -544,7 +544,8 @@ async fn test_speculative_two_blocks_emitted_in_order() {
         with_state_diffs: false,
     });
 
-    let mut stream = Box::pin(ingest_range(rpc, req, opts, 100, Some(101), 5, 5, "latest", false).await);
+    let mut stream =
+        Box::pin(ingest_range(rpc, req, opts, 100, Some(101), 5, 5, "latest", false).await);
 
     let mut all_block_numbers: Vec<u64> = Vec::new();
     // Collect with timeout to avoid hanging
