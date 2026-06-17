@@ -3,7 +3,7 @@
 use crate::metrics::get_block_ingestion_timestamp;
 use crate::service::DataService;
 use crate::source::DataSource;
-use crate::types::{Block, DataResponse, InvalidBaseBlock};
+use crate::types::{Block, DataResponse, InvalidBaseBlock, QueryError};
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -187,7 +187,7 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
         .await;
 
     let data_response: DataResponse = match result {
-        Err(InvalidBaseBlock { prev }) => {
+        Err(QueryError::InvalidBaseBlock(InvalidBaseBlock { prev })) => {
             return (
                 StatusCode::CONFLICT,
                 Json(PreviousBlocksResponse {
@@ -195,6 +195,14 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
                 }),
             )
                 .into_response()
+        }
+        Err(QueryError::Internal(e)) => {
+            tracing::error!(%e, "internal error while servicing /stream query");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Internal server error\n\n{e:#}"),
+            )
+                .into_response();
         }
         Ok(r) => r,
     };

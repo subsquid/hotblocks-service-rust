@@ -3,7 +3,7 @@
 use crate::chain::Chain;
 use crate::metrics::{record_block_ingestion, Metrics};
 use crate::source::{BlockBatch, DataSource, StreamError, StreamRequest};
-use crate::types::{Block, BlockHeader, BlockRef, DataResponse, InvalidBaseBlock};
+use crate::types::{Block, BlockHeader, BlockRef, DataResponse, InvalidBaseBlock, QueryError};
 use anyhow::Context;
 use futures::StreamExt;
 use std::sync::{Arc, RwLock};
@@ -452,7 +452,7 @@ impl<S: DataSource> DataService<S> {
         &self,
         from: u64,
         parent_hash: Option<&str>,
-    ) -> Result<DataResponse, InvalidBaseBlock> {
+    ) -> Result<DataResponse, QueryError> {
         let first_parent_number = self.get_chain_ref(|c| c.first_block().parent_number);
 
         let result = if from <= first_parent_number {
@@ -468,7 +468,7 @@ impl<S: DataSource> DataService<S> {
             match res {
                 Err(invalid) => {
                     self.metrics.inc_query("error");
-                    return Err(invalid);
+                    return Err(invalid.into());
                 }
                 Ok(resp) if resp.tail.is_some() => {
                     self.metrics.inc_query("cache");
@@ -481,7 +481,7 @@ impl<S: DataSource> DataService<S> {
                     match res2 {
                         Err(invalid) => {
                             self.metrics.inc_query("error");
-                            Err(invalid)
+                            Err(invalid.into())
                         }
                         Ok(r) => {
                             self.metrics.inc_query("cache");
@@ -524,7 +524,7 @@ impl<S: DataSource> DataService<S> {
         &self,
         from: u64,
         parent_hash: Option<&str>,
-    ) -> Result<DataResponse, InvalidBaseBlock> {
+    ) -> Result<DataResponse, QueryError> {
         let (tail, finalized_head, missing) = self.get_chain_ref(|c| {
             let missing = c.first_block().parent_number.saturating_sub(from) + 1;
             (c.snapshot(), c.get_finalized_head(), missing)
@@ -546,20 +546,18 @@ impl<S: DataSource> DataService<S> {
         // Eagerly await the first batch.
         let first_batch = match stream.next().await {
             None => {
-                return Err(InvalidBaseBlock { prev: vec![] });
+                return Err(QueryError::InvalidBaseBlock(InvalidBaseBlock { prev: vec![] }));
             }
             Some(Err(StreamError::Fork { previous_blocks })) => {
-                return Err(InvalidBaseBlock {
+                return Err(QueryError::InvalidBaseBlock(InvalidBaseBlock {
                     prev: previous_blocks,
-                });
+                }));
             }
             Some(Err(StreamError::Other(e))) => {
-                // Re-raise as an anyhow error through a panic-style path.
-                // The TS code re-throws non-fork errors as-is; we do the
-                // same by converting back to an error that propagates up.
-                // Since our function signature returns InvalidBaseBlock on
-                // Err, we panic here (internal error).
-                panic!("below-query stream error: {e}");
+                // The TS `belowQuery` re-throws non-fork errors as-is, which
+                // the HTTP layer turns into a 500. Surface it as an internal
+                // error rather than crashing the request task.
+                return Err(QueryError::Internal(e.context("below-query stream error")));
             }
             Some(Ok(batch)) => batch,
         };

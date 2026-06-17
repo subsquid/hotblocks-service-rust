@@ -68,6 +68,27 @@ pub struct InvalidBaseBlock {
     pub prev: Vec<BlockRef>,
 }
 
+/// Error returned by `DataService::query`.
+///
+/// Mirrors the TS `query` contract: a fork/invalid-base-block becomes an
+/// HTTP 409, while any other error is surfaced as an HTTP 500 (the TS
+/// `belowQuery` re-throws non-fork errors, which the HTTP layer turns into a
+/// 500). The `Internal` variant exists so a transient backfill error returns
+/// a proper response instead of crashing the request task.
+#[derive(Debug)]
+pub enum QueryError {
+    /// The supplied base block is not on the current chain → HTTP 409.
+    InvalidBaseBlock(InvalidBaseBlock),
+    /// An error occurred while servicing the query → HTTP 500.
+    Internal(anyhow::Error),
+}
+
+impl From<InvalidBaseBlock> for QueryError {
+    fn from(e: InvalidBaseBlock) -> Self {
+        QueryError::InvalidBaseBlock(e)
+    }
+}
+
 /// Response from a query — either a streaming backfill head + snapshot tail,
 /// or just a tail (cache hit), or nothing yet (wait for block).
 pub struct DataResponse {

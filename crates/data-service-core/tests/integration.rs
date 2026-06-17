@@ -414,6 +414,95 @@ async fn test_block_time_endpoint() {
 }
 
 // ---------------------------------------------------------------------------
+// Below-query internal error → 500 (regression: must not panic / drop the conn)
+// ---------------------------------------------------------------------------
+
+/// A source seeded at block 10 (parent 9) whose backfill stream fails with a
+/// non-fork error. Used to exercise the below-query error path: the request
+/// must receive a clean HTTP 500 rather than crashing the request task and
+/// dropping the connection.
+#[derive(Clone)]
+struct BackfillErrorSource {
+    seed: Block,
+}
+
+#[async_trait]
+impl DataSource for BackfillErrorSource {
+    async fn get_head(&self) -> anyhow::Result<BlockRef> {
+        Ok(self.seed.block_ref())
+    }
+    async fn get_finalized_head(&self) -> anyhow::Result<BlockRef> {
+        Ok(self.seed.block_ref())
+    }
+    fn get_finalized_stream(
+        &self,
+        req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+        let seed = self.seed.clone();
+        Box::pin(async_stream::stream! {
+            if req.from == seed.number {
+                // init() seeding request — yield the single seed block.
+                yield Ok(BlockBatch {
+                    blocks: vec![seed.clone()],
+                    finalized_head: Some(seed.block_ref()),
+                });
+            } else {
+                // below-query backfill request — simulate a transient failure.
+                yield Err(StreamError::Other(anyhow::anyhow!("simulated backfill failure")));
+            }
+        })
+    }
+    fn get_stream(
+        &self,
+        _req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+        // No further blocks — park so the chain stays seeded at block 10.
+        Box::pin(async_stream::stream! {
+            if false {
+                // Type hint for the stream item; never executed.
+                yield Ok(BlockBatch { blocks: vec![], finalized_head: None });
+            }
+            futures::future::pending::<()>().await;
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_stream_500_on_backfill_error() {
+    let source = BackfillErrorSource {
+        seed: make_block(10, "h10", 9, "h9"),
+    };
+    let handle = run_data_service(DataServiceOptions {
+        source,
+        block_cache_size: 1000,
+        port: 0,
+        auto_adjust_finalized_head: false,
+    })
+    .await
+    .unwrap();
+    let port = handle.port;
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    // fromBlock=5 is below the seeded first block (parent 9) → below-query,
+    // whose backfill stream fails. Must be a clean 500, not a dropped conn.
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/stream"))
+        .header("content-type", "application/json")
+        .body(r#"{"fromBlock": 5}"#)
+        .send()
+        .await
+        .expect("request must get a response, not a dropped connection");
+    assert_eq!(resp.status(), 500);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("simulated backfill failure"),
+        "500 body should carry the error: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Shutdown promptness test
 // ---------------------------------------------------------------------------
 
