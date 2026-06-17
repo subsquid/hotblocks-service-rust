@@ -145,8 +145,16 @@ impl RpcClient {
             }))
         });
 
+        // Keep connections warm and reused. A fresh HTTPS connection pays the
+        // TCP + TLS handshake and starts with a cold congestion window, so a
+        // reused connection is faster, especially for large receipts payloads.
+        // TCP keepalive stops the provider's load balancer / NAT from silently
+        // dropping idle connections (which would force such a reconnect), and a
+        // generous idle timeout keeps the pool warm through quieter chains.
         let http = reqwest::Client::builder()
-            .pool_max_idle_per_host(config.capacity)
+            .pool_max_idle_per_host(config.capacity.min(64))
+            .pool_idle_timeout(Duration::from_secs(120))
+            .tcp_keepalive(Duration::from_secs(30))
             .build()
             .expect("failed to build reqwest client");
 
