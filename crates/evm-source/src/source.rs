@@ -166,9 +166,15 @@ impl EvmRpcDataSource {
     /// passthrough of fresh batches — fixing the stall where an in-flight
     /// probe RTT delays emission of new blocks.
     ///
+    /// A confirmed finalized head is not emitted as its own batch: that would
+    /// share the consumer with head blocks and stall ingestion during an epoch's
+    /// finalization. It updates `current_finalized`, which the head-batch arm
+    /// attaches to the next head batch. Finality lags the head by minutes, so
+    /// deferring it one head block is safe.
+    ///
     /// Design:
     /// - A background task owns the probe queue and fires rounds (≤5 probes,
-    ///   ≥500 ms between rounds) over a watch channel.
+    ///   ≥500 ms between rounds) over a channel.
     /// - The stream loop does `tokio::select!` over the ingest stream and the
     ///   probe result channel, forwarding fresh batches immediately.
     fn finalize_stream<S>(
@@ -328,14 +334,12 @@ impl EvmRpcDataSource {
                                 // Probe round: nothing confirmed, continue
                             }
                             Some(Some(finalized_ref)) => {
-                                // New finalized head confirmed
+                                // New finalized head confirmed. Record it only;
+                                // the head-batch arm attaches `current_finalized`.
+                                // Emitting a finalized-only batch here would
+                                // serialize finalization ahead of head ingestion.
                                 if current_finalized.as_ref().is_none_or(|c| finalized_ref.number > c.number) {
-                                    current_finalized = Some(finalized_ref.clone());
-                                    // Emit a finalized-head-only batch
-                                    yield Ok(BlockBatch {
-                                        blocks: vec![],
-                                        finalized_head: Some(finalized_ref),
-                                    });
+                                    current_finalized = Some(finalized_ref);
                                 }
                             }
                         }
