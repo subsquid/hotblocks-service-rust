@@ -654,7 +654,7 @@ fn log_block_info(block: &BlockHeader, msg: &str) {
     info!(
         block_number = block.number,
         block_hash = %block.hash,
-        block_age_ms = ?age_ms,
+        block_age_ms = age_ms.unwrap_or(-1),
         "{msg}"
     );
 }
