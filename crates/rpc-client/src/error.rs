@@ -61,7 +61,7 @@ impl RpcError {
     }
 
     /// Is this error retryable for a plain call?
-    /// Mirrors TS `RpcClient.isConnectionError` + PLAN.md retryability table.
+    /// Mirrors TS `RpcClient.isConnectionError` + evm `isRetryableError`.
     pub fn is_retryable(&self, retry_internal_server_errors: bool) -> bool {
         match self {
             RpcError::RetryRequested(_) => true,

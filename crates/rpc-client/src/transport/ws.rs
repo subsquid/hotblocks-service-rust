@@ -4,7 +4,7 @@
 //! no subscriptions). A small round-robin pool of independent connections, each
 //! with its own reader task, writer task, pending map, and lazy reconnect.
 //!
-//! Key invariants (see WS_TRANSPORT_PLAN.md):
+//! Key invariants:
 //! - The global request-id counter lives in `RpcClient` and NEVER resets, so a
 //!   stale frame from a dropped socket can never collide with a reused id.
 //! - The pending map is keyed on the NUMERIC id only; a response whose id is not
