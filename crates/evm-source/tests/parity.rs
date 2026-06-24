@@ -94,10 +94,19 @@ fn state_diffs_key_is_camel_case() {
     let fixtures: Vec<Fixture> = serde_json::from_str(&content).unwrap();
     let mut nb = map_rpc_block(
         &fixtures[0].raw,
-        &MappingOptions { with_traces: false, with_state_diffs: true },
+        &MappingOptions {
+            with_traces: false,
+            with_state_diffs: true,
+        },
     );
     nb.state_diffs = Some(vec![]); // force the key to serialize
     let s = serde_json::to_string(&nb).unwrap();
-    assert!(s.contains("\"stateDiffs\""), "expected camelCase stateDiffs key; got: {s}");
-    assert!(!s.contains("state_diffs"), "snake_case state_diffs leaked: {s}");
+    assert!(
+        s.contains("\"stateDiffs\""),
+        "expected camelCase stateDiffs key; got: {s}"
+    );
+    assert!(
+        !s.contains("state_diffs"),
+        "snake_case state_diffs leaked: {s}"
+    );
 }
