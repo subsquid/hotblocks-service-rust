@@ -7,7 +7,7 @@ use rpc_client::{CallOptions, RpcClient, RpcError, RpcErrorInfo};
 
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::chain_utils::ChainUtils;
 use crate::rpc_data::{
@@ -281,10 +281,7 @@ impl Rpc {
             }
             retries += 1;
 
-            // Surface every retry. The original incident took ~2 days to
-            // diagnose largely because this loop was silent; a warn turns a
-            // stuck block into an immediate signal.
-            warn!(
+            debug!(
                 block = number,
                 attempt = retries,
                 max_retries = MAX_RETRIES,
