@@ -233,43 +233,73 @@ impl Rpc {
             return Ok(body);
         }
 
-        // Flat aggressive retry: the not-ready window is typically short
-        // (provider serves receipts a few hundred ms after the header),
-        // so a constant 50ms poll beats exponential backoff on the tail.
-        let delay_ms: u64 = 50;
+        // Retry by re-fetching the WHOLE block (header + data) as one unit,
+        // mirroring the TS `getBlocks` retry (evm-rpc/src/data-source/get-blocks.ts).
+        // The first attempt reuses the speculatively-fetched header (`body`) so
+        // a block that's ready immediately costs no extra eth_getBlockByNumber;
+        // every retry re-fetches via `get_block_batch`, so a reorg / load-balanced
+        // hash mismatch heals as soon as the canonical header arrives. Reusing a
+        // stale header across retries (the original bug) made such a mismatch
+        // permanent and hung the ingestion loop forever with no error.
+        //
+        // The retry is bounded; on exhaustion we surface the error so the
+        // ingestion loop logs it and restarts, like `getBlocks` throwing
+        // `_errorMessage` after its retries.
+        //
+        // Budget: 10 × 50ms = 500ms total — the same wall-clock window as the TS
+        // `getBlocks` (5 × 100ms), just polled finer. Unlike TS this runs at the
+        // chain *head* (speculative path), where receipts/logs legitimately lag
+        // the header, so the window must comfortably exceed that lag for normal
+        // head-following not to trip the (now fatal) bound.
+        const MAX_RETRIES: u32 = 10;
+        const DELAY_MS: u64 = 50;
+
+        let number = body.number;
+        let mut retries: u32 = 0;
+
+        // First attempt: enrich the header we already fetched speculatively.
+        // Network/RPC errors propagate (the client already retries transient
+        // ones internally via batch_call_reduce_on_retry).
+        let mut blocks = vec![body];
+        self.add_requested_data(&mut blocks, req).await?;
+
         loop {
-            let mut attempt = vec![body.clone()];
-            match self.add_requested_data(&mut attempt, req).await {
-                Err(e) => {
-                    // Network/RPC error — propagate
-                    return Err(e);
-                }
-                Ok(()) => {
-                    let block = attempt.remove(0);
-                    if block.is_invalid {
-                        // Not ready: null receipts/mismatched hash — retry
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        continue;
-                    }
-                    // Validate hash consistency for logs
-                    if let Some(ref logs) = block.logs {
-                        let mismatch = logs.iter().any(|l| l.block_hash != block.hash);
-                        if mismatch {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            continue;
-                        }
-                    }
-                    // Validate hash consistency for receipts
-                    if let Some(ref receipts) = block.receipts {
-                        let mismatch = receipts.iter().any(|r| r.block_hash != block.hash);
-                        if mismatch {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            continue;
-                        }
-                    }
-                    return Ok(block);
-                }
+            // Enrichment only populates logs/receipts once they match the header
+            // hash (see add_logs/add_receipts), so a ready block is simply one
+            // that exists and wasn't marked invalid.
+            if blocks.first().is_some_and(|b| !b.is_invalid) {
+                return Ok(blocks.remove(0));
             }
+
+            let err_msg = blocks
+                .first()
+                .and_then(|b| b.error_message.clone())
+                .unwrap_or_else(|| "block not available".to_string());
+
+            if retries >= MAX_RETRIES {
+                bail!("failed to enrich block {number} after {MAX_RETRIES} retries: {err_msg}");
+            }
+            retries += 1;
+
+            // Surface every retry. The original incident took ~2 days to
+            // diagnose largely because this loop was silent; a warn turns a
+            // stuck block into an immediate signal.
+            warn!(
+                block = number,
+                attempt = retries,
+                max_retries = MAX_RETRIES,
+                reason = %err_msg,
+                "block enrichment not ready, retrying whole-block fetch"
+            );
+
+            tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+
+            // Re-fetch the whole block (header + data) as one unit — TS
+            // getBlockBatch semantics. An empty result (not produced yet / chain
+            // break) leaves `blocks` empty and we keep retrying until the bound.
+            blocks = self
+                .get_block_batch(std::slice::from_ref(&number), req)
+                .await?;
         }
     }
 
@@ -588,9 +618,14 @@ impl Rpc {
                         raw_receipts.into_iter().flatten().collect();
 
                     // Check all receipts belong to this block (hash consistency)
-                    let hash_mismatch = receipts.iter().any(|r| r.block_hash != block.hash);
-                    if hash_mismatch {
-                        block.mark_invalid("eth_getBlockReceipts returned receipts for a different block (load-balanced inconsistency, will retry)");
+                    if let Some(bad) = receipts.iter().find(|r| r.block_hash != block.hash) {
+                        let msg = format!(
+                            "eth_getBlockReceipts returned receipts for a different block \
+                             (header {}, receipt block_hash {}) — reorg / load-balanced \
+                             inconsistency, will retry",
+                            block.hash, bad.block_hash
+                        );
+                        block.mark_invalid(msg);
                         continue;
                     }
 
@@ -712,9 +747,14 @@ impl Rpc {
             }
 
             // Hash consistency check
-            let hash_mismatch = receipts.iter().any(|r| r.block_hash != block.hash);
-            if hash_mismatch {
-                block.mark_invalid("eth_getTransactionReceipt returned receipts for a different block (load-balanced inconsistency, will retry)");
+            if let Some(bad) = receipts.iter().find(|r| r.block_hash != block.hash) {
+                let msg = format!(
+                    "eth_getTransactionReceipt returned receipts for a different block \
+                     (header {}, receipt block_hash {}) — reorg / load-balanced \
+                     inconsistency, will retry",
+                    block.hash, bad.block_hash
+                );
+                block.mark_invalid(msg);
                 continue;
             }
 

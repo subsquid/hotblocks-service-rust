@@ -132,6 +132,39 @@ fn make_rpc_receipt(block_hash: &str, block_number: u64, tx_hash: &str) -> Value
     })
 }
 
+/// Block 100 with a single transaction. Shared by the mismatch test's seed body
+/// and its mock's `eth_getBlockByNumber` response, so a whole-block re-fetch
+/// returns a block consistent with the served receipts.
+fn make_block_100_with_tx(hash: &str) -> Value {
+    let mut b = make_rpc_block(
+        100,
+        hash,
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    b["transactions"] = json!([{
+        "hash": "0xdeadbeef",
+        "nonce": "0x0",
+        "blockHash": hash,
+        "blockNumber": "0x64",
+        "transactionIndex": "0x0",
+        "from": "0x0000000000000000000000000000000000000001",
+        "to": "0x0000000000000000000000000000000000000002",
+        "value": "0x0",
+        "gas": "0x5208",
+        "gasPrice": "0x1",
+        "input": "0x",
+        "type": "0x2",
+        "chainId": "0x1",
+        "maxFeePerGas": "0x1",
+        "maxPriorityFeePerGas": "0x1",
+        "accessList": [],
+        "v": "0x0",
+        "r": "0x0",
+        "s": "0x0"
+    }]);
+    b
+}
+
 fn make_client(url: &str) -> Arc<rpc_client::RpcClient> {
     use rpc_client::{RpcClient, RpcClientConfig};
     Arc::new(RpcClient::new(RpcClientConfig {
@@ -177,6 +210,16 @@ async fn enrich_retry_handler(
 
         let result = match method.as_str() {
             "eth_chainId" => json!("0x1"),
+            "eth_getBlockByNumber" => {
+                let tag = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                if tag == "latest" || tag == "finalized" {
+                    Value::Null
+                } else {
+                    // A real node always serves the header; the whole-block retry
+                    // re-fetches it each attempt.
+                    make_block_100_with_tx(s.block_hash)
+                }
+            }
             "eth_getBlockReceipts" => {
                 let tag = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
                 if tag == "latest" {
@@ -241,38 +284,10 @@ async fn test_enrich_retry_on_receipt_hash_mismatch() {
     let client = make_client(&url);
     let rpc = Arc::new(Rpc::new(client, RpcOptions::default()));
 
-    // Build a raw block body for block 100 with 1 transaction
-    let raw_block_json = {
-        let mut b = make_rpc_block(
-            100,
-            block_hash,
-            "0x0000000000000000000000000000000000000000000000000000000000000000",
-        );
-        b["transactions"] = json!([{
-            "hash": "0xdeadbeef",
-            "nonce": "0x0",
-            "blockHash": block_hash,
-            "blockNumber": "0x64",
-            "transactionIndex": "0x0",
-            "from": "0x0000000000000000000000000000000000000001",
-            "to": "0x0000000000000000000000000000000000000002",
-            "value": "0x0",
-            "gas": "0x5208",
-            "gasPrice": "0x1",
-            "input": "0x",
-            "type": "0x2",
-            "chainId": "0x1",
-            "maxFeePerGas": "0x1",
-            "maxPriorityFeePerGas": "0x1",
-            "accessList": [],
-            "v": "0x0",
-            "r": "0x0",
-            "s": "0x0"
-        }]);
-        b
-    };
-
-    let rpc_block: evm_source::rpc_data::RpcBlock = serde_json::from_value(raw_block_json).unwrap();
+    // Build a raw block body for block 100 with 1 transaction (same shape the
+    // mock's eth_getBlockByNumber serves on the whole-block retry).
+    let rpc_block: evm_source::rpc_data::RpcBlock =
+        serde_json::from_value(make_block_100_with_tx(block_hash)).unwrap();
     let body = evm_source::rpc_data::RawRpcBlock::new(100, block_hash.to_string(), rpc_block);
 
     let req = DataRequest {
@@ -321,6 +336,7 @@ async fn test_enrich_retry_on_null_receipts() {
 
     #[derive(Clone)]
     struct NullReceiptsState {
+        block_hash: &'static str,
         receipt_call_count: Arc<AtomicUsize>,
     }
 
@@ -347,6 +363,18 @@ async fn test_enrich_retry_on_null_receipts() {
 
             let result = match method.as_str() {
                 "eth_chainId" => json!("0x1"),
+                "eth_getBlockByNumber" => {
+                    let tag = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                    if tag == "latest" || tag == "finalized" {
+                        Value::Null
+                    } else {
+                        make_rpc_block(
+                            50,
+                            s.block_hash,
+                            "0x0000000000000000000000000000000000000000000000000000000000000000",
+                        )
+                    }
+                }
                 "eth_getBlockReceipts" => {
                     let tag = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
                     if tag == "latest" {
@@ -378,6 +406,7 @@ async fn test_enrich_retry_on_null_receipts() {
     }
 
     let ns = NullReceiptsState {
+        block_hash,
         receipt_call_count: receipt_count_clone,
     };
     let app = Router::new()
