@@ -82,3 +82,22 @@ fn parity_base_traces() {
         },
     );
 }
+
+/// Regression: the top-level statediffs key must serialize as camelCase
+/// `stateDiffs`, not snake_case `state_diffs`. The Rust port shipped 0.1.3 with
+/// `state_diffs`, which HotblocksDB/consumers (expecting `stateDiffs`) silently
+/// mishandled. No fixture exercises statediffs, so guard the key explicitly.
+#[test]
+fn state_diffs_key_is_camel_case() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/base-logs.json");
+    let content = fs::read_to_string(&path).unwrap();
+    let fixtures: Vec<Fixture> = serde_json::from_str(&content).unwrap();
+    let mut nb = map_rpc_block(
+        &fixtures[0].raw,
+        &MappingOptions { with_traces: false, with_state_diffs: true },
+    );
+    nb.state_diffs = Some(vec![]); // force the key to serialize
+    let s = serde_json::to_string(&nb).unwrap();
+    assert!(s.contains("\"stateDiffs\""), "expected camelCase stateDiffs key; got: {s}");
+    assert!(!s.contains("state_diffs"), "snake_case state_diffs leaked: {s}");
+}

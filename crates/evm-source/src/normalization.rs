@@ -14,12 +14,15 @@ use crate::types::{qty2_u64, safe_qty2_u64, to_qty};
 
 /// Normalized block output — matches the TypeScript Block data.ts interface exactly.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NormalizedBlock {
     pub header: NormalizedHeader,
     pub transactions: Vec<NormalizedTransaction>,
     pub logs: Vec<NormalizedLog>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traces: Option<Vec<NormalizedTrace>>,
+    // TS emits this key as camelCase `stateDiffs`; without rename_all serde
+    // would serialize the snake_case field name and silently break consumers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_diffs: Option<Vec<NormalizedStateDiff>>,
 }
