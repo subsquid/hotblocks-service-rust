@@ -435,9 +435,13 @@ pub struct TraceFrame {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TraceTransactionReplay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    // `trace_replayBlockTransactions` returns these keys camelCase (`stateDiff`,
+    // `transactionHash`). Without the rename they silently stayed None, dropping
+    // all trace-API statediffs (and breaking the transaction_hash association).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_diff: Option<serde_json::Map<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]

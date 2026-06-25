@@ -829,8 +829,12 @@ impl Rpc {
             return Ok(());
         }
 
-        // Determine what replay tracers we need
-        let need_replay_trace = req.traces && req.use_trace_api && !req.state_diffs;
+        // Determine what replay tracers we need. Request the `trace` tracer
+        // whenever traces are wanted via the trace API — even if statediffs are
+        // also requested (both come from one trace_replayBlockTransactions call).
+        // The previous `&& !req.state_diffs` dropped traces on use_trace_api
+        // chains that also fetch statediffs (e.g. gnosis).
+        let need_replay_trace = req.traces && req.use_trace_api;
         let need_replay_statediff = req.state_diffs && !req.use_debug_api_for_state_diffs;
         let need_replay = need_replay_trace || need_replay_statediff;
 
