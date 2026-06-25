@@ -899,6 +899,42 @@ impl Rpc {
             }
         }
 
+        // Completeness check for the debug-API paths (mirrors add_logs/add_receipts).
+        // `debug_traceBlockByHash` (callTracer / prestateTracer) yields exactly one
+        // entry per transaction, so a block that has transactions but came back with
+        // no trace/stateDiff entries was NOT served correctly: fetch_debug_frames /
+        // fetch_debug_state_diffs collapse any RPC error or a `null` result (including
+        // the "not found" / "cannot query unfinalized data" responses they normalize
+        // to Null) into an empty `vec![]`. Without this check that empty vector is
+        // stored — and cached — as if the block legitimately had no traces, silently
+        // serving finalized blocks with empty traces/stateDiffs. Mark such blocks
+        // invalid so enrich_block_with_retry re-fetches the whole block instead of
+        // accepting the gap. A block with zero transactions correctly has no entries
+        // and is left untouched.
+        for &i in &traceable {
+            let block = &mut blocks[i];
+            if block.is_invalid || block.block.transactions.is_empty() {
+                continue;
+            }
+            if req.traces && !req.use_trace_api {
+                let n_frames = block.debug_frames.as_ref().map_or(0, |f| f.len());
+                if n_frames == 0 {
+                    block.mark_invalid(
+                        "debug_traceBlockByHash returned no traces for a block with transactions (not ready)",
+                    );
+                    continue;
+                }
+            }
+            if req.state_diffs && req.use_debug_api_for_state_diffs {
+                let n_diffs = block.debug_state_diffs.as_ref().map_or(0, |d| d.len());
+                if n_diffs == 0 {
+                    block.mark_invalid(
+                        "debug_traceBlockByHash(prestateTracer) returned no stateDiffs for a block with transactions (not ready)",
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
