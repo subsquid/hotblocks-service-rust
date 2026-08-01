@@ -11,8 +11,9 @@ same change (IB-20).
 Unknown routes → 404; wrong method on a known route → 405. Text bodies are
 `text/plain`; JSON bodies `application/json`.
 
-**IB-2 — Compression negotiation.** Responses of `POST /stream` are always
-content-encoded: `zstd` when the request's `Accept-Encoding` contains the token
+**IB-2 — Compression negotiation.** Non-empty successful responses (200) of
+`POST /stream` are always content-encoded: `zstd` when the request's
+`Accept-Encoding` contains the token
 `zstd` (substring match — pinned for predecessor compatibility, ADR-1), else `gzip`.
 There is no identity mode. `Content-Encoding` and `Vary: Accept-Encoding` are set.
 The body is a concatenation of **independent per-block frames**: zstd frames
@@ -116,7 +117,7 @@ namespace-interpreted — divergence from the predecessor's namespace globs, acc
 Startup validation per REQ-32/FM-50.
 
 **IB-11 — Process contract.** Exit 0 on clean shutdown; non-zero on startup failure
-(FM-31) and terminal divergence (FM-30, per ADR-12 ⚠ pending ratification). `SIGINT`/`SIGTERM` → graceful
+(FM-31) and terminal divergence (FM-30, per ADR-12). `SIGINT`/`SIGTERM` → graceful
 drain within `P-SHUTDOWN-GRACE`; a second signal → immediate exit 130.
 
 ## Metrics binding

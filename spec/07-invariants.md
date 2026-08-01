@@ -59,7 +59,7 @@ provisionally to the whole buffer (WP-12) — the arriving blocks re-validate by
 linkage. A T1 re-INIT opens a new epoch and MAY seed a lower watermark, because the
 seed is upstream's finalized head and FM-26 permits that value to oscillate; the
 reset is alarmed (WP-20, OB-7). Monotonicity across epochs is not offered and MUST NOT
-be relied on (ADR-14 ⚠ pending ratification). A seed that contradicts the buffer being discarded (same height,
+be relied on (ADR-14). A seed that contradicts the buffer being discarded (same height,
 different hash) is not a regression but unrecoverable divergence — FM-19/FM-30; beyond
 that buffer's extent the comparison has no state to run against and is not claimed.
 *Why:* a regressing or forged finality watermark breaks INV-11's meaning; scoping it

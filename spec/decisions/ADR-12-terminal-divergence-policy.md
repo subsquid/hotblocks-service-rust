@@ -1,6 +1,6 @@
 # ADR-12 — Terminal divergence: alarm, then exit non-zero
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 

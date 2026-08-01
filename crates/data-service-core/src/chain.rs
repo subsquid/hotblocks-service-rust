@@ -51,6 +51,11 @@ impl Chain {
     ///
     /// Mirrors `Chain.push` in chain.ts.
     pub fn push(&mut self, new_block: Block) {
+        // DEF-4; a descending block leaves `blocks` unsorted and `bisect` blind.
+        assert!(
+            new_block.parent_number < new_block.number,
+            "block claims a parent at or above its own height"
+        );
         if self.last_block().number == new_block.parent_number {
             assert!(
                 is_chain(self.last_block(), &new_block),
@@ -157,8 +162,10 @@ impl Chain {
         from: u64,
         base_block_hash: Option<&str>,
     ) -> Result<DataResponse, InvalidBaseBlock> {
-        // Caller should do a below-query.
-        if from <= self.first_block().parent_number {
+        // Caller should do a below-query. A root has no below-window region:
+        // its self-height parent coordinate names no block (DEF-4 / RP-3).
+        let first = self.first_block();
+        if first.parent_number != first.number && from <= first.parent_number {
             return Ok(DataResponse {
                 finalized_head: None,
                 head: None,
@@ -264,6 +271,14 @@ impl Chain {
         &self.blocks[0]
     }
 
+    /// The buffered ref at `number`, if that height is held (unique by INV-2).
+    pub fn ref_at(&self, number: u64) -> Option<BlockRef> {
+        self.blocks
+            .iter()
+            .find(|b| b.number == number)
+            .map(|b| b.block_ref())
+    }
+
     pub fn last_block(&self) -> &Block {
         self.blocks.last().expect("chain is never empty")
     }
@@ -355,6 +370,15 @@ mod tests {
         let mut c = Chain::new(genesis(), 100, false);
         // Wrong parent hash for block 1.
         c.push(make_block(1, "h1", 0, "wrong"));
+    }
+
+    #[test]
+    #[should_panic(expected = "block claims a parent at or above its own height")]
+    fn push_descending_height() {
+        let mut c = chain_of(11);
+        // Parent ref names the buffered tip, but the block sits below it:
+        // appending would leave `blocks` unsorted and `bisect` unusable.
+        c.push(make_block(5, "h5b", 10, "h10"));
     }
 
     // ---- push / reorg ----------------------------------------------------
@@ -513,6 +537,14 @@ mod tests {
         let res = c.query(2, None).unwrap();
         assert!(res.tail.is_some());
         assert_eq!(res.tail.unwrap()[0].number, 2);
+    }
+
+    #[test]
+    fn query_at_buffered_root_returns_data() {
+        let c = chain_of(5);
+        let res = c.query(0, None).unwrap();
+        let tail = res.tail.expect("a root is served from the window");
+        assert_eq!(tail[0].number, 0);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # ADR-14 — Monotonicity is scoped to an epoch and an instance
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 
