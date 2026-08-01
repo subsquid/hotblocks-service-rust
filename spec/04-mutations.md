@@ -150,7 +150,7 @@ resolves and the single block at `fh` is acquirable. *Post:*
 process start is a startup failure (exit, FM-31); failure of a re-INIT (WP-9 ladder)
 re-enters the ladder. T1 discards any previous buffer entirely; it is the sanctioned
 destructive reset and MUST be alarmed when it discards a non-trivial buffer (OB-7).
-A re-INIT ends the current epoch and starts the next (INV-12, ADR-14 ⚠ pending ratification): `fh` below the
+A re-INIT ends the current epoch and starts the next (INV-12, ADR-14): `fh` below the
 previous epoch's finalized head is permitted — FM-26 lets upstream's finalized head
 oscillate — and MUST be alarmed as a watermark regression. `fh` naming a height the
 buffer being discarded holds under a different hash is unrecoverable divergence
@@ -166,9 +166,9 @@ is not owed.
 only paths by which buffered data leaves (INV-14). Violation of any precondition is an
 integrity violation (WP-5).
 
-**WP-23 — T4 FINALIZE.** Runs on a report attached to an input batch (DEF-20) or on
-one the confirmation prober delivers alone — T4 is not conditioned on blocks arriving.
-With report `r` (post-arbitration, WP-12): if
+**WP-23 — T4 FINALIZE.** Runs on a report attached opportunistically to a non-empty
+input batch (DEF-20, ADR-6). The confirmation prober never emits a standalone
+finality-only batch. With report `r` (post-arbitration, WP-12): if
 `r.number < b₁.number` → no-op. If `r.number > bₙ.number` → `f' = n` (whole buffer;
 see WP-12). Else require ∃ `i ≥ f`: `bᵢ.number = r.number ∧ bᵢ.hash = r.hash` →
 `f' = max(f, i)`; a hash mismatch is an integrity violation (WP-5). `f` never

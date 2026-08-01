@@ -1,12 +1,53 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use data_service_core::service::{run_data_service, DataServiceOptions};
+use data_service_core::service::{run_data_service, DataServiceOptions, RunEnd};
 use evm_source::fetch::RpcOptions;
 use evm_source::source::{EvmRpcDataSource, EvmRpcDataSourceOptions};
 use evm_source::types::DataRequest;
 use rpc_client::{RpcClient, RpcClientConfig};
+
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+enum ShutdownReason {
+    Clean,
+    Failure(anyhow::Error),
+}
+
+fn classify_run_end(end: Result<RunEnd, tokio::sync::oneshot::error::RecvError>) -> ShutdownReason {
+    match end {
+        Ok(RunEnd::Stopped) => ShutdownReason::Clean,
+        Ok(RunEnd::StartupFailure(error)) => {
+            ShutdownReason::Failure(error.context("startup failure (FM-31)"))
+        }
+        Ok(RunEnd::Terminal(error)) => {
+            ShutdownReason::Failure(error.context("terminal divergence (FM-30)"))
+        }
+        Err(error) => ShutdownReason::Failure(
+            anyhow::Error::new(error)
+                .context("ingestion task vanished before reporting how it ended (FM-32)"),
+        ),
+    }
+}
+
+async fn finish_shutdown<F>(shutdown: F, reason: ShutdownReason) -> anyhow::Result<()>
+where
+    F: Future<Output = ()>,
+{
+    let drained = tokio::time::timeout(SHUTDOWN_GRACE, shutdown).await;
+    match (drained, reason) {
+        (Ok(()), ShutdownReason::Clean) => Ok(()),
+        (Ok(()), ShutdownReason::Failure(error)) => Err(error),
+        (Err(_), ShutdownReason::Clean) => {
+            anyhow::bail!("service drain exceeded the shutdown grace")
+        }
+        (Err(_), ShutdownReason::Failure(error)) => {
+            Err(error.context("service drain also exceeded the shutdown grace"))
+        }
+    }
+}
 
 /// Hot block data service for EVM
 #[derive(Parser, Debug)]
@@ -201,7 +242,7 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
-    let handle = run_data_service(DataServiceOptions {
+    let mut handle = run_data_service(DataServiceOptions {
         source,
         block_cache_size: args.block_cache_size,
         port: args.port,
@@ -211,25 +252,99 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("listening on port {}", handle.port);
 
-    // Wait for SIGINT or SIGTERM.
-    {
+    // Serve until a signal arrives — but exit non-zero if ingestion dies
+    // before its first block (WP-9/FM-31) or ends in terminal divergence
+    // (FM-30): the process must never keep serving with ingestion dead.
+    let shutdown_reason = {
         use tokio::signal::unix::{signal, SignalKind};
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
+        let mut started_done = false;
+        loop {
+            tokio::select! {
+                _ = sigint.recv() => break ShutdownReason::Clean,
+                _ = sigterm.recv() => break ShutdownReason::Clean,
+                res = &mut handle.started, if !started_done => {
+                    started_done = true;
+                    match res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            break ShutdownReason::Failure(
+                                error.context("startup failure (FM-31)")
+                            );
+                        }
+                        Err(error) => {
+                            break ShutdownReason::Failure(
+                                anyhow::Error::new(error)
+                                    .context("startup supervisor vanished (FM-32)")
+                            );
+                        }
+                    }
+                }
+                end = &mut handle.ended => {
+                    break classify_run_end(end);
+                }
+            }
+        }
+    };
+    tracing::info!("shutting down");
+
+    // Hard-exit on a second signal (either kind) while we drain (IB-11).
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut sigint), Ok(mut sigterm)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) else {
+            return; // no signal handlers — no force path
+        };
         tokio::select! {
             _ = sigint.recv() => {},
             _ = sigterm.recv() => {},
         }
-    }
-    tracing::info!("shutting down");
-
-    // Spawn a task that hard-exits on a second SIGINT while we drain.
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::warn!("second interrupt — forcing exit");
+        tracing::warn!("second signal — forcing exit");
         std::process::exit(130);
     });
 
-    handle.shutdown().await;
-    Ok(())
+    // Every reason, including terminal failure, goes through the same bounded
+    // drain. The original failure is returned only after in-flight responses
+    // have had their grace period (ADR-12 / IB-11).
+    finish_shutdown(handle.shutdown(), shutdown_reason).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn vanished_ingestion_task_is_a_failure() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<RunEnd>();
+        drop(tx);
+
+        let reason = classify_run_end(rx.await);
+        let ShutdownReason::Failure(error) = reason else {
+            panic!("a vanished ingestion task must not be a clean stop");
+        };
+        assert!(error.to_string().contains("ingestion task vanished"));
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_is_returned_after_drain() {
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained_by_shutdown = Arc::clone(&drained);
+        let reason = classify_run_end(Ok(RunEnd::Terminal(anyhow::anyhow!("diverged"))));
+
+        let error = finish_shutdown(
+            async move {
+                drained_by_shutdown.store(true, Ordering::SeqCst);
+            },
+            reason,
+        )
+        .await
+        .expect_err("terminal divergence remains a non-zero result");
+
+        assert!(drained.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("terminal divergence"));
+    }
 }

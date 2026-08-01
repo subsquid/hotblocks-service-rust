@@ -37,7 +37,7 @@ carries no version or epoch token and ADR-1 pins it that way, so a client fanned
 the two instances of FM-34, or reading across a T1 re-INIT, can observe an older
 version. That flapping is sanctioned, never corruption — each response is one
 instance's coherent snapshot. A client needing cross-instance monotonicity must pin an
-instance itself; the service offers no affinity mechanism (ADR-14 ⚠ pending ratification).
+instance itself; the service offers no affinity mechanism (ADR-14).
 
 **CN-6 — Maintenance transparency.** [MUST] Eviction (T5) and any internal
 housekeeping are invisible in query results except through the sanctioned observables:

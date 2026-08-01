@@ -1326,6 +1326,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "data-service-core",
+ "flate2",
+ "futures",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "zstd",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

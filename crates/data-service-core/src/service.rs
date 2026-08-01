@@ -19,10 +19,47 @@ pub struct DataServiceOptions<S> {
     pub auto_adjust_finalized_head: bool,
 }
 
+/// FM-30: a T1 re-seed named a height the buffer it would discard holds
+/// under a different hash (WP-20/INV-12) — unrecoverable divergence, not a
+/// re-seed.
+#[derive(Debug)]
+pub struct DivergentReseed {
+    pub seed: BlockRef,
+    pub held: BlockRef,
+}
+
+impl std::fmt::Display for DivergentReseed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "re-seed names {}#{} but the buffer holds {} at that height",
+            self.seed.number, self.seed.hash, self.held.hash
+        )
+    }
+}
+
+impl std::error::Error for DivergentReseed {}
+
+/// How the ingestion run ended. Anything but `Stopped` requires action from
+/// the binary: exit non-zero per IB-11 (FM-31 startup failure, FM-30
+/// terminal divergence — ADR-12).
+#[derive(Debug)]
+pub enum RunEnd {
+    /// `stop()` or shutdown cancellation.
+    Stopped,
+    /// WP-9/FM-31: the first-ever session died before ingesting a block.
+    StartupFailure(anyhow::Error),
+    /// FM-30: unrecoverable divergence — rollback below finality, or a
+    /// divergent re-seed.
+    Terminal(anyhow::Error),
+}
+
 /// Handle returned by `run_data_service`.
 pub struct DataServiceHandle {
     pub port: u16,
     pub started: tokio::sync::oneshot::Receiver<anyhow::Result<()>>,
+    /// Resolves when the ingestion run ends; `RunEnd` says how (IB-11).
+    pub ended: tokio::sync::oneshot::Receiver<RunEnd>,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     cancel_tx: watch::Sender<bool>,
     server_task: tokio::task::JoinHandle<()>,
@@ -59,6 +96,7 @@ pub async fn run_data_service<S: DataSource>(
     service.init().await?;
 
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Build the axum router.
@@ -94,12 +132,14 @@ pub async fn run_data_service<S: DataSource>(
             let _ = started_tx.send(result);
         });
 
-        svc2.run().await;
+        let end = svc2.run().await;
+        let _ = ended_tx.send(end);
     });
 
     Ok(DataServiceHandle {
         port,
         started: started_rx,
+        ended: ended_rx,
         shutdown_tx,
         cancel_tx,
         server_task,
@@ -216,6 +256,30 @@ impl<S: DataSource> DataService<S> {
         );
         let seed = batch.blocks.into_iter().next().unwrap();
         let mut guard = self.chain_write();
+        if let Some(prev) = guard.as_ref() {
+            // WP-20: a seed naming a height the buffer being discarded holds
+            // under a different hash is unrecoverable divergence (FM-30),
+            // not a re-seed. Discard nothing.
+            if let Some(held) = prev.ref_at(seed.number) {
+                if held.hash != seed.hash {
+                    return Err(anyhow::Error::new(DivergentReseed {
+                        seed: seed.block_ref(),
+                        held,
+                    }));
+                }
+            }
+            let prev_finalized = prev.get_finalized_head();
+            if seed.number < prev_finalized.number {
+                // WP-20: an epoch reset below the previous watermark is
+                // legal but MUST be alarmed as a watermark regression.
+                error!(
+                    seed_number = seed.number,
+                    seed_hash = %seed.hash,
+                    prev_finalized_number = prev_finalized.number,
+                    "watermark regression: re-seed opens a new epoch below the previous finalized head"
+                );
+            }
+        }
         *guard = Some(Chain::new(
             seed,
             self.buffer_size,
@@ -225,21 +289,31 @@ impl<S: DataSource> DataService<S> {
         Ok(())
     }
 
-    /// Main ingestion loop. Runs until `stop()` is called or a fatal error
-    /// occurs.  Mirrors `DataService.run()` in data-service.ts.
-    pub async fn run(&self) {
+    fn stop_requested(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Relaxed) || *self.cancel_rx.borrow()
+    }
+
+    /// Main ingestion loop. Runs until `stop()` is called or the run ends per
+    /// `RunEnd` — the ladder retries everything else forever (LIV-2).
+    /// Mirrors `DataService.run()` in data-service.ts.
+    pub async fn run(&self) -> RunEnd {
         let mut base: BlockRef = self.get_chain_ref(|c| c.get_header().block_ref());
         let mut stacked = 0i32;
         let mut first_block_ingested = false;
 
         loop {
-            if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
+            if self.stop_requested() {
+                return RunEnd::Stopped;
             }
 
             let session_result = if stacked > 5 {
                 // Full re-init.
                 match self.init().await {
+                    // WP-20: a divergent seed is FM-30, not a retry.
+                    Err(e) if e.is::<DivergentReseed>() => {
+                        error!(%e, "terminal divergence on re-seed");
+                        return RunEnd::Terminal(e);
+                    }
                     Err(e) => Err(StreamError::Other(e)),
                     Ok(()) => {
                         base = self.get_chain_ref(|c| c.get_header().block_ref());
@@ -251,8 +325,8 @@ impl<S: DataSource> DataService<S> {
                 self.ingest_session(&base, &mut first_block_ingested).await
             };
 
-            if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
+            if self.stop_requested() {
+                return RunEnd::Stopped;
             }
 
             match session_result {
@@ -261,7 +335,9 @@ impl<S: DataSource> DataService<S> {
                     if !first_block_ingested {
                         let _ = self.started_tx.send(Err(()));
                         error!("data ingestion unexpectedly terminated before first block");
-                        return;
+                        return RunEnd::StartupFailure(anyhow::anyhow!(
+                            "head stream ended before the first block was ingested"
+                        ));
                     }
                     let head = self.get_chain_ref(|c| c.get_header().block_ref());
                     stacked = if head.number == base.number {
@@ -293,6 +369,7 @@ impl<S: DataSource> DataService<S> {
                             base = fb;
                         }
                         None => {
+                            // FM-30: divergence at or below the finalized head.
                             let finalized = self.get_finalized_head();
                             error!(
                                 finalized_head_number = finalized.number,
@@ -303,7 +380,12 @@ impl<S: DataSource> DataService<S> {
                             if !first_block_ingested {
                                 let _ = self.started_tx.send(Err(()));
                             }
-                            return;
+                            return RunEnd::Terminal(anyhow::anyhow!(
+                                "rollback behind finalized head {}#{} (fork refs: {:?})",
+                                finalized.number,
+                                finalized.hash,
+                                previous_blocks
+                            ));
                         }
                     }
                 }
@@ -311,7 +393,9 @@ impl<S: DataSource> DataService<S> {
                     if !first_block_ingested {
                         let _ = self.started_tx.send(Err(()));
                         error!(%err, "data ingestion terminated before first block");
-                        return;
+                        return RunEnd::StartupFailure(
+                            err.context("first ingestion session died before its first block"),
+                        );
                     }
                     let head = self.get_chain_ref(|c| c.get_header().block_ref());
                     stacked = if head.number == base.number {
@@ -337,7 +421,8 @@ impl<S: DataSource> DataService<S> {
         first_block_ingested: &mut bool,
     ) -> Result<(), StreamError> {
         let mut stream = self.source.get_stream(StreamRequest {
-            from: base.number + 1,
+            // WP-14: at the coordinate ceiling there is no next block to ask for.
+            from: base.number.saturating_add(1),
             to: None,
             parent_hash: Some(base.hash.clone()),
         });
@@ -480,9 +565,12 @@ impl<S: DataSource> DataService<S> {
         from: u64,
         parent_hash: Option<&str>,
     ) -> Result<DataResponse, QueryError> {
-        let first_parent_number = self.get_chain_ref(|c| c.first_block().parent_number);
+        let below_window = self.get_chain_ref(|c| {
+            let first = c.first_block();
+            first.parent_number != first.number && from <= first.parent_number
+        });
 
-        let result = if from <= first_parent_number {
+        let result = if below_window {
             let res = self.below_query(from, parent_hash).await;
             match &res {
                 Err(_) => self.metrics.inc_query("error"),
@@ -553,7 +641,11 @@ impl<S: DataSource> DataService<S> {
         parent_hash: Option<&str>,
     ) -> Result<DataResponse, QueryError> {
         let (tail, finalized_head, missing) = self.get_chain_ref(|c| {
-            let missing = c.first_block().parent_number.saturating_sub(from) + 1;
+            let missing = c
+                .first_block()
+                .parent_number
+                .saturating_sub(from)
+                .saturating_add(1);
             (c.snapshot(), c.get_finalized_head(), missing)
         });
 
@@ -561,7 +653,7 @@ impl<S: DataSource> DataService<S> {
 
         info!(from_block = from, missing, "below query");
 
-        let to = from + missing - 1;
+        let to = from.saturating_add(missing - 1);
         let parent_hash_owned = parent_hash.map(|s| s.to_string());
 
         let mut stream = self.source.get_finalized_stream(StreamRequest {

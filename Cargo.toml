@@ -5,6 +5,7 @@ members = [
     "crates/rpc-client",
     "crates/evm-source",
     "crates/evm-data-service",
+    "crates/harness",
 ]
 
 [workspace.package]
