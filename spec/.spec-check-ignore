@@ -1,0 +1,5 @@
+# Suppressions for scripts/check-spec.py — format: check | file-glob | message-regex
+# Every entry MUST carry a written justification on the preceding comment line.
+# Suppressions are for judgment calls, never for a check that was not tuned.
+#
+# (no entries — the suite currently passes clean)
