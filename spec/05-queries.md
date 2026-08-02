@@ -77,7 +77,10 @@ when the client's claimed base fails the base check (RP-11) — and only then
 (INV-22). The conflict carries `prev: ⟨BlockRef⟩` with: `prev` non-empty; at most
 `P-FORK-REFS-MAX` refs (a size bound, not a selection rule — the choice within it
 stays free, 13 §free-variables); ascending by number; every ref on (or an
-ancestor-ref of) the chain the service currently holds; the newest ref last. The **client recovery algorithm** is normative:
+ancestor-ref of) the chain the service currently holds; the newest ref last. A root's
+parent coordinate (DEF-4) is not such a ref — it names no block and repeats the root's
+own height — so it never appears in `prev`; where the root is the only candidate, its
+own ref is. The **client recovery algorithm** is normative:
 
 ```
 recover(client_chain, prev):

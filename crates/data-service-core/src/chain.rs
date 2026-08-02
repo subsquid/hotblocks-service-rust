@@ -181,13 +181,23 @@ impl Chain {
                 if self.blocks[pos].parent_hash != bhash {
                     // Hash mismatch → return up to 100 previous block refs.
                     let start = pos.saturating_sub(100);
-                    let prev: Vec<BlockRef> = self.blocks[start..=pos]
+                    // A root's parent coordinate names no block (DEF-4), and
+                    // it repeats the root's own height — emitting it breaks
+                    // RP-7's ascending refs with a ref nothing resolves.
+                    let mut prev: Vec<BlockRef> = self.blocks[start..=pos]
                         .iter()
+                        .filter(|b| b.parent_number != b.number)
                         .map(|b| BlockRef {
                             number: b.parent_number,
                             hash: b.parent_hash.clone(),
                         })
                         .collect();
+                    if prev.is_empty() {
+                        // Only the root itself was in range: its own ref is the
+                        // deepest thing a client can roll back to (RP-7 needs
+                        // a non-empty list).
+                        prev.push(self.first_block().block_ref());
+                    }
                     return Err(InvalidBaseBlock { prev });
                 }
             }
@@ -316,6 +326,53 @@ impl Chain {
 
     pub fn get_header(&self) -> BlockHeader {
         self.last_block().header()
+    }
+}
+
+#[cfg(test)]
+mod root_conflict_tests {
+    use super::*;
+
+    fn blk(n: u64, h: &str, pn: u64, ph: &str) -> Block {
+        Block {
+            number: n,
+            hash: h.into(),
+            parent_number: pn,
+            parent_hash: ph.into(),
+            timestamp: None,
+            json_line_zstd: bytes::Bytes::new(),
+            timings: None,
+        }
+    }
+
+    /// RP-7: refs must ascend and resolve to blocks. A root's parent
+    /// coordinate does neither — it repeats the root's height and names
+    /// nothing (DEF-4).
+    #[test]
+    fn conflict_prev_never_carries_the_root_sentinel() {
+        let mut chain = Chain::new(blk(0, "h0", 0, "0x0"), 10, false);
+        chain.push(blk(1, "h1", 0, "h0"));
+
+        let err = chain.query(1, Some("wrong")).unwrap_err();
+        assert_eq!(
+            err.prev,
+            vec![BlockRef {
+                number: 0,
+                hash: "h0".into()
+            }]
+        );
+
+        // Only the root in range: its own ref is the deepest rollback target,
+        // and RP-7 still owes a non-empty list.
+        let root_only = Chain::new(blk(0, "h0", 0, "0x0"), 10, false);
+        let err = root_only.query(0, Some("wrong")).unwrap_err();
+        assert_eq!(
+            err.prev,
+            vec![BlockRef {
+                number: 0,
+                hash: "h0".into()
+            }]
+        );
     }
 }
 

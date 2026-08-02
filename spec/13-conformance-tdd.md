@@ -1,6 +1,6 @@
 # 13 — Conformance & TDD program
 
-**Mutable doc #1.** Statuses dated **2026-08-02**, derived from the actual test
+**Mutable doc #1.** Statuses dated **2026-08-03**, derived from the actual test
 inventory of the current implementation (not aspiration).
 
 ## Harness architecture
@@ -184,7 +184,7 @@ Every record inside the eligible range is matched on hash *and* parentRef — th
 record has no predecessor for pairwise linkage to check, so a forged parent there is
 otherwise invisible.
 
-## Traceability matrix (2026-08-01)
+## Traceability matrix (2026-08-03)
 
 Status: **C** covered (black-box, automated) / **P** partial / **U** unchecked.
 `!` = known-violated today (see gap register). Current inventory: unit tests on the
@@ -249,7 +249,7 @@ fault matrix, no differential runner, no benchmarks yet.
 | REQ-24 | CT-5 | U ! | GAP-27: no differential runner; GAP-13/18/19 known breaches |
 | REQ-30..32 | CT-5 | U ! | GAP-24, GAP-25 |
 
-## Gap register (2026-08-02)
+## Gap register (2026-08-03)
 
 Priorities: P0 active production risk · P1 correctness hole with plausible trigger ·
 P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry point.

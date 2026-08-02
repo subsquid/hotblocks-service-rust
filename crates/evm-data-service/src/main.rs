@@ -255,15 +255,33 @@ async fn main() -> anyhow::Result<()> {
     // Serve until a signal arrives — but exit non-zero if ingestion dies
     // before its first block (WP-9/FM-31) or ends in terminal divergence
     // (FM-30): the process must never keep serving with ingestion dead.
-    let shutdown_reason = {
+    // One listener for the whole process lifetime: re-registering per phase
+    // leaves a window where tokio's global handler consumes a signal with
+    // nobody listening, losing IB-11's second-signal exit.
+    let mut signals = {
         use tokio::signal::unix::{signal, SignalKind};
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(4);
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sigint.recv() => {}
+                    _ = sigterm.recv() => {}
+                }
+                if tx.send(()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        rx
+    };
+
+    let shutdown_reason = {
         let mut started_done = false;
         loop {
             tokio::select! {
-                _ = sigint.recv() => break ShutdownReason::Clean,
-                _ = sigterm.recv() => break ShutdownReason::Clean,
+                _ = signals.recv() => break ShutdownReason::Clean,
                 res = &mut handle.started, if !started_done => {
                     started_done = true;
                     match res {
@@ -289,21 +307,13 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!("shutting down");
 
-    // Hard-exit on a second signal (either kind) while we drain (IB-11).
+    // Hard-exit on a second signal (either kind) while we drain (IB-11). The
+    // channel buffers one that lands before this task starts.
     tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let (Ok(mut sigint), Ok(mut sigterm)) = (
-            signal(SignalKind::interrupt()),
-            signal(SignalKind::terminate()),
-        ) else {
-            return; // no signal handlers — no force path
-        };
-        tokio::select! {
-            _ = sigint.recv() => {},
-            _ = sigterm.recv() => {},
+        if signals.recv().await.is_some() {
+            tracing::warn!("second signal — forcing exit");
+            std::process::exit(130);
         }
-        tracing::warn!("second signal — forcing exit");
-        std::process::exit(130);
     });
 
     // Every reason, including terminal failure, goes through the same bounded
