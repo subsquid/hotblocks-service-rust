@@ -217,6 +217,10 @@ pub fn validate_data(
             .map_err(|e| format!("record {} not valid JSON: {e}", records.len()))?;
         let (number, parent_number, hash, parent_hash) =
             extract(&v).ok_or_else(|| format!("record {} lacks linkage fields", records.len()))?;
+        // DEF-2: hashes are non-empty; an empty one links to anything.
+        if hash.is_empty() || parent_hash.is_empty() {
+            return Err(format!("DEF-2: record {number} carries an empty hash"));
+        }
         if let Some(prev) = records.last() {
             if number <= prev.number {
                 return Err(format!(
@@ -333,11 +337,16 @@ pub fn validate_conflict(body: &serde_json::Value) -> Result<Vec<BlockRef>, Stri
                 .get("number")
                 .and_then(|n| n.as_u64())
                 .ok_or("INV-22: ref lacks number")?,
-            hash: v
-                .get("hash")
-                .and_then(|h| h.as_str())
-                .ok_or("INV-22: ref lacks hash")?
-                .to_string(),
+            hash: {
+                let h = v
+                    .get("hash")
+                    .and_then(|h| h.as_str())
+                    .ok_or("INV-22: ref lacks hash")?;
+                if h.is_empty() {
+                    return Err("DEF-2: conflict ref carries an empty hash".into());
+                }
+                h.to_string()
+            },
         });
     }
     for w in refs.windows(2) {
@@ -481,18 +490,21 @@ pub fn validate_error(
                 .map_err(|e| format!("IB-5: empty form lacks watermarks: {e}"))?;
             Ok(ErrorClass::Empty)
         }
-        400 | 404 => {
+        400 => {
             expect_text(headers.content_type, status)?;
             if body.is_empty() {
-                return Err(format!("IB-7: {status} carries no text diagnostic"));
+                return Err("IB-7: 400 carries no text diagnostic".into());
             }
             std::str::from_utf8(body)
-                .map_err(|e| format!("IB-7: {status} diagnostic is not text: {e}"))?;
-            Ok(if status == 400 {
-                ErrorClass::InvalidRequest
-            } else {
-                ErrorClass::NotFound
-            })
+                .map_err(|e| format!("IB-7: 400 diagnostic is not text: {e}"))?;
+            Ok(ErrorClass::InvalidRequest)
+        }
+        404 => {
+            // 14 pins the status and nothing else for an unknown route; the
+            // routes whose 404 text *is* pinned are checked by their own
+            // binding assertions (CT-5), not here.
+            std::str::from_utf8(body).map_err(|e| format!("IB-7: 404 body is not text: {e}"))?;
+            Ok(ErrorClass::NotFound)
         }
         409 => {
             match headers.content_type {
@@ -536,6 +548,9 @@ pub fn validate_watermark(number: Option<&str>, hash: Option<&str>) -> Result<Bl
         ));
     }
     let hash = hash.ok_or("INV-24: missing finalized-head hash header")?;
+    if hash.is_empty() {
+        return Err("DEF-2: finalized-head hash is empty".into());
+    }
     Ok(BlockRef {
         number,
         hash: hash.to_string(),
@@ -688,6 +703,32 @@ mod tests {
         let mut e = GzEncoder::new(Vec::new(), flate2::Compression::fast());
         e.write_all(text.as_bytes()).unwrap();
         e.finish().unwrap()
+    }
+
+    #[test]
+    fn empty_hashes_are_rejected_everywhere() {
+        // DEF-2: an opaque *non-empty* string. An empty hash compares equal to
+        // nothing a client holds, so it silently defeats the base check.
+        assert!(validate_watermark(Some("1"), Some("")).is_err());
+        assert!(validate_conflict(&serde_json::json!({
+            "previousBlocks": [{"number": 1, "hash": ""}]
+        }))
+        .is_err());
+        let empty_hash = "{\"number\":1,\"parentNumber\":0,\"hash\":\"\",\"parentHash\":\"h0\"}\n";
+        assert!(validate_data(empty_hash, 1, sim_extract, &DataOracle::default()).is_err());
+    }
+
+    #[test]
+    fn unknown_route_404_is_status_only() {
+        // 14 pins the status and nothing else for an unknown route; routes
+        // whose 404 text is pinned assert it themselves (CT-5).
+        let bare = WireHeaders::default();
+        assert_eq!(
+            validate_error(404, &bare, b"").unwrap(),
+            ErrorClass::NotFound
+        );
+        // 400 still owes a text diagnostic (IB-7).
+        assert!(validate_error(400, &bare, b"").is_err());
     }
 
     #[test]

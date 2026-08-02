@@ -203,7 +203,17 @@ async fn ct1_happy_path_matches_reference_model() {
     assert_eq!(resp.status, 200);
     let wm = v::validate_data_headers(&stream_headers(&resp), "zstd").unwrap();
     assert_eq!(wm, model.finalized());
+    // REQ-6 holds across the splice too: the backfill prefix is framed per
+    // block, not re-framed as one stream (both encodings).
+    let framed = v::validate_framing(&resp.body, "zstd").unwrap();
     let text = v::decode_body(&resp.body, "zstd").unwrap();
+    assert_eq!(framed.concat(), text);
+    let gz = client.stream(0, None, "identity").await.unwrap();
+    assert_eq!(gz.content_encoding.as_deref(), Some("gzip"));
+    assert_eq!(
+        v::validate_framing(&gz.body, "gzip").unwrap().len(),
+        framed.len()
+    );
     let eligible: Vec<_> = (0..CHAIN_LEN).map(|n| sim.header(n)).collect();
     let records = {
         let lg = ledger.lock().unwrap();

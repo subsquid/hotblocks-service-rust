@@ -394,11 +394,12 @@ impl RefModel {
     }
 
     /// INV-22 membership: a conflict ref must be a block-ref or parent-ref of
-    /// the model chain.
+    /// the model chain. A root's parent ref names no block (DEF-4), so it is
+    /// not one of them.
     pub fn is_known_ref(&self, r: &BlockRef) -> bool {
         self.blocks
             .iter()
-            .any(|b| b.block_ref() == *r || b.parent_ref() == *r)
+            .any(|b| b.block_ref() == *r || (b.parent_number != b.number && b.parent_ref() == *r))
     }
 
     fn alarm(&mut self, a: Alarm) {
