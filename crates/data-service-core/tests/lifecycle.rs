@@ -162,6 +162,103 @@ async fn divergent_reseed_is_terminal_and_leaves_the_buffer() {
     assert_eq!(svc.get_head().hash, "h5", "the buffer must be untouched");
 }
 
+/// WP-20/DEF-8: same ref, another parent — invisible to a hash-only check.
+#[tokio::test]
+async fn reseed_equivocating_on_the_parent_link_is_terminal() {
+    let seed = Arc::new(Mutex::new(block(5, "h5", 4, "h4")));
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let svc = DataService::new(
+        ReseedSource {
+            seed: Arc::clone(&seed),
+        },
+        10,
+        false,
+        cancel_rx,
+    );
+
+    svc.init().await.unwrap();
+    *seed.lock().unwrap() = block(5, "h5", 4, "h4-other");
+    let err = svc.init().await.unwrap_err();
+    assert!(
+        err.is::<DivergentReseed>(),
+        "expected DivergentReseed, got: {err:#}"
+    );
+    assert_eq!(svc.get_head().hash, "h5", "the buffer must be untouched");
+}
+
+/// Seeds a block other than the one `get_finalized_head` named.
+#[derive(Clone)]
+struct LyingSeedSource {
+    announced: BlockRef,
+    delivered: Vec<Block>,
+}
+
+#[async_trait]
+impl DataSource for LyingSeedSource {
+    async fn get_head(&self) -> anyhow::Result<BlockRef> {
+        Ok(self.announced.clone())
+    }
+
+    async fn get_finalized_head(&self) -> anyhow::Result<BlockRef> {
+        Ok(self.announced.clone())
+    }
+
+    fn get_finalized_stream(
+        &self,
+        _req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+        let blocks = self.delivered.clone();
+        Box::pin(async_stream::stream! {
+            yield Ok(BlockBatch { blocks, finalized_head: None });
+        })
+    }
+
+    fn get_stream(
+        &self,
+        _req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+        Box::pin(async_stream::stream! {
+            futures::future::pending::<()>().await;
+            yield Err(StreamError::Other(anyhow::anyhow!("unreachable")));
+        })
+    }
+}
+
+/// WP-20: T1 seeds at the *reported* finalized head — an unchecked block
+/// would become the finality anchor. Malformed shapes reach the ladder.
+#[tokio::test]
+async fn seed_must_be_the_announced_finalized_head() {
+    let announced = BlockRef {
+        number: 5,
+        hash: "h5".into(),
+    };
+    for (case, delivered) in [
+        ("wrong hash", vec![block(5, "h5-other", 4, "h4")]),
+        ("wrong height", vec![block(6, "h6", 5, "h5")]),
+        (
+            "more than one block",
+            vec![block(5, "h5", 4, "h4"), block(6, "h6", 5, "h5")],
+        ),
+        ("empty batch", vec![]),
+    ] {
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let svc = DataService::new(
+            LyingSeedSource {
+                announced: announced.clone(),
+                delivered,
+            },
+            10,
+            false,
+            cancel_rx,
+        );
+        let err = svc.init().await.unwrap_err();
+        assert!(
+            !err.is::<DivergentReseed>(),
+            "{case}: a source fault is a ladder retry, not FM-30: {err:#}"
+        );
+    }
+}
+
 /// WP-20: a lower seed at an unheld height is a legal epoch reset (alarmed,
 /// not refused) — and an identical re-seed is trivially legal.
 #[tokio::test]
