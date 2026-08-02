@@ -26,6 +26,8 @@ loop:
 **WP-3 — Batch atomicity & visibility.** [MUST] All effects of one input batch — its
 appends/reorgs, its finality advance, and the resulting eviction — become visible to
 readers as one committed state (INV-16). Readers never observe a half-applied batch.
+A batch that violates DEF-20's shape (ascending, pairwise linked) is rejected before
+anything mutates, not discovered block by block (GAP-35).
 The commit point is the atomic publication of the new buffer state; there is no
 acknowledgement to the adapter — redelivered blocks are absorbed idempotently (WP-13).
 
