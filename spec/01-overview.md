@@ -42,7 +42,7 @@ contract, and HTTP surface do not change per chain (see ADR-2).
   coherent for the configured data selection; data is never silently dropped or emptied.
   → REQ-7, REQ-9, INV-25, INV-26, INV-28.
 - **G4 — Bounded footprint.** Memory is a function of configuration, not of chain or
-  client behavior. → REQ-12, RS-2, RS-3, PF-1.
+  client behavior. → REQ-12, INV-4, PF-1.
 - **G5 — Self-healing operation.** Transient upstream trouble is retried within bounds;
   persistent trouble surfaces as an alarm and a restartable condition — never a silent
   stall and never a corrupted process. → REQ-13, REQ-22, LIV-2, FM-1, INV-41.
@@ -75,7 +75,7 @@ contract, and HTTP surface do not change per chain (see ADR-2).
 | Actor | Verified | Trusted | Must never be able to cause |
 |---|---|---|---|
 | Upstream node | structural coherence of each block's components (REQ-9); parent-hash linkage of the delivered sequence; optional cryptographic checks per REQ-14 | content of block data (unless a REQ-14 check covers it); head and finality reports (bounded by INV-11/INV-12 sanity rules) | process termination outside the sanctioned terminal exits of FM-30/FM-31 (FM-1, ADR-12), or a permanently unservable state (INV-41); violation of buffer well-formedness (INV-1..3); silent data loss (INV-28) |
-| Streaming client | request syntax and bounds (RP-2) | nothing | ingestion stall or another client's starvation beyond declared coupling (INV-35); process termination; unbounded memory (RS-3) |
+| Streaming client | request syntax and bounds (RP-2) | nothing | ingestion stall or another client's starvation beyond declared coupling (INV-35); process termination; unbounded memory (INV-4) |
 | Monitoring client | request syntax | nothing | anything beyond its own response |
 | Operator | configuration validity at startup (REQ-32) | intent of accepted configuration | — (an accepted flag that does nothing is a defect: INV-36) |
 

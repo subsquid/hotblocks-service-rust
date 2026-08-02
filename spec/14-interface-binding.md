@@ -104,7 +104,7 @@ symbols in 15.
 | `--http-rpc-max-batch-call-size` | unset | upstream call-batch cap (GAP-20) |
 | `--http-retry-internal-server-errors` | off | widen retryable classification (FM-23) |
 | `--finality-confirmation <n>` | unset | finality policy `offset(n)` (DEF-23) |
-| `--auto-adjust-finalized-head` | off | RS-4 |
+| `--auto-adjust-finalized-head` | off | DEF-24, WP-24 |
 | `--with-receipts` / `--with-traces` / `--with-statediffs` | off | data selection (DEF-22); receipts and logs are mutually exclusive acquisitions — receipts off ⇒ logs on |
 | `--use-trace-api`, `--use-debug-api-for-statediffs`, `--use-debug-trace-block-by-number` | off | EVM acquisition method choices |
 | `--verify-block-hash`, `--verify-tx-sender`, `--verify-tx-root`, `--verify-receipts-root`, `--verify-withdrawals-root`, `--verify-logs-bloom` | off | verification policy (DEF-25; GAP-8 marks the inert three) |

@@ -19,11 +19,11 @@ both fields are equal.
 `(number: Height, hash: Hash, parentNumber: Height, parentHash: Hash, timestamp: ℕ|⊥, payload: Record)`
 where `timestamp` is milliseconds since epoch (⊥ where the chain family has none) and
 `payload` is the canonical record (DEF-6). `ref(b) = (b.number, b.hash)`,
-`parentRef(b) = (b.parentNumber, b.parentHash)`. Required: `b.parentNumber < b.number`,
-with one exception — a chain family's **root** block, which has no parent and carries
-`parentNumber = number` with a `parentHash` naming no block. The root can only ever be
-a buffer's seed (T1), never an argument of T2/T3, so no transition may relax the
-requirement.
+`parentRef(b) = (b.parentNumber, b.parentHash)`. Required, without exception:
+`b.parentNumber < b.number`. The buffer is seeded at the upstream *finalized* head
+(T1), so a chain family's root block is never buffered and never an argument of any
+transition; a chain younger than its own finality depth is out of scope, and a root
+delivered as input is an integrity violation like any other malformed block (WP-5).
 
 **DEF-5 — Parent link.** `linked(a, b) ≡ a.number = b.parentNumber ∧ a.hash = b.parentHash`.
 This is the *only* adjacency relation in the core: contiguity of heights is NOT assumed
@@ -70,11 +70,11 @@ the head (drives the restart ladder, WP-9).
 
 **DEF-13 — Snapshot.** An immutable copy of `B` (or a suffix of it) plus
 `finalized(C)`, taken atomically at query resolution: at admission, or — for a
-request that waited (RP-4) — at its single post-wait re-resolution (CN-3). All of a
+request that waited (RP-4) — at its single post-wait re-resolution (INV-21). All of a
 response's buffered blocks come from that one final snapshot.
 
 **DEF-14 — Servable & response-eligible.** A block is *buffer-servable* when it is
-an element of some committed buffer state (CN-1); blocks become buffer-servable only
+an element of some committed buffer state (INV-16); blocks become buffer-servable only
 via the transitions of 04, entire batches at a time (WP-3). A block is
 *response-eligible* when it is buffer-servable **or** was acquired by the
 window-underflow path (RP-8) and links gap-free into the response chain that ends at
@@ -116,8 +116,19 @@ chain's own finality signal) or `offset(k)` (the newest block at height ≤ `hea
 exactly `head − k` on contiguous-height families, DEF-1) for chains without one.
 Fixed at startup.
 
-**DEF-24 — Retention policy.** `(P-CACHE-SIZE, autoAdjust: bool)` — the window size and
-whether lagging finality may be force-advanced to preserve the memory bound (RS-4).
+**DEF-24 — Retention policy.** `(P-CACHE-SIZE, autoAdjust: bool)` — the window size
+(a target maximum buffered block count) and which of the two precedences applies when
+lagging finality blocks eviction:
+
+| autoAdjust | Precedence |
+|---|---|
+| off | finality dominates: the excess is retained and alarmed (ADR-9) |
+| on | the bound dominates: finality is force-advanced to restore it (WP-24) |
+
+Fixed at startup. The window is a sliding one — only the oldest finalized prefix is
+ever evicted (WP-24, INV-14), and eviction is invisible to readers (INV-10). The size
+trades memory against backfill traffic: a small window pushes resuming clients into
+RP-8 constantly (HZ-5).
 
 **DEF-25 — Verification policy.** The set of enabled optional integrity checks
 (REQ-14). Fixed at startup.
@@ -135,9 +146,11 @@ Input event summary:
 
 **DEF-30 — Coverage.** The block range a stream response delivers:
 `[from, last]` where `last` is the last delivered block. A response's coverage is
-always a contiguous-by-linkage prefix of what was requested; on families with
-skipped heights (DEF-1) it begins at the lowest available height ≥ `from` — `from`
-itself need not exist. **Progress**: a successful
+always a contiguous-by-linkage prefix of what was requested, beginning at the lowest
+available height ≥ `from`. This is the single rule everywhere a request names a start
+(RP-3, RP-5, RP-11, INV-20): `from` itself need not name a block, since DEF-1 admits
+gaps in the coordinate space — on families with contiguous heights the lowest such
+height is `from` itself, which is a consequence, not a separate case. **Progress**: a successful
 non-empty response advances the client by ≥ 1 block (INV-23); the client's next request
 from `last.number + 1` with `last.hash` needs no other state — coverage is recoverable
 purely from delivered blocks (REQ-1).
@@ -182,4 +195,4 @@ health signal.
 | stride | acquisition batch unit (unspecified internal; 14 §upstream) |
 | commitment (`latest`/`finalized`) | acquisition target level (14 §upstream) |
 | enrichment | component acquisition (WP-11) |
-| `auto-adjust-finalized-head` | autoAdjust (DEF-24, RS-4) |
+| `auto-adjust-finalized-head` | autoAdjust (DEF-24, WP-24) |

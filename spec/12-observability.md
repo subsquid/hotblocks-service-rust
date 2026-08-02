@@ -4,8 +4,8 @@ Required signals. Concrete metric names/routes are bound in 14 (IB-12); here eac
 signal is a numbered obligation. "Level" = a gauge readable at any time; "event" = a counter.
 
 **OB-1 — State gauges.** [MUST] Levels for: first buffered height, head height,
-finalized height, buffered block count, and window excess (RS-3). Fresh per commit
-(CN-4).
+finalized height, buffered block count, and window excess (INV-4). Fresh per commit
+(INV-24).
 
 **OB-2 — Progress heartbeat.** [MUST] A signal that distinguishes *idle input* (no new
 upstream block) from *stalled service* (upstream advanced, nothing committed): the
@@ -30,7 +30,7 @@ separately by cause (budget, error-after-first-record, disconnect). Ingestion:
 per-batch commit duration distribution.
 
 **OB-6 — Retention alarms.** [MUST] Over-window condition as a level (active/inactive
-+ magnitude) and force-advance events (RS-4) as a counter with the advanced-past
++ magnitude) and force-advance events (WP-24) as a counter with the advanced-past
 height. (INV-31: level + event, not log-only.)
 
 **OB-7 — Ingestion alarms.** [MUST] Reason-coded events + a current-state level for:
@@ -61,7 +61,7 @@ the log stream — once per flip, not per retry.
 | LIV-8 reorg convergence | OB-7 fork events + OB-2 |
 | LIV-9 shutdown | OB-9 + process exit |
 | LIV-11 eviction convergence | OB-1 stored/excess + OB-6 level |
-| INV-4 / RS-3 window bound | OB-1 excess + OB-6 |
+| INV-4 window bound | OB-1 excess + OB-6 |
 | REQ-16 upstream budget | OB-4 counters |
 | RP-12 truncation visibility | OB-5 truncation counters |
 | FM-30 terminal state | OB-7 terminal level |

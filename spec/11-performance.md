@@ -42,13 +42,13 @@ committed numbers the corpus provides (compression benchmark and retry budgets �
 ## Resource-bound requirements
 
 **PF-1 — Memory ceiling from configuration.** [MUST] Peak resident memory is
-derivable: `P-MEM-BASE` + `P-MEM-PER-BLOCK` × (window + RS-3 excess) +
+derivable: `P-MEM-BASE` + `P-MEM-PER-BLOCK` × (window + INV-4 excess) +
 `P-RESP-BUFFER` × `W-BLOCK-SIZE` × `P-MAX-CONCURRENT-STREAMS` (RP-23; `P-RESP-BUFFER`
 counts whole record frames, so this term's ceiling is workload-dependent through the
 chain's record sizes) + acquisition in-flight bounded
-by pipeline and batch parameters. No unbounded internal queue exists on any path (ingestion,
-finality probing — unresolved above-head obligations are capped at `P-PENDING-REPORTS`
-(WP-12), since FM-26 puts their arrival rate under upstream's control — serving).
+by pipeline and batch parameters. No unbounded internal queue exists on any path
+(ingestion, finality tracking — the session holds one obligation, the maximum report
+(WP-12) — serving).
 
 **PF-2 — End-to-end backpressure.** [MUST] Every producer/consumer seam (adapter →
 loop, loop → buffer, buffer → response, response → socket) is bounded; a stalled
@@ -57,19 +57,9 @@ consumer stalls its producer rather than queueing unboundedly.
 **PF-3 — Admission overhead.** [MUST] Request admission (validation + resolution) is
 O(log window) against the snapshot; it never scans payloads.
 
-**PF-4 — Maintenance budget, two-sided.** [MUST] Complementing RS-7, eviction and
-internal upkeep consume
-≤ `P-MAINT-BUDGET` of a commit step (upper bound) *and* run often enough that debt
-never defers the window bound beyond RS-3 (lower bound).
-
 **PF-5 — Startup work scheduling.** [MUST] Catch-up acquisition must not starve
 serving of already-committed blocks; readiness gating (LIV-5) is the mechanism —
 serving capacity exists from acceptance, not from readiness.
-
-**PF-6 — Shared-budget fairness.** [SHOULD] Within the shared upstream budget
-(RP-22), head-following SHOULD have priority over backfill acquisition such that S6
-does not violate SLI-1 by more than `P-NOISY-DEGRADE`. (No mechanism exists today —
-HZ-1.)
 
 ## Workload model
 
@@ -96,20 +86,21 @@ Reference scenarios:
 - **S5 slow-reader storm** — `W-CLIENTS` readers at near-zero drain rate +
   disconnects (RP-21).
 - **S6 noisy neighbor** — S1 head-following concurrent with S4 backfill on one
-  upstream budget (PF-6).
+  upstream budget (HZ-1).
 
 ## Hazard register
 
 Mechanism → threatened property → probe. (Dated defects live in 13's gap register;
 these are standing risks.)
 
-- **HZ-1 — Shared upstream budget without priority.** Backfill/readiness traffic can
-  starve head acquisition. → LIV-1, SLI-1. Probe: S6 with budget saturation.
+- **HZ-1 — Shared upstream budget without priority.** Backfill traffic can starve head
+  acquisition (RP-22): head-following ought to win that contention, and no mechanism
+  makes it. → LIV-1, SLI-1. Probe: S6 with budget saturation.
 - **HZ-2 — Snapshot cost under the commit lock.** Snapshot-taking that scales with
   window size can convoy the writer and other readers. → LIV-3, SLI-3, INV-35.
   Probe: S5 with maximal window and high admission rate.
 - **HZ-3 — Catch-up finality stall.** Acquisition modes that outpace finality
-  tracking inflate the window (RS-3). → SLI-6, SLI-8, LIV-7. Probe: S2 with
+  tracking inflate the window (INV-4). → SLI-6, SLI-8, LIV-7. Probe: S2 with
   `W-FINALITY-LAG` ≫ window.
 - **HZ-4 — Per-request re-encode cost.** The fallback content encoding pays a
   per-block re-encode per client; N clients multiply CPU. → SLI-3/4 under S4/S5.
@@ -126,9 +117,6 @@ these are standing risks.)
 - **HZ-8 — Finality-probe amplification.** Finality confirmation that probes
   per-block can multiply upstream calls at high block rates. → REQ-16, SLI-6. Probe:
   S1 at `W-BLOCK-INTERVAL` ≤ 250 ms, count upstream calls per block.
-- **HZ-9 — Readiness probe cost.** Each readiness probe is a live upstream call
-  (RP-10); aggressive orchestrator probing adds upstream load. → REQ-16. Probe: S1 +
-  1 Hz probing, measure share of budget.
 
 ## Benchmarking requirements
 

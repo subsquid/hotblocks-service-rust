@@ -28,18 +28,43 @@ well-formed chain.
 With autoAdjust on: `|B| ≤ P-CACHE-SIZE` in every committed state — T5 restores the
 bound within the same atomic step (WP-24), so no committed overshoot exists. With
 autoAdjust off: whenever a committed state has `|B| > P-CACHE-SIZE`, the standing
-over-window alarm (OB-6) is active for the entire excess period (RS-3, REQ-12).
+over-window alarm (OB-6) is active for the entire excess period, with the excess
+magnitude exposed (OB-1) — unbounded silent growth is non-conforming (REQ-12).
 *Why:* memory must be a function of configuration or loudly not be (G4).
 *Check:* CT-7 — soak with lagging finality, both settings; scrape OB-6.
+
+**INV-5 — Clock independence.** [transition]
+No ordering or identity decision reads a wall clock: transition legality, coverage,
+conflict verdicts, and watermark values are functions of input and committed state
+alone. Time enters only as bounds (waits, budgets, alarm thresholds). Block
+timestamps are payload data (DEF-4), never an ordering key.
+*Why:* a clock-dependent verdict is untestable and unreproducible — and on a chain
+whose timestamps are adversary-influenced, unsafe.
+*Check:* CT-1 — the reference model consumes no clock; the same history replayed at
+different speeds must produce identical verdicts.
 
 ## Transition legality
 
 **INV-10 — Frame condition & maintenance transparency.** [transition]
 Per WP-8, `(B, f)` changes only via T1–T5 driven by input events or the retention policy; no
 query, scrape, timer, or background task changes it. Metamorphic: any read repeated
-across a quiescent period (no input) returns identical results.
+across a quiescent period (no input) returns identical results, and a read whose range
+an eviction did not touch returns identical records across that eviction. Eviction
+leaves no reader-visible artifact: a request below the window switches to backfill
+(RP-8), and nothing distinguishes "evicted" from "never buffered".
 *Why:* catches whole classes of accidental mutation and "maintenance" corruption.
 *Check:* CT-3 — concurrency swarm with input paused; diff all reads.
+
+**INV-16 — Commit order & atomic visibility.** [transition]
+The buffer moves through a single total order of committed states `C₀, C₁, …`, one per
+applied batch (WP-3). Every read observes exactly one of them; no read mixes two, and
+no reader observes a truncated-but-not-yet-extended chain or an evicted-but-unadjusted
+finality index. Two orders are at play: *version order* always advances, while *chain
+progress* (head height) may regress when T3 truncates — clients observe monotone
+versions, not monotone heights.
+*Why:* every read-side guarantee below is stated against "one committed state";
+without a total order the phrase names nothing.
+*Check:* CT-1 + CT-3 — swarm cannot observe an intermediate or mixed state (INV-15).
 
 **INV-11 — Finalized immutability.** [transition]
 No transition *replaces* any of `b₁..b_f`, and none removes `b_f` itself. T3 requires
@@ -87,7 +112,7 @@ buffered, evicted-after-finality, truncated-by-named-reorg, or discarded-by-name
 All transitions are serialized through one writer (WP-1); no interleaving of two
 concurrent transition steps is observable.
 *Why:* the transition catalog's pre/post reasoning is meaningless without it.
-*Check:* CT-3 — swarm cannot observe intermediate states (CN-2).
+*Check:* CT-3 — swarm cannot observe intermediate states (WP-3).
 
 ## Read / response semantics
 
@@ -99,8 +124,12 @@ duplicates and no gaps inside coverage.
 *Check:* CT-5 structural validator on every response (also run inside CT-3/CT-4).
 
 **INV-21 — Snapshot consistency.** [response]
-All buffered records in one response come from one committed state (CN-3); no response
-interleaves two versions.
+All buffered records in one response come from one snapshot (DEF-13), fixed at final
+resolution — admission, or the single post-wait re-resolution of RP-3/RP-4; no response
+interleaves two versions. Commits concurrent with an in-flight response — including
+reorgs that orphan snapshot blocks — do not alter it: a client may receive blocks
+orphaned after admission and learns of it on its next request through the conflict
+protocol (RP-7). This staleness is bounded by response duration (`P-RESP-BUDGET`).
 *Why:* a mixed response can present a chain that never existed.
 *Check:* CT-3 — reorg storm while streaming; validator checks cross-record linkage.
 
@@ -120,10 +149,26 @@ never enters a no-progress cycle while the service holds data it hasn't seen.
 
 **INV-24 — Watermark honesty.** [response]
 Watermark reads and response metadata equal the corresponding committed state's values
-(RP-9); finalized ≤ head within any single read; a later read never reports an older
-version (CN-5).
+(RP-9); within any committed state `first ≤ finalized ≤ head` by buffer position, so
+finalized ≤ head within any single read. Every watermark read reflects the newest
+commit at read time — no cache outlives a commit — while a response's finalized-head
+metadata is the *snapshot's* and may trail the live value by design.
 *Why:* clients schedule polling and rollback bounds off these values.
 *Check:* CT-1 + CT-3 (interleaved watermark reads during storms).
+
+**INV-29 — Reader monotonicity, scoped.** [response]
+Against **one instance within one epoch** (INV-12), two sequential reads by one client
+observe non-decreasing versions: a watermark read after a stream response never reports
+a state older than that response's snapshot. Height may still regress (INV-16). The
+wire carries no version or epoch token and ADR-1 pins it that way, so a client fanned
+across the two instances of FM-34, or reading across a T1 re-INIT, can observe an older
+version — sanctioned flapping, never corruption, since each response is one instance's
+coherent snapshot. A client needing more must pin an instance itself; no affinity
+mechanism is offered (ADR-14).
+*Why:* stating monotonicity without the scope promises what a stateless, unpinned wire
+protocol cannot deliver — and clients would build rollback logic on it.
+*Check:* CT-3 — sequential reads per client during storms; cross-instance flapping
+asserted only within one instance's history.
 
 **INV-25 — Payload fidelity.** [response]
 Served record bytes (after content-encoding removal) are exactly the stored canonical
@@ -198,8 +243,12 @@ behavior in a scripted scenario.
 ## Recovery
 
 **INV-40 — Restart equivalence.** [recovery]
-The post-restart state is exactly T1's result on current upstream state (CN-7):
-no stale derived value, no residue influencing behavior.
+The post-restart state is exactly T1's result on current upstream state (WP-15): a
+one-block buffer at the upstream finalized head, with every derived value (watermarks,
+gauges, session state) computed freshly from it — no stale derived value, no residue
+influencing behavior. Recovery is idempotent (T1 twice ≡ T1 once, modulo upstream
+advance) and needs no format-compatibility gate, because nothing is persisted; if OQ-3
+introduces persistence, this invariant gains that gate.
 *Why:* the recovery story is "there is nothing to recover"; any residue falsifies it.
 *Check:* CT-2 — kill-point matrix: kill at every transition boundary, restart,
 compare against fresh reference model.
@@ -215,11 +264,5 @@ orchestrator; this is the single worst divergence found in the current implement
 *Check:* CT-2 + CT-4 — inject integrity violations and panics mid-transition; assert
 either full recovery or exit, never zombie (GAP-1 first test).
 
-## Reading the catalog in tests
-
-- Every generated history (CT-1) asserts INV-1..4 after each step and INV-20..24 for
-  each read.
-- Every fault-corpus run (CT-4) asserts INV-11..14, INV-27..28, INV-31, INV-41.
-- Every storm (CT-3) asserts INV-10, INV-15, INV-21, INV-24, INV-35.
-- Every restart (CT-2) asserts INV-40..41.
-- Every conformance sweep (CT-5) asserts INV-25..26, INV-30, INV-36.
+Each entry's *Check:* line names the test classes that decide it; 13's traceability
+matrix is the single record of what those classes cover today.

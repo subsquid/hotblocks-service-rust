@@ -24,6 +24,6 @@ load. The planning document and README call the shared budget "intended".
 The configured upstream budget is actually enforceable (REQ-16, IB-17); resource
 teardown is by structured cancellation instead of a worker-close protocol. Trade-off
 accepted: backfill and head-following now compete for one budget with no priority
-mechanism — the head path can be starved by query-driven acquisition (HZ-1, PF-6);
+mechanism — the head path can be starved by query-driven acquisition (HZ-1);
 a priority lever remains future work. The predecessor's `active_workers` gauge became
 meaningless (GAP-24).

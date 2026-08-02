@@ -21,13 +21,11 @@ others later) plug in as acquisition adapters whose upstream binding lives in
 | [01-overview.md](01-overview.md) | context, actors, goals, non-goals, trust model, lifecycle | yes |
 | [02-requirements.md](02-requirements.md) | product requirements `REQ-n` with acceptance criteria | yes |
 | [03-data-model.md](03-data-model.md) | definitions `DEF-n`: state tuple, events, policies | yes |
-| [04-mutations.md](04-mutations.md) | ingestion loop and transition catalog `WP-n` | yes |
+| [04-mutations.md](04-mutations.md) | ingestion loop and transition catalog `WP-n`, incl. eviction (T5) | yes |
 | [05-queries.md](05-queries.md) | query & conflict contract `RP-n` | yes |
-| [06-consistency.md](06-consistency.md) | commit model, snapshots, recovery `CN-n` | yes |
-| [07-invariants.md](07-invariants.md) | safety catalog `INV-n` | yes |
+| [07-invariants.md](07-invariants.md) | safety catalog `INV-n`, incl. commit model and recovery | yes |
 | [08-liveness.md](08-liveness.md) | progress properties `LIV-n` | yes |
 | [09-failure-model.md](09-failure-model.md) | fault families and required responses `FM-n` | yes |
-| [10-retention.md](10-retention.md) | buffer window, eviction, memory bounds `RS-n` | yes |
 | [11-performance.md](11-performance.md) | SLIs/SLOs, workload model, hazards `PF/SLI/HZ-n` | yes |
 | [12-observability.md](12-observability.md) | required signals `OB-n` | yes |
 | [13-conformance-tdd.md](13-conformance-tdd.md) | reference model, `CT-n`, matrix, `GAP-n`, `MG-n`, `HC-n` | **mutable** |
@@ -39,13 +37,14 @@ others later) plug in as acquisition adapters whose upstream binding lives in
 
 - **RFC 2119**: MUST / MUST NOT / SHOULD / MAY are normative keywords.
 - **IDs** are stable and never renumbered. Prefixes: `REQ` requirements, `DEF`
-  definitions, `WP` write/mutation properties, `RP` read/query properties, `CN`
-  consistency, `INV` safety invariants, `LIV` liveness, `FM` failure-model rows, `RS`
-  retention, `PF` performance requirements, `SLI` indicators, `HZ` hazards, `OB`
-  observables, `CT` test classes, `MG` merge gates, `HC` harness capabilities, `GAP`
-  gaps, `IB` binding rules, `ADR` decisions. Numbering is **banded** per category so
-  insertions never renumber (bands are declared at the top of each catalog); gaps in a
-  band are intentional.
+  definitions, `WP` write/mutation properties, `RP` read/query properties, `INV` safety
+  invariants, `LIV` liveness, `FM` failure-model rows, `PF` performance requirements,
+  `SLI` indicators, `HZ` hazards, `OB` observables, `CT` test classes, `MG` merge gates,
+  `HC` harness capabilities, `GAP` gaps, `IB` binding rules, `ADR` decisions. Numbering
+  is **banded** per category so insertions never renumber (bands are declared at the top
+  of each catalog); gaps in a band, and in the document numbering, are intentional.
+- **One fact, one home.** Every rule is stated once, where it is decided, and cited
+  everywhere else. A restatement that drifts is worse than a link.
 - **Symbolic parameters**: every constant appears in normative text only as a `P-NAME`
   (or workload `W-NAME`) symbol. Concrete values, observed vs target, live only in
   [15-parameters.md](15-parameters.md). ⚠ marks a proposed target awaiting ratification
