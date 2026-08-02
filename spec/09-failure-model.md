@@ -46,7 +46,7 @@ acquisition, one probe) is contained to that activity plus declared shared budge
 | FM-23 | Erroring (5xx-class / internal errors) | retry only per configured classification (REQ-16, 14 §upstream); else surface to ladder |
 | FM-24 | Equivocating (load-balanced fleet disagrees between calls) | mask via whole-block re-acquisition (WP-11.2); persistent equivocation → retry exhaustion → ladder |
 | FM-25 | Oversized / malformed / schema-violating response | fail the call (transient class); tolerate documented optional-field absence (IB-16, GAP-14); never panic (FM-1) |
-| FM-26 | Lying finality (finalized > head, or oscillating) | WP-12 arbitration; oscillation masked by the monotone max *within an epoch* — a T1 re-seed may adopt a lower value, alarmed (INV-12, ADR-14); above-head obligations bounded by `P-PENDING-REPORTS`; alarmed if contradiction (FM-18) |
+| FM-26 | Lying finality (finalized > head, or oscillating) | WP-12 arbitration; oscillation masked by the monotone max *within an epoch* — a T1 re-seed may adopt a lower value, alarmed (INV-12, ADR-14); the above-head obligation is the maximum alone, so report rate buys upstream no state (ADR-16); alarmed if contradiction (FM-18) |
 | FM-27 | Stale head (head report behind delivered blocks) | mask (head reads are advisory; readiness may flap) |
 
 ## Process faults
@@ -56,8 +56,8 @@ acquisition, one probe) is contained to that activity plus declared shared budge
 | FM-30 | **Unrecoverable divergence** (FM-19) or equivalent contradiction that no retry can heal | terminal alarm: raise OB-7 terminal state, drain in-flight responses, then exit non-zero (ADR-12); MUST NOT continue serving while appearing healthy with ingestion silently dead (GAP-4) |
 | FM-31 | Startup failure (T1 impossible: bad config, unreachable upstream) | exit non-zero with diagnostic (REQ-32) |
 | FM-32 | Internal panic/defect in one activity | contain (FM-3); if the writer is affected: recover via ladder/T1 or exit — never zombie (INV-41, GAP-1) |
-| FM-33 | Crash / kill at any point | restart per REQ-13; recovery contract CN-7 |
-| FM-34 | Dual instance behind one address | tolerated: the protocol is stateless per request (RP-5); clients may see version flapping between instances but never corruption — each response is one instance's snapshot. CN-5's monotonicity is scoped per instance for exactly this reason (ADR-14); no affinity or epoch token is offered (ADR-1 pins the wire) |
+| FM-33 | Crash / kill at any point | restart per REQ-13; recovery contract INV-40 |
+| FM-34 | Dual instance behind one address | tolerated: the protocol is stateless per request (RP-5); clients may see version flapping between instances but never corruption — each response is one instance's snapshot. INV-29's monotonicity is scoped per instance for exactly this reason (ADR-14); no affinity or epoch token is offered (ADR-1 pins the wire) |
 
 ## Client faults
 
@@ -76,14 +76,9 @@ acquisition, one probe) is contained to that activity plus declared shared budge
 | FM-50 | Invalid option value / combination | FM-31 (reject at startup, REQ-32) |
 | FM-51 | Option the build cannot honor | FM-31 (INV-36; GAP-8) |
 | FM-52 | Wrong network endpoint (chain mismatch mid-run) | manifests as FM-10/FM-19 → containment + FM-30 path; SHOULD be detected at startup by a network-identity check (14 §upstream) |
-| FM-53 | Undersized window for the chain's finality lag | over-window alarm (OB-6) or autoAdjust per RS-4; never OOM-by-design without alarm |
+| FM-53 | Undersized window for the chain's finality lag | over-window alarm (OB-6) or autoAdjust per WP-24; never OOM-by-design without alarm |
 
-## Fault → property → test cross-reference
-
-| Fault family | Properties at stake | Test class |
-|---|---|---|
-| FM-10..19 | INV-11..14, INV-27..28, LIV-2, LIV-8 | CT-4 input-fault corpus |
-| FM-20..27 | REQ-16, LIV-1..2, INV-28 | CT-4 upstream-fault matrix (HC-3) |
-| FM-30..34 | INV-40..41, LIV-5, LIV-9, CN-7 | CT-2 kill/restart matrix |
-| FM-40..44 | INV-35, RP-21..23, LIV-3, LIV-12 | CT-8 + CT-9 |
-| FM-50..53 | INV-36, REQ-32, RS-4 | CT-5 config matrix |
+Which test class exercises which fault family is 13's business: CT-4 owns the input
+and upstream families, CT-2 the process families, CT-8/CT-9 the client families, and
+CT-5 the operator families. The traceability matrix there is the single record of what
+each class covers today.

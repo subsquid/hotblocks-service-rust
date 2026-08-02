@@ -37,24 +37,21 @@ Pure, single-threaded; the comparator runs it against the same scripted history.
 
 ```
 state: B: list<Block>, f: int (1-based), base: Ref, stalled: int,
-       fin_max: Ref|⊥,   # WP-12 running maximum for the session
-       pending: list<Ref>  # above-head reports awaiting validation (WP-23),
-                           # at most P-PENDING-REPORTS entries
+       fin_max: Ref|⊥    # WP-12 running maximum for the session — the only
+                         # finality obligation held (ADR-16)
 
 init(fh_block):            B ← [fh_block]; f ← 1; base ← ref(fh_block); stalled ← 0
                            new_session()
 
-new_session():             fin_max ← ⊥; pending ← []   # WP-12 is per session; T6
-                                                       # rebase stays inside one
+new_session():             fin_max ← ⊥      # WP-12 is per session; T6 rebase stays
+                                            # inside one
 
 apply_batch(blocks, finrep):
   require blocks ≠ []         else session_error       # DEF-20: batches are non-empty
-  checkpoint ← (B, f, fin_max, pending)  # WP-5: a violating batch is rejected whole
+  checkpoint ← (B, f, fin_max)           # WP-5: a violating batch is rejected whole
   for x in blocks:
     if ∃ b ∈ B: b.number = x.number ∧ b.hash = x.hash ∧ parentRef(b) = parentRef(x):
-        continue                        # WP-6: identical duplicate is a no-op —
-                                        # checked first, so a redelivered root
-                                        # (DEF-4's exception) is absorbed here
+        continue                        # WP-6: identical duplicate is a no-op
     require x.parentNumber < x.number     else integrity_violation        # DEF-4
     if linked(last(B), x):  B.append(x)                                   # T2
     else:
@@ -64,30 +61,24 @@ apply_batch(blocks, finrep):
       require linked(B[i], x)     else integrity_violation
       B ← B[1..i] + [x]                                                   # T3
       f ← min(f, len(B))          # unchanged in value; index stays valid
-  settle_reports()            # the arriving blocks discharge obligations first,
-  if finrep ≠ ⊥:              # so a batch is never refused by a bound it releases
-     note_report(finrep); settle_reports()                                # WP-12
+  settle_report()             # the arriving blocks discharge the obligation first
+  if finrep ≠ ⊥:
+     note_report(finrep); settle_report()                                 # WP-12
   compact()                                                               # T5
   well_formed()               # INV-1..3 after every step
   base ← ref(last(B))
 
 note_report(r):
-  for q in pending + [fin_max]:
-     if q ≠ ⊥ and r.number = q.number and r.hash ≠ q.hash:
-        integrity_violation             # equal-height contradiction
+  if fin_max ≠ ⊥ and r.number = fin_max.number and r.hash ≠ fin_max.hash:
+     integrity_violation                # equal-height contradiction
   if fin_max = ⊥ or r.number > fin_max.number:
-     fin_max ← r
-     if r.number > last(B).number:
-        require |pending| < P-PENDING-REPORTS else session_error   # PF-1: an adapter
-        pending ← pending + [r]        # running unboundedly ahead of its own delivery
-                                       # is a fault, not a state to accumulate
+     fin_max ← r                        # a higher report replaces the obligation;
+                                        # the replaced one's check is not owed
 
-settle_reports():                       # every unresolved obligation, every batch
-  for r in pending with r.number ≤ last(B).number: finalize(r)   # validates hash
-  pending ← [r ∈ pending : r.number > last(B).number]
+settle_report():
   if fin_max ≠ ⊥:
-     if fin_max.number ≤ last(B).number: finalize(fin_max)
-     else: f ← len(B)                   # WP-23 provisional, revalidated above
+     if fin_max.number ≤ last(B).number: finalize(fin_max)   # validates hash
+     else: f ← len(B)                   # WP-23 provisional, revalidated on arrival
 
 finalize(r):
   if r.number < B[1].number: return
@@ -98,12 +89,12 @@ finalize(r):
 
 compact():
   excess ← max(0, len(B) − P_CACHE_SIZE)
-  if excess > f−1 and autoAdjust: f ← excess + 1        # RS-4, alarmed
+  if excess > f−1 and autoAdjust: f ← excess + 1        # WP-24 force-advance, alarmed
   k ← min(excess, f−1)
   B ← B[k+1..]; f ← f − k
-  if len(B) > P_CACHE_SIZE: alarm(OVER_WINDOW)          # RS-3
+  if len(B) > P_CACHE_SIZE: alarm(OVER_WINDOW)          # INV-4
 
-integrity_violation:  (B, f, fin_max, pending) ← checkpoint; alarm; session_teardown
+integrity_violation:  (B, f, fin_max) ← checkpoint; alarm; session_teardown
                                                         # WP-5 — never process death
 
 fork_signal(prev):
@@ -114,9 +105,8 @@ fork_signal(prev):
   else: terminal(FM_30)                                 # divergence at/below f
 
 query(from, parentHash):                                # RP-3..RP-13
-  snap ← (B, f)                                         # CN-3
-  if snap.B[1] is not a root                            # DEF-4's exception: nothing
-     and from ≤ snap.B[1].parentNumber:                 #  exists below a root
+  snap ← (B, f)                                         # INV-21
+  if from ≤ snap.B[1].parentNumber:
      return BACKFILL                                    # RP-8 (oracle: simulator
                                                         #  ledger supplies the range)
   if from > last(snap.B).number:
@@ -134,11 +124,11 @@ query(from, parentHash):                                # RP-3..RP-13
 Input shape is part of the contract, not a convenience: `apply_batch` takes a
 non-empty batch (DEF-20), with finality knowledge attached opportunistically per ADR-6.
 The model deliberately exposes no standalone finality-only transition; a test that
-feeds an empty batch is testing a shape no conforming adapter emits. The unresolved
-above-head obligations of WP-23 are held in
-`pending`, bounded by `P-PENDING-REPORTS`: FM-26 lets upstream finality oscillate,
-which makes an unbounded obligation list a memory sink an adversarial upstream
-controls (PF-1). Overflow is an adapter fault, not a state to accumulate.
+feeds an empty batch is testing a shape no conforming adapter emits. The single
+above-head obligation of WP-23 is `fin_max` itself (ADR-16), so an upstream reporting
+finality faster than it delivers blocks buys no state in the model and none in the
+service (PF-1). Simulators seed above genesis: DEF-4 admits no root block, and a
+history that starts at one is testing a shape the buffer never holds.
 
 **Free variables** (the SUT may vary; everything else must match the model):
 
@@ -155,21 +145,20 @@ controls (PF-1). Overflow is an adapter fault, not a state to accumulate.
 | CT | Class | Primary properties | Needs |
 |---|---|---|---|
 | CT-1 | State-machine property tests: generated histories (appends, reorgs, finality, duplicates) driven through the SUT and model, all reads compared | INV-1..4, 10..15, 20..24, WP-*, RP-3..12, LIV-4, LIV-8 | HC-1, HC-5, HC-6 |
-| CT-2 | Crash/restart & kill-point matrix: kill at transition boundaries and mid-response; restart; compare to fresh model; panic-injection for zombie detection | INV-40, INV-41, CN-7, LIV-5, LIV-9, REQ-13, REQ-23 | HC-1, HC-7, kill harness |
-| CT-3 | Concurrency swarms: parallel clients + reorg storms + watermark readers against a moving head | INV-10, 15, 21, 24, 35; CN-1..5; LIV-3 | HC-1, HC-7, HC-9 |
+| CT-2 | Crash/restart & kill-point matrix: kill at transition boundaries and mid-response; restart; compare to fresh model; panic-injection for zombie detection | INV-40, INV-41, LIV-5, LIV-9, REQ-13, REQ-23; FM-32, FM-33 | HC-1, HC-7, kill harness |
+| CT-3 | Concurrency swarms: parallel clients + reorg storms + watermark readers against a moving head | INV-10, 15, 16, 21, 24, 29, 35; LIV-3 | HC-1, HC-7, HC-9 |
 | CT-4 | Input-fault corpus: FM-10..27 matrix (per-component faults × fault kinds), quirk corpora per network, finality contradiction corpus | INV-11..14, 27, 28, 31; WP-5, 10..12; LIV-2; REQ-9, 15, 16 | HC-3, HC-2 |
-| CT-5 | Interface conformance: 14's binding table, structural validators on every response, dual-encoding fidelity, golden payload corpus, differential vs predecessor, config-honesty matrix, metrics-vs-ledger | IB-*, INV-25, 26, 30, 36; REQ-7, 24, 30, 32 | HC-4, HC-6, HC-8 |
+| CT-5 | Interface conformance: 14's binding table, structural validators on every response, dual-encoding fidelity, golden payload corpus, differential vs predecessor, config-honesty matrix, metrics-vs-ledger | IB-*, INV-25, 26, 30, 36; REQ-7, 24, 30, 32; FM-50..53 | HC-4, HC-6, HC-8 |
 | CT-6 | Performance benchmarks: S1/S2 SLI measurement vs baselines | SLI-1..8, PF-10..12, LIV-1, LIV-6, LIV-7 | HC-10, HC-12 |
-| CT-7 | Soak/endurance: multi-hour S1/S2 with lagging finality; memory, log volume, alarm levels | INV-4, RS-3, LIV-2, LIV-11, REQ-31 | HC-1, HC-10 |
-| CT-8 | Isolation/noisy-neighbor: S4/S5/S6 | INV-35, RP-21..23, LIV-10, LIV-12, PF-6 | HC-9 |
+| CT-7 | Soak/endurance: multi-hour S1/S2 with lagging finality; memory, log volume, alarm levels | INV-4, LIV-2, LIV-11, REQ-31 | HC-1, HC-10 |
+| CT-8 | Isolation/noisy-neighbor: S4/S5/S6 | INV-35, RP-21..23, LIV-10, LIV-12; FM-41..44 | HC-9 |
 | CT-9 | Fuzz, both surfaces: HTTP requests (structure-aware) and upstream responses (schema-aware) | FM-1, FM-25, FM-40, INV-27, INV-41, REQ-22 | HC-3, HC-7, HC-11 seeds |
 
 ## Structural validators (kind-agnostic, every response)
 
 decodable per negotiated encoding → records self-delimiting → ascending → pairwise
 linked → coverage starts at the lowest response-eligible height ≥ the requested one
-and never below it (DEF-30; exact equality is an extra assertion only for chain
-families with contiguous heights) → records follow the snapshot's branch → no
+and never below it (DEF-30) → records follow the snapshot's branch → no
 duplicates → watermark metadata parses and finalized ≤ head → conflict bodies
 non-empty/ascending → error bodies match the RP-13 taxonomy shape → outcomes outside
 that taxonomy (405 wrong method, 503 readiness — IB-1 and 14's operation table) match
@@ -199,13 +188,15 @@ fault matrix, no differential runner, no benchmarks yet.
 | Property | CT | Status | Note |
 |---|---|---|---|
 | INV-1..3 | CT-1 | P | unit tests + model asserts on every applied event (CT-1 smoke); no generated histories yet |
-| INV-4 / RS-3 | CT-7 | U ! | GAP-2: violated during catch-up; no soak exists |
+| INV-4 | CT-7 | U ! | GAP-2: violated during catch-up; no soak exists |
+| INV-5 | CT-1 | P | the reference model consumes no clock; no replay-speed differential yet |
 | INV-10 | CT-3 | U | |
 | INV-11 | CT-1/4 | P | unit tests incl. rejection cases; no adapter-driven corpus |
 | INV-12 | CT-2/4 | U ! | GAP-7: arbitration missing; regression corpus absent; the epoch-boundary contradiction check (ADR-14) landed 2026-08-02 with a lifecycle test — full CT-2 exercise absent |
 | INV-13 | CT-1/4 | P | unit-level only |
 | INV-14 | CT-1 | U | no ledger reconciliation |
 | INV-15 | CT-3 | U | |
+| INV-16 | CT-1/3 | P | model asserts one committed state per applied batch (CT-1 smoke); no swarm |
 | INV-20 | CT-5/3/4 | P | structural validator on live responses + dual-encoding equality (CT-1 smoke) |
 | INV-21 | CT-3 | U | |
 | INV-22 | CT-1/5 | P ! | conflict shape + ref membership validated live (CT-1 smoke); GAP-6: empty-`prev` conflict emitted on empty backfill |
@@ -215,6 +206,7 @@ fault matrix, no differential runner, no benchmarks yet.
 | INV-26 | CT-5 | U ! | GAP-13: iteration-order nondeterminism on one trace path |
 | INV-27 | CT-4/9 | U ! | GAP-6, GAP-22 |
 | INV-28 | CT-4 | P ! | happy-path cassette only; GAP-3: fault paths serve emptied components |
+| INV-29 | CT-3 | U | scoping is stated; no per-client sequential-read assertion exists |
 | INV-30 | CT-5 | U ! | GAP-24: dead gauge exposed |
 | INV-31 | CT-4 | U ! | GAP-4: alarm conditions are log-only |
 | INV-35 | CT-8 | U | |
@@ -254,7 +246,7 @@ P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry p
 | GAP | Statement | Violates | Prio | First test |
 |---|---|---|---|---|
 | GAP-1 | An integrity violation in the buffer (hash mismatch, gap, sub-finality write, contradictory finality, descending height) raises a process-internal panic while a shared lock is held. The production supervisor now treats the vanished writer as FM-32, drains, and exits non-zero, but upstream input can still terminate the process instead of leaving the buffer intact and entering the session ladder | INV-41, WP-5, FM-1, FM-32, REQ-22 | P0 | CT-4: adapter emits a batch whose parent hash mismatches the buffered tip at a buffered height; assert the batch is rejected, the session restarts (OB-7 event), and `/head` still answers |
-| GAP-2 | During catch-up on the head stream, acquisition outruns finality tracking (range acquisition is bounded by the *latest* head and carries no finality reports, and the confirmation prober is rate-bound), so eviction is starved and the buffer grows past the window without bound; only a log line reports it | INV-4, RS-3, LIV-7, PF-1, INV-31 | P0 | CT-7: simulator with head far ahead and finality advancing normally; assert window excess stays ≤ bound or OB-6 level active *and* finality gauge tracks upstream within `P-SLO-FINALITY-LAG` |
+| GAP-2 | During catch-up on the head stream, acquisition outruns finality tracking (range acquisition is bounded by the *latest* head and carries no finality reports, and the confirmation prober is rate-bound), so eviction is starved and the buffer grows past the window without bound (HZ-3 realized); only a log line reports it | INV-4, LIV-7, PF-1, INV-31 | P0 | CT-7: simulator with head far ahead and finality advancing normally; assert window excess stays ≤ bound or OB-6 level active *and* finality gauge tracks upstream within `P-SLO-FINALITY-LAG` |
 | GAP-3 | On the execution-trace and state-diff acquisition paths, upstream errors, null results, wrong-block results, and unparsable payloads are converted to empty components and served, instead of marking the block incoherent and retrying | INV-28, REQ-9, WP-11.3 | P0 | CT-4: fault-injecting upstream returns an error for the trace call of one block; assert the block is retried/alarmed, never served with an empty component |
 | GAP-4 | Alarms are log-only: no OB-7 (or OB-6) condition is visible on the scrape surface as a level or counter. The terminal-divergence exit path landed 2026-08-02 (rebase below finality and divergent re-seed end the run, drain within `P-SHUTDOWN-GRACE`, and exit non-zero per ADR-12), but an orchestrator still cannot distinguish alarm states before the exit | INV-31, OB-6, OB-7, LIV-2 | P2 | CT-4: induce each alarm condition (stall, over-window, integrity violation, terminal); scrape must show a level/counter change |
 | GAP-5 | A fork signal with an empty ref list rebases to the current head and immediately reopens the stream: a malformed adapter can hot-spin the loop forever with no backoff or alarm | WP-10, LIV-8, FM-13 | P1 | CT-4: adapter emits empty-`prev` fork signal; assert session-error handling (ladder), not spin |
@@ -289,12 +281,14 @@ P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry p
 ## Build order
 
 1. **Phase 0 — harness skeleton** *(done 2026-07-31, `crates/harness`; hardened
-   2026-08-02: model absorbed the DEF-4 root convention and ADR-15's stepwise
+   2026-08-02: model absorbed ADR-15's stepwise
    descent, one-session replay keyed by each delivered
    `(number, hash, parentNumber, parentHash)` tuple with read-path deliveries
-   excluded, buffered-root resolution aligned between model and SUT,
+   excluded,
    watermark bounds/strictness and IB-1/IB-2/IB-5/IB-6 transport rules added to
-   HC-6, the free-variable-2 pin removed from CT-1)*: HC-1
+   HC-6, the free-variable-2 pin removed from CT-1; the suite's consolidation
+   2026-08-02 dropped the root convention and the pending-report list from the
+   model, ADR-16)*: HC-1
    simulator + HC-2 ledger + HC-5 reference model + HC-6 validators; wire CT-1 smoke
    (happy-path history) and the spec checker (MG-7). *Exit met:* CT-1 green on the
    happy path; INV-23 flipped U→P; INV-1..3, 20, 22, 24, 25 strengthened.
@@ -316,16 +310,24 @@ change. The post-migration redesign (OQ-2), once specified, re-plans phases 3-5.
 
 ## Merge gates
 
-| MG | Gate | Threshold | When | Enforced by | Blocking? |
-|---|---|---|---|---|---|
-| MG-1 | Property-coverage ratchet: no INV/LIV/REQ row's status regresses (U → P → C is the only direction) and the count of rows at C never decreases; a PR adding a property adds its matrix row + CT class. Deliberately a count, not a fraction: a fraction floor would penalise adding the property this same gate mandates | `P-COV-PROP` (ratchet) | per-PR | HC-13 + review checklist | yes |
-| MG-2 | Line coverage: changed-lines ≥ `P-COV-DIFF`, repo floor ≥ `P-COV-TOTAL`, both ratchet-only | `P-COV-DIFF`, `P-COV-TOTAL` | per-PR | HC-11 | advisory until HC-11 built (GAP: see HC register) |
-| MG-3 | Failing test first: every GAP closure and bug fix lands with the test that fails without it, named in the register | — | per-PR | review checklist | yes |
-| MG-4 | Fast conformance: CT-1 (bounded generation), CT-4 (corpus subset), CT-5 (binding + validators) green | `P-CI-PR-BUDGET` wall-clock | per-PR | CI + HC-1..6 | advisory until Phase 2 supplies all three subsets; Phase-0 smoke is blocking but does not satisfy this full gate |
-| MG-5 | Performance regression: SLI-1..8 within `P-PERF-NOISE` of committed baselines | `P-PERF-NOISE` | nightly | HC-12 | unarmed until HC-12 supplies a runner, baselines, and noise band |
-| MG-6 | Static gates: formatter check, linter at the pinned deny-set, dependency audit | — | per-PR | existing CI | yes (audit advisory until added) |
-| MG-7 | Spec integrity: `scripts/check-spec.py` zero error-severity findings | — | per-PR | HC-13 | yes |
-| MG-8 | Slow classes: CT-2 kill-point matrix, CT-3 swarms, CT-6 full benchmarks, CT-7 soak, CT-8 isolation, CT-9 fuzz | — | nightly / pre-release | HC-1, HC-3, HC-7, HC-9..12 + kill harness | unarmed while the required slow-class capabilities remain U |
+**Armed** — these block a merge today.
+
+| MG | Gate | Threshold | When | Enforced by |
+|---|---|---|---|---|
+| MG-1 | Property-coverage ratchet: no INV/LIV/REQ row's status regresses (U → P → C is the only direction) and the count of rows at C never decreases; a PR adding a property adds its matrix row + CT class. Deliberately a count, not a fraction: a fraction floor would penalise adding the property this same gate mandates | `P-COV-PROP` (ratchet) | per-PR | HC-13 + review checklist |
+| MG-3 | Failing test first: every GAP closure and bug fix lands with the test that fails without it, named in the register | — | per-PR | review checklist |
+| MG-6 | Static gates: formatter check, linter at the pinned deny-set, dependency audit (audit advisory until added) | — | per-PR | existing CI |
+| MG-7 | Spec integrity: `scripts/check-spec.py` zero error-severity findings | — | per-PR | HC-13 |
+
+**Planned** — each arms in the phase that builds its capability, and blocks nothing
+until then. The Phase-0 CT-1 smoke run blocks on its own, but it does not satisfy MG-4.
+
+| MG | Gate | Threshold | When | Enforced by |
+|---|---|---|---|---|
+| MG-2 | Line coverage: changed-lines ≥ `P-COV-DIFF`, repo floor ≥ `P-COV-TOTAL`, both ratchet-only (arms with HC-11) | `P-COV-DIFF`, `P-COV-TOTAL` | per-PR | HC-11 |
+| MG-4 | Fast conformance: CT-1 (bounded generation), CT-4 (corpus subset), CT-5 (binding + validators) green (arms in Phase 2) | `P-CI-PR-BUDGET` wall-clock | per-PR | CI + HC-1..6 |
+| MG-5 | Performance regression: SLI-1..8 within `P-PERF-NOISE` of committed baselines (arms in Phase 4) | `P-PERF-NOISE` | nightly | HC-12 |
+| MG-8 | Slow classes: CT-2 kill-point matrix, CT-3 swarms, CT-6 full benchmarks, CT-7 soak, CT-8 isolation, CT-9 fuzz (arms as each capability lands) | — | nightly / pre-release | HC-1, HC-3, HC-7, HC-9..12 + kill harness |
 
 **Target flake policy (not yet automated)**: one automatic retry per test; a second
 flake within `P-FLAKE-WINDOW` quarantines the test with a named owner and an expiry

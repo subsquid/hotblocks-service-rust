@@ -62,7 +62,7 @@ async fn ct1_happy_path_matches_reference_model() {
     let client = Client::new(handle.port);
 
     // Quiescence: the SUT reaches the simulator's chain tip.
-    let tip = sim.block_ref(CHAIN_LEN - 1);
+    let tip = sim.tip();
     let head = wait_until(&client, |h| *h == tip, "SUT to reach the chain tip").await;
 
     // Replay the ledger — exactly what the simulator delivered, preserving
@@ -73,7 +73,7 @@ async fn ct1_happy_path_matches_reference_model() {
     // Watermarks match the model (INV-24).
     assert_eq!(head, model.head());
     assert_eq!(client.finalized_head().await.unwrap(), model.finalized());
-    assert_eq!(model.finalized(), sim.block_ref(CHAIN_LEN - 1 - FIN_LAG));
+    assert_eq!(model.finalized(), sim.block_ref(tip.number - FIN_LAG));
     v::validate_watermark_bounds(&model.finalized(), &head).unwrap();
 
     // DATA: stream from just above the seed, correct base (INV-20/23/25).
@@ -195,13 +195,14 @@ async fn ct1_happy_path_matches_reference_model() {
 
     // RP-8 / FM-44: an ancient `from` is backfilled from the finalized stream
     // and spliced onto the snapshot. The eligible chain is that splice, so the
-    // response must start at 0 and stay on it across the splice point.
+    // response must start at the chain's lowest height (DEF-30: `from` itself
+    // names no block) and stay on that branch across the splice point.
     let resp = client.stream(0, None, "zstd").await.unwrap();
     assert_eq!(resp.status, 200);
     let wm = v::validate_data_headers(&stream_headers(&resp), "zstd").unwrap();
     assert_eq!(wm, model.finalized());
     let text = v::decode_body(&resp.body, "zstd").unwrap();
-    let eligible: Vec<_> = (0..CHAIN_LEN).map(|n| sim.header(n)).collect();
+    let eligible: Vec<_> = sim.heights().map(|n| sim.header(n)).collect();
     let records = {
         let lg = ledger.lock().unwrap();
         v::validate_data(
@@ -215,7 +216,7 @@ async fn ct1_happy_path_matches_reference_model() {
         )
         .unwrap()
     };
-    assert_eq!(records[0].number, 0);
+    assert_eq!(records[0].number, *sim.heights().start());
 
     // The ledger now also holds the read-path backfill deliveries of the
     // `from = 0` query; replay must skip them (they are not ingest input) and
@@ -259,7 +260,7 @@ async fn ct1_gzip_and_zstd_decode_identically() {
     .await
     .unwrap();
     let client = Client::new(handle.port);
-    let tip = sim.block_ref(29);
+    let tip = sim.tip();
     wait_until(&client, |h| *h == tip, "SUT to reach the chain tip").await;
 
     let base = sim.block_ref(20);

@@ -12,7 +12,7 @@ Liveness claims hold only under these premises; outside them the obligation redu
   requirements; no starvation by co-tenants.
 - **Quiescent**: no input event pending and no in-flight request.
 - Bounds are end-to-end observable (each names its witness observable OB-n), and
-  none of them participates in ordering or identity decisions (CN-8).
+  none of them participates in ordering or identity decisions (INV-5).
 
 ## Properties
 
@@ -73,9 +73,9 @@ acquisition it spawns is abandoned within `P-DISCONNECT-REAP` of the response en
 for any reason. Witness: OB-5 backfill counters, resource gauges. Check: CT-8.
 
 **LIV-11 — Eviction convergence.** Precondition: finality advancing again after a lag.
-Bound: once `finalized(C)` covers the excess, the buffer returns to the window bound
-within `P-EVICT-CONVERGE` commits, and over-window alarms clear. Witness: OB-1 stored
-gauge, OB-6. Check: CT-7.
+Bound: the commit that finalizes past the excess also evicts it (T5 runs in the same
+atomic step, WP-24), so the buffer is back within the window bound at that commit and
+over-window alarms clear with it. Witness: OB-1 stored gauge, OB-6. Check: CT-7.
 
 **LIV-12 — No cross-client starvation.** Precondition: adequate resources. Bound: a
 conforming client's poll loop achieves ≥ 1 block of progress per

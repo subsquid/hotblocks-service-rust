@@ -17,7 +17,7 @@ RP-20..29 resource rules.
 | metrics(), metric(name) | status read | metric exposition |
 | blockIngestTime(height) | status read | timestamp ∪ not-found |
 
-All operations are reads of committed state (CN-1); none mutates the buffer (WP-1).
+All operations are reads of committed state (INV-16); none mutates the buffer (WP-1).
 Every operation is naturally idempotent and safe to retry.
 
 ## Admission
@@ -33,10 +33,9 @@ Against the resolution snapshot (DEF-13 — fresh at admission, and once more af
 wait per RP-4),
 `from` resolves to exactly one of:
 1. **window** — `first(C).parentNumber < from ≤ head(C).number`: serve the buffered
-   suffix starting at the lowest buffered height ≥ `from` (after the base check,
-   RP-11). The lower bound is the parent link, not `first(C).number`: on
-   skipped-height families (DEF-1) a `from` strictly between them names no block but
-   still resolves here (DEF-30).
+   suffix starting at the lowest buffered height ≥ `from` (DEF-30, after the base
+   check, RP-11). The lower bound is the parent link, not `first(C).number`, so a
+   `from` strictly between them still resolves here.
 2. **above head** — `from > head(C).number`: wait per RP-4, then re-resolve once —
    a full resolution against a fresh snapshot that may land in *any* of the three
    cases, including window-underflow when eviction crossed `from` during the wait
@@ -46,10 +45,7 @@ wait per RP-4),
    be validated against any buffered block and completes empty even if its
    `parentHash` is nonsense (explicitly tolerated; the client discovers the mismatch
    when the height enters the window).
-3. **below window** — `from ≤ first(C).parentNumber`: window-underflow (RP-8). Void
-   when `first(C)` is a root (DEF-4's exception, `parentNumber = number`): nothing
-   exists below a root, so every `from ≤ head` resolves to the window and is served
-   from the root up.
+3. **below window** — `from ≤ first(C).parentNumber`: window-underflow (RP-8).
 
 **RP-4 — Bounded waiting.** [MUST] The above-head wait lasts at most `P-WAIT-BLOCK`;
 it is released early by any commit that reaches `from` (LIV-4). At most one
@@ -59,8 +55,7 @@ re-resolution happens per request (no unbounded internal retry).
 
 **RP-5 — Coverage.** [MUST] A successful (non-empty) response delivers blocks
 `x_from … x_last` such that: the sequence is ascending and pairwise linked (DEF-5);
-the first delivered block is the lowest
-response-eligible height ≥ `from` (equal to `from` on contiguous-height families);
+the first delivered block is the lowest response-eligible height ≥ `from` (DEF-30);
 every delivered block is response-eligible (DEF-14);
 and `last ≥ from` (≥ 1 block — INV-23). **Early stop is normal**: the
 service may end the response at any record boundary (budget `P-RESP-BUDGET`, internal
@@ -111,23 +106,23 @@ INTERNAL error, never an empty conflict (INV-27, GAP-6).
 
 **RP-9 — Watermark reads (DEF-11).** [MUST] `head()`/`finalizedHead()` return refs from one
 committed state (INV-24); freshness: any commit is reflected by all subsequent
-watermark reads (CN-4 — no caching that outlives a commit). Successful and empty
+watermark reads (INV-24 — no caching that outlives a commit). Successful and empty
 stream responses carry the snapshot's finalized-head ref as metadata (14 §headers);
 conflicts and errors need not.
 
-**RP-10 — Readiness.** [MUST] Readiness (DEF-32) compares the *current upstream head*
-(a live adapter read, not a cached value) to the buffered head, and reports true iff
-`buffered ≥ upstream`. An adapter failure during the probe reports not-ready — a
-readiness probe never reports an internal error (its consumers are routers).
-Per-probe upstream cost is a declared hazard (HZ-9). Liveness
-is unconditional while the process serves at all.
+**RP-10 — Readiness.** [MUST] Readiness (DEF-32) compares the *last observed* upstream
+head (OB-4) to the buffered head and reports true iff `buffered ≥ observed` and the
+observation is younger than `P-STALL-ALARM`; a stale view reports not-ready. The probe
+is a local read — it never calls upstream and never reports an internal error, since
+its consumers are routers (ADR-17 ⚠ pending ratification; it lands with OB-4's gauge,
+GAP-25). Liveness is unconditional while the process serves at all.
 
 **RP-11 — The base check.** [MUST] When the client supplies `parentHash` and `from`
 resolves to the window or to backfill, let `x` be the lowest response-eligible block
-at height ≥ `from` (exactly at `from` on contiguous-height families): admit iff
+at height ≥ `from` (DEF-30): admit iff
 `x.parentHash = parentHash` (exact equality per DEF-2) — a resuming client's
 `parentHash` names its last block, which is `x`'s parent whether or not the
-intervening heights exist (DEF-30). When `from = head.number + 1`: admit iff
+intervening heights exist. When `from = head.number + 1`: admit iff
 `parentHash = head.hash`. Omitted `parentHash` always admits (the client opts out of
 fork detection for this request).
 
@@ -169,12 +164,12 @@ the first record it surfaces as truncation.
 **RP-21 — Slow clients & disconnect.** [MUST] A client that stops reading receives
 backpressure, not unbounded server-side buffering: per-request buffered-but-unsent
 data is bounded by `P-RESP-BUFFER`. A disconnect releases all request-scoped resources
-(snapshot, backfill acquisition, buffers) within `P-DISCONNECT-REAP` (RS-6). Neither a slow
+(snapshot, backfill acquisition, buffers) within `P-DISCONNECT-REAP` (LIV-10). Neither a slow
 client nor a disconnect affects ingestion or other requests beyond the declared shared
 budgets (INV-35).
 
 **RP-22 — Query-side upstream budget.** [MUST] Window-underflow acquisitions (RP-8)
-and readiness probes draw from the *same* configured upstream budget as ingestion
+draw from the *same* configured upstream budget as ingestion
 (REQ-16, ADR-3). This coupling is deliberate and declared; fairness between ingestion
 and query-side acquisition is a known hazard (HZ-1) until a priority mechanism exists.
 

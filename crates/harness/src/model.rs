@@ -36,12 +36,6 @@ fn linked(a: &ModelBlock, b: &ModelBlock) -> bool {
     a.number == b.parent_number && a.hash == b.parent_hash
 }
 
-/// `P-PENDING-REPORTS`: above-head finality obligations held at once (WP-12).
-/// Their arrival rate is upstream's to choose (FM-26), so the list is bounded
-/// state, not a queue — overflow is an adapter fault (PF-1). The value is the
-/// registry's ⚠ target, unratified until ADR-13 lands.
-pub const MAX_PENDING_REPORTS: usize = 64;
-
 /// Alarms the model raises. Surfacing them is INV-31 — no comparator reads
 /// this list yet (the matrix keeps INV-31 at U); tests may assert on it
 /// directly.
@@ -91,11 +85,9 @@ pub struct RefModel {
     f: usize,
     cache_size: usize,
     auto_adjust: bool,
-    /// WP-12: running maximum of finality reports for the current session.
+    /// WP-12: running maximum of finality reports for the current session —
+    /// the only obligation held (ADR-16).
     fin_max: Option<BlockRef>,
-    /// Reports above the buffered head, awaiting validation when their named
-    /// block arrives (WP-23's "re-validated later" is a real obligation).
-    pending: Vec<BlockRef>,
     pub alarms: Vec<Alarm>,
 }
 
@@ -108,7 +100,6 @@ impl RefModel {
             cache_size,
             auto_adjust,
             fin_max: None,
-            pending: vec![],
             alarms: vec![],
         };
         m.assert_well_formed();
@@ -175,15 +166,15 @@ impl RefModel {
                     bad => return bad,
                 }
             }
-            // Settle before noting: the arriving blocks discharge obligations,
-            // and a batch that clears the pending set must not be refused by it.
-            match m.settle_reports() {
+            // Settle before noting: the arriving blocks discharge the
+            // obligation the previous batch left open.
+            match m.settle_report() {
                 ApplyOutcome::Applied => {}
                 bad => return bad,
             }
             match finalized_report {
                 Some(r) => match m.note_report(r) {
-                    ApplyOutcome::Applied => m.settle_reports(),
+                    ApplyOutcome::Applied => m.settle_report(),
                     bad => bad,
                 },
                 None => ApplyOutcome::Applied,
@@ -191,26 +182,20 @@ impl RefModel {
         })
     }
 
-    /// WP-12: the running maximum and its obligations are per session. A
-    /// rebase (T6) stays inside one; a teardown ends it.
+    /// WP-12: the running maximum is per session. A rebase (T6) stays inside
+    /// one; a teardown ends it.
     pub fn begin_session(&mut self) {
         self.fin_max = None;
-        self.pending.clear();
     }
 
     /// WP-3/WP-5: run `step` against a checkpoint, restore it whole on any
     /// non-`Applied` outcome, then T5 + INV-1..3.
     fn atomic_step(&mut self, step: impl FnOnce(&mut Self) -> ApplyOutcome) -> ApplyOutcome {
-        let checkpoint = (
-            self.blocks.clone(),
-            self.f,
-            self.fin_max.clone(),
-            self.pending.clone(),
-        );
+        let checkpoint = (self.blocks.clone(), self.f, self.fin_max.clone());
         match step(self) {
             ApplyOutcome::Applied => {}
             bad => {
-                (self.blocks, self.f, self.fin_max, self.pending) = checkpoint;
+                (self.blocks, self.f, self.fin_max) = checkpoint;
                 return bad;
             }
         }
@@ -219,48 +204,27 @@ impl RefModel {
         ApplyOutcome::Applied
     }
 
-    /// WP-12: running maximum with contradiction detection. An equal-height
-    /// report disagreeing with the maximum or any pending obligation is a
-    /// violation; a new maximum above the head joins the pending set instead
-    /// of displacing older unvalidated obligations.
+    /// WP-12: running maximum with contradiction detection. A report naming
+    /// the maximum's height under a different hash is a violation; a higher
+    /// report replaces the maximum, and the replaced obligation's own check is
+    /// not owed (ADR-16).
     fn note_report(&mut self, r: &BlockRef) -> ApplyOutcome {
-        for q in self.pending.iter().chain(self.fin_max.as_ref()) {
-            if r.number == q.number && r.hash != q.hash {
+        if let Some(m) = &self.fin_max {
+            if r.number == m.number && r.hash != m.hash {
                 self.alarm(Alarm::IntegrityViolation("conflicting finality reports"));
                 return ApplyOutcome::IntegrityViolation("conflicting finality reports");
             }
         }
-        let newer = self.fin_max.as_ref().is_none_or(|m| r.number > m.number);
-        if newer {
-            if r.number > self.blocks.last().unwrap().number {
-                // Checked after settle_reports, so only obligations the batch
-                // left unresolved count against the bound.
-                if self.pending.len() >= MAX_PENDING_REPORTS {
-                    return ApplyOutcome::SessionError("too many unresolved finality reports");
-                }
-                self.pending.push(r.clone());
-            }
+        if self.fin_max.as_ref().is_none_or(|m| r.number > m.number) {
             self.fin_max = Some(r.clone());
         }
         ApplyOutcome::Applied
     }
 
-    /// Validate every obligation whose named block has arrived; the maximum
-    /// above the head keeps the provisional whole-buffer finality (WP-23).
-    fn settle_reports(&mut self) -> ApplyOutcome {
+    /// Validate the obligation once its named block has arrived; above the
+    /// head it keeps the provisional whole-buffer finality (WP-23).
+    fn settle_report(&mut self) -> ApplyOutcome {
         let head_num = self.blocks.last().unwrap().number;
-        let due: Vec<BlockRef> = self
-            .pending
-            .iter()
-            .filter(|r| r.number <= head_num)
-            .cloned()
-            .collect();
-        self.pending.retain(|r| r.number > head_num);
-        for r in &due {
-            if let bad @ ApplyOutcome::IntegrityViolation(_) = self.finalize(r) {
-                return bad;
-            }
-        }
         if let Some(m) = self.fin_max.clone() {
             if m.number <= head_num {
                 if let bad @ ApplyOutcome::IntegrityViolation(_) = self.finalize(&m) {
@@ -275,9 +239,7 @@ impl RefModel {
 
     fn push(&mut self, x: &ModelBlock) -> ApplyOutcome {
         // WP-6: identical duplicate is a no-op — identity is the full
-        // parentRef (spec 13 §apply_batch), not just (number, hash). Checked
-        // before DEF-4, because a redelivered root (parentNumber = number,
-        // DEF-4's sole exception) must be absorbed here, not rejected below.
+        // parentRef (spec 13 §apply_batch), not just (number, hash).
         if self.blocks.iter().any(|b| {
             b.number == x.number
                 && b.hash == x.hash
@@ -336,11 +298,11 @@ impl RefModel {
         ApplyOutcome::Applied
     }
 
-    /// T5 COMPACT (WP-24, RS-3/RS-4).
+    /// T5 COMPACT (WP-24).
     fn compact(&mut self) {
         let excess = self.blocks.len().saturating_sub(self.cache_size);
         if excess > self.f && self.auto_adjust {
-            self.f = excess; // RS-4 force-advance
+            self.f = excess; // force-advance
             self.alarm(Alarm::ForceAdvance);
         }
         let k = excess.min(self.f);
@@ -349,7 +311,7 @@ impl RefModel {
             self.f -= k;
         }
         if self.blocks.len() > self.cache_size {
-            self.alarm(Alarm::OverWindow); // RS-3 standing alarm
+            self.alarm(Alarm::OverWindow); // INV-4 standing alarm
         }
     }
 
@@ -377,12 +339,8 @@ impl RefModel {
 
     /// RP-3 range resolution against the current state (the snapshot).
     pub fn query(&self, from: u64, parent_hash: Option<&str>) -> QueryVerdict {
-        // Below-window means below `first`'s parent link. A buffered root
-        // (parentNumber = number, DEF-4's exception) has nothing below it:
-        // every `from` up to its height is a window query served from it.
-        let first = &self.blocks[0];
-        let rooted = first.parent_number == first.number;
-        if !rooted && from <= first.parent_number {
+        // Below-window means below `first`'s parent link (RP-3 case 3).
+        if from <= self.blocks[0].parent_number {
             return QueryVerdict::Backfill;
         }
         let last = self.blocks.last().unwrap();
@@ -445,88 +403,61 @@ mod tests {
         }
     }
 
+    /// A buffer seed: the first block is always linked to a parent outside the
+    /// buffer (T1 seeds at the upstream finalized head — DEF-4 admits no root).
+    fn seed() -> ModelBlock {
+        blk(1, "h1", "h0")
+    }
+
+    fn chain(range: std::ops::RangeInclusive<u64>) -> Vec<ModelBlock> {
+        range
+            .map(|i| blk(i, &format!("h{i}"), &format!("h{}", i - 1)))
+            .collect()
+    }
+
     #[test]
     fn duplicate_redelivery_is_a_noop() {
-        let mut m = RefModel::init(blk(0, "h0", "x"), 100, false);
+        let mut m = RefModel::init(seed(), 100, false);
+        assert_eq!(m.apply_batch(&chain(2..=4), None), ApplyOutcome::Applied);
+        // Redelivering block 3 must not truncate block 4 (WP-6 / GAP-29).
         assert_eq!(
-            m.apply_batch(
-                &[blk(1, "h1", "h0"), blk(2, "h2", "h1"), blk(3, "h3", "h2")],
-                None
-            ),
+            m.apply_batch(&[blk(3, "h3", "h2")], None),
             ApplyOutcome::Applied
         );
-        // Redelivering block 2 must not truncate block 3 (WP-6 / GAP-29).
-        assert_eq!(
-            m.apply_batch(&[blk(2, "h2", "h1")], None),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(m.head(), rf(3, "h3"));
+        assert_eq!(m.head(), rf(4, "h4"));
         assert_eq!(m.len(), 4);
     }
 
     #[test]
+    fn seed_redelivery_is_a_noop() {
+        let mut m = RefModel::init(seed(), 100, false);
+        assert_eq!(m.apply_batch(&chain(2..=3), None), ApplyOutcome::Applied);
+        // WP-6 holds at every position, including the buffer's first block.
+        assert_eq!(m.apply_batch(&[seed()], None), ApplyOutcome::Applied);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m.head(), rf(3, "h3"));
+    }
+
+    #[test]
     fn duplicate_with_a_forged_parent_height_is_not_absorbed() {
-        let mut m = RefModel::init(blk(0, "h0", "x"), 100, false);
-        assert_eq!(
-            m.apply_batch(&[blk(1, "h1", "h0"), blk(2, "h2", "h1")], None),
-            ApplyOutcome::Applied
-        );
-        // Same (number, hash) as the buffered block 2, one height lower on the
+        let mut m = RefModel::init(seed(), 100, false);
+        assert_eq!(m.apply_batch(&chain(2..=3), None), ApplyOutcome::Applied);
+        // Same (number, hash) as the buffered block 3, one height lower on the
         // parent: identity is the full parentRef (DEF-3), so this takes the
         // reorg path — matching (number, hash) alone made it a silent no-op.
         let forged = ModelBlock {
-            number: 2,
-            hash: "h2".into(),
-            parent_number: 0,
-            parent_hash: "h0".into(),
+            number: 3,
+            hash: "h3".into(),
+            parent_number: 1,
+            parent_hash: "h1".into(),
         };
         assert_eq!(m.apply_batch(&[forged], None), ApplyOutcome::Applied);
         assert_eq!(m.len(), 2);
-        assert_eq!(m.head(), rf(2, "h2"));
-    }
-
-    fn root() -> ModelBlock {
-        // DEF-4's root convention: parentNumber = number, parent hash names
-        // no block — exactly what the simulator generates for block 0.
-        ModelBlock {
-            number: 0,
-            hash: "h0".into(),
-            parent_number: 0,
-            parent_hash: "0x0".into(),
-        }
+        assert_eq!(m.head(), rf(3, "h3"));
     }
 
     #[test]
-    fn genesis_redelivery_is_a_noop() {
-        let mut m = RefModel::init(root(), 100, false);
-        assert_eq!(
-            m.apply_batch(&[blk(1, "h1", "h0"), blk(2, "h2", "h1")], None),
-            ApplyOutcome::Applied
-        );
-        // WP-6: an identical duplicate is a no-op even for the root, whose
-        // self-parent convention must not trip the DEF-4 height check.
-        assert_eq!(m.apply_batch(&[root()], None), ApplyOutcome::Applied);
-        assert_eq!(m.len(), 3);
-        assert_eq!(m.head(), rf(2, "h2"));
-    }
-
-    #[test]
-    fn query_serves_data_at_a_buffered_root() {
-        let mut m = RefModel::init(root(), 100, false);
-        assert_eq!(
-            m.apply_batch(&[blk(1, "h1", "h0")], None),
-            ApplyOutcome::Applied
-        );
-        // Block 0 is buffered and servable; nothing exists below a root, so
-        // this is a window query, not a backfill.
-        match m.query(0, None) {
-            QueryVerdict::Data { blocks, .. } => assert_eq!(blocks[0].number, 0),
-            other => panic!("buffered root must be served, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn query_below_a_non_root_base_is_backfill() {
+    fn query_below_the_buffer_base_is_backfill() {
         let m = RefModel::init(blk(10, "h10", "h9"), 100, false);
         assert_eq!(m.query(9, None), QueryVerdict::Backfill);
         assert!(matches!(m.query(10, None), QueryVerdict::Data { .. }));
@@ -534,11 +465,8 @@ mod tests {
 
     #[test]
     fn fork_signal_exhausted_prev_descends_one_below_the_lowest_ref() {
-        let mut m = RefModel::init(root(), 100, false);
-        let chain: Vec<_> = (1..=5)
-            .map(|i| blk(i, &format!("h{i}"), &format!("h{}", i - 1)))
-            .collect();
-        assert_eq!(m.apply_batch(&chain, None), ApplyOutcome::Applied);
+        let mut m = RefModel::init(seed(), 100, false);
+        assert_eq!(m.apply_batch(&chain(2..=5), None), ApplyOutcome::Applied);
         // Upstream names height 4 under an unknown hash: no buffered ref
         // matches, so the base is the newest block strictly below the lowest
         // signalled ref — stepwise descent (WP-10), not terminal divergence.
@@ -550,12 +478,9 @@ mod tests {
 
     #[test]
     fn fork_signal_matching_the_finalized_block_rebases() {
-        let mut m = RefModel::init(root(), 100, false);
-        let chain: Vec<_> = (1..=5)
-            .map(|i| blk(i, &format!("h{i}"), &format!("h{}", i - 1)))
-            .collect();
+        let mut m = RefModel::init(seed(), 100, false);
         assert_eq!(
-            m.apply_batch(&chain, Some(&rf(4, "h4"))),
+            m.apply_batch(&chain(2..=5), Some(&rf(4, "h4"))),
             ApplyOutcome::Applied
         );
         assert_eq!(m.finalized(), rf(4, "h4"));
@@ -566,12 +491,9 @@ mod tests {
 
     #[test]
     fn fork_signal_entirely_below_finality_is_terminal() {
-        let mut m = RefModel::init(root(), 100, false);
-        let chain: Vec<_> = (1..=5)
-            .map(|i| blk(i, &format!("h{i}"), &format!("h{}", i - 1)))
-            .collect();
+        let mut m = RefModel::init(seed(), 100, false);
         assert_eq!(
-            m.apply_batch(&chain, Some(&rf(4, "h4"))),
+            m.apply_batch(&chain(2..=5), Some(&rf(4, "h4"))),
             ApplyOutcome::Applied
         );
         // The only descent target would sit below the finalized block: FM-30.
@@ -580,13 +502,10 @@ mod tests {
 
     #[test]
     fn descending_height_is_rejected() {
-        let mut m = RefModel::init(blk(0, "h0", "x"), 100, false);
-        assert_eq!(
-            m.apply_batch(&[blk(1, "h1", "h0")], None),
-            ApplyOutcome::Applied
-        );
+        let mut m = RefModel::init(seed(), 100, false);
+        assert_eq!(m.apply_batch(&chain(2..=2), None), ApplyOutcome::Applied);
         let bad = ModelBlock {
-            number: 1,
+            number: 3,
             hash: "hx".into(),
             parent_number: 5,
             parent_hash: "h5".into(),
@@ -598,36 +517,8 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_that_clears_the_pending_set_is_not_refused() {
-        let mut m = RefModel::init(blk(0, "h0", "x"), 1000, false);
-        let report_base = MAX_PENDING_REPORTS as u64;
-        for i in 1..=MAX_PENDING_REPORTS as u64 {
-            assert_eq!(
-                m.apply_batch(
-                    &[blk(i, &format!("h{i}"), &format!("h{}", i - 1))],
-                    Some(&rf(report_base + i, &format!("h{}", report_base + i)))
-                ),
-                ApplyOutcome::Applied
-            );
-        }
-        let blocks: Vec<_> = (report_base + 1..=report_base * 2)
-            .map(|i| blk(i, &format!("h{i}"), &format!("h{}", i - 1)))
-            .collect();
-        // Every obligation is discharged by this batch; its own new report
-        // must not be turned away by the bound the batch just released.
-        assert_eq!(
-            m.apply_batch(&blocks, Some(&rf(report_base * 2 + 1, "hx"))),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.finalized(),
-            rf(report_base * 2, &format!("h{}", report_base * 2))
-        );
-    }
-
-    #[test]
     fn empty_input_batch_is_an_adapter_fault() {
-        let mut m = RefModel::init(blk(1, "h1", "h0"), 100, false);
+        let mut m = RefModel::init(seed(), 100, false);
         assert_eq!(
             m.apply_batch(&[], Some(&rf(2, "A"))),
             ApplyOutcome::SessionError("empty input batch (DEF-20)")
@@ -635,58 +526,51 @@ mod tests {
     }
 
     #[test]
-    fn above_head_obligations_are_bounded() {
-        let mut m = RefModel::init(blk(0, "h0", "x"), 100, false);
-        for i in 1..=MAX_PENDING_REPORTS as u64 {
-            assert_eq!(
-                m.apply_batch(
-                    &[blk(i, &format!("h{i}"), &format!("h{}", i - 1))],
-                    Some(&rf(1000 + i, "f"))
-                ),
-                ApplyOutcome::Applied
-            );
-        }
+    fn the_obligation_is_validated_when_its_block_arrives() {
+        let mut m = RefModel::init(seed(), 100, false);
+        // Report (3, A) rides on block 2 and stays open above the head.
         assert_eq!(
-            m.apply_batch(
-                &[blk(
-                    MAX_PENDING_REPORTS as u64 + 1,
-                    "next",
-                    &format!("h{MAX_PENDING_REPORTS}")
-                )],
-                Some(&rf(1001 + MAX_PENDING_REPORTS as u64, "f"))
-            ),
-            ApplyOutcome::SessionError("too many unresolved finality reports")
-        );
-    }
-
-    #[test]
-    fn pending_report_validated_when_named_block_arrives() {
-        let mut m = RefModel::init(blk(0, "h0", "x"), 100, false);
-        // Report (2, A) is attached to block 1 and held as a pending
-        // obligation until the named block arrives.
-        assert_eq!(
-            m.apply_batch(&[blk(1, "h1", "h0")], Some(&rf(2, "A"))),
+            m.apply_batch(&chain(2..=2), Some(&rf(3, "A"))),
             ApplyOutcome::Applied
         );
-        // Block 2 arrives with hash C alongside a newer report (3, B):
-        // the old obligation must still be validated — and must fail.
+        // Block 3 arrives under a different hash: the open obligation is
+        // checked before the batch's own report is noted, and fails (WP-23).
         assert_eq!(
-            m.apply_batch(&[blk(2, "C", "h1")], Some(&rf(3, "B"))),
+            m.apply_batch(&[blk(3, "C", "h2")], Some(&rf(9, "B"))),
             ApplyOutcome::IntegrityViolation("finality hash mismatch")
         );
         // The rejected batch left no trace (WP-5).
-        assert_eq!(m.head(), rf(1, "h1"));
+        assert_eq!(m.head(), rf(2, "h2"));
+    }
+
+    #[test]
+    fn a_higher_report_replaces_the_open_obligation() {
+        let mut m = RefModel::init(seed(), 100, false);
+        assert_eq!(
+            m.apply_batch(&chain(2..=2), Some(&rf(5, "A"))),
+            ApplyOutcome::Applied
+        );
+        // A higher report supersedes (5, A) before block 5 ever arrives, so
+        // (5, A)'s own hash check is no longer owed (ADR-16).
+        assert_eq!(
+            m.apply_batch(&chain(3..=3), Some(&rf(6, "B"))),
+            ApplyOutcome::Applied
+        );
+        let mut tail = chain(4..=4);
+        tail.push(blk(5, "C", "h4"));
+        assert_eq!(m.apply_batch(&tail, None), ApplyOutcome::Applied);
+        assert_eq!(m.head(), rf(5, "C"));
     }
 
     #[test]
     fn equal_height_contradictory_reports_are_a_violation() {
-        let mut m = RefModel::init(blk(0, "h0", "x"), 100, false);
+        let mut m = RefModel::init(seed(), 100, false);
         assert_eq!(
-            m.apply_batch(&[blk(1, "h1", "h0")], Some(&rf(3, "A"))),
+            m.apply_batch(&chain(2..=2), Some(&rf(4, "A"))),
             ApplyOutcome::Applied
         );
         assert_eq!(
-            m.apply_batch(&[blk(2, "h2", "h1")], Some(&rf(3, "B"))),
+            m.apply_batch(&chain(3..=3), Some(&rf(4, "B"))),
             ApplyOutcome::IntegrityViolation("conflicting finality reports")
         );
     }

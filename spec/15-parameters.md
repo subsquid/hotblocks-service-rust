@@ -25,8 +25,7 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 | P-STALL-FREE-RETRIES | stalled-session restarts before backoff (WP-9) | 1 | — |
 | P-SESSION-BACKOFF | delay between stalled sessions | 30 s | — |
 | P-STALL-REINIT | stalled sessions before T1 re-seed | 6 (code gate `stalled > 5`) | — |
-| P-STALL-ALARM | zero-progress time before the stall alarm level (LIV-2) | ⊥ not implemented (GAP-4) | ⚠ 60 s |
-| P-PENDING-REPORTS | unresolved above-head finality obligations held per session (WP-12) | ⊥ arbitration itself absent (GAP-7); the reference model implements the ⚠ target | ⚠ 64 |
+| P-STALL-ALARM | zero-progress time before the stall alarm level (LIV-2); also the readiness staleness floor (RP-10) | ⊥ not implemented (GAP-4) | ⚠ 60 s |
 | P-STRIDE-SIZE | acquisition range-batch size (IB-10) | 5 (default) | — |
 | P-STRIDE-CONCURRENCY | concurrent range batches | 5 (default) | — |
 
@@ -76,10 +75,7 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 | P-SLO-READY-AVAIL | SLI-7 floor | ⊥ | ⚠ |
 | P-SLO-MEM-FACTOR | SLI-8 bound | **violated during catch-up** (GAP-2) | ⚠ |
 | P-SLO-REORG-CONVERGE | LIV-8 bound (function of depth) | one fork signal + session per depth unit observed | ⚠ |
-| P-NOISY-DEGRADE | allowed SLI-1 degradation under S6 (PF-6) | ⊥ no fairness mechanism (HZ-1) | ⚠ |
 | P-PERF-NOISE | benchmark noise band (MG-5) | ⊥ | ⚠ |
-| P-MAINT-BUDGET | maintenance share per commit (PF-4) | ⊥ | ⚠ |
-| P-EVICT-CONVERGE | commits to restore the window bound (LIV-11) | ⊥ | ⚠ 1 |
 | P-LOG-RATE-STEADY | log records per ingested block (REQ-31) | **violated: ≥ 1 status line per block, unthrottled** (GAP-23) | ⚠ 0.1 |
 
 ## Process gates (13)

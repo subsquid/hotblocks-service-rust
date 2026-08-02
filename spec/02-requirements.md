@@ -8,12 +8,12 @@ operations. Acceptance *status* lives in [13-conformance-tdd.md](13-conformance-
 **REQ-1 — Resumable block stream.** [MUST]
 A client that names a starting height (and optionally the hash of that height's parent)
 receives a contiguous, ascending, parent-linked sequence of canonical block records
-starting at the lowest available height at or above the named one (exactly the named
-height on chain families with contiguous heights — DEF-1 admits skipped
-coordinates). Any response prefix is independently valid: the client
+starting at the lowest available height at or above the named one (DEF-30). Any
+response prefix is independently valid: the client
 may resume later from the last block it received, with no server-side session state.
 *Acceptance:* for every successful stream response, blocks decode, ascend,
-parent-link, and start at the lowest available height ≥ the requested one; issuing a follow-up request from `last+1` with
+parent-link, and start at the lowest available height ≥ the requested one (DEF-30);
+issuing a follow-up request from `last+1` with
 `last.hash` succeeds or conflicts, never gaps.
 *Trace:* RP-5, RP-6, INV-20, INV-23.
 
@@ -112,14 +112,14 @@ watermark is monotone within each epoch and the process stays healthy.
 
 **REQ-12 — Bounded window.** [MUST]
 The buffer holds at most `P-CACHE-SIZE` blocks plus transient batch overshoot
-(RS-3). Eviction removes only finalized blocks (oldest first). When lagging finality
+(INV-4). Eviction removes only finalized blocks (oldest first). When lagging finality
 blocks eviction, the operator chooses by configuration between (a) exceeding the window
 with a continuous alarm and (b) force-advancing finality to keep the bound
-(`auto-adjust`, RS-4).
+(`auto-adjust`, WP-24).
 *Acceptance:* with auto-adjust on, no committed state's buffer exceeds `P-CACHE-SIZE`
 (INV-4); with it off, every over-window state is accompanied by an active alarm
 observable (OB-6).
-*Trace:* RS-1..RS-5, INV-4, LIV-11; GAP-2; ADR-9.
+*Trace:* DEF-24, WP-24, INV-4, LIV-11; GAP-2; ADR-9.
 
 **REQ-13 — Unattended restart.** [MUST]
 After any process exit, a fresh start reaches serving state from configuration and
@@ -127,7 +127,7 @@ upstream state alone: it reseeds from the upstream finalized head and catches up
 local state, operator action, or client cooperation is required.
 *Acceptance:* kill-and-restart under load reaches readiness within `P-SLO-STARTUP` +
 catch-up time; clients recover using only REQ-1/REQ-2 semantics.
-*Trace:* WP-15, CN-7, LIV-5.
+*Trace:* WP-15, INV-40, LIV-5.
 
 **REQ-14 — Optional verification.** [SHOULD]
 The operator can enable independent verification of upstream-supplied integrity claims
@@ -255,7 +255,7 @@ The following are deliberately left open; conformance tests MUST NOT pin them:
 |---|---|---|---|
 | OQ-1 | Non-EVM adapters (Solana first): mapping of slots→height/parent coordinates, finality/commitment semantics, payload canonical form — what, if anything, does the core contract miss? | product/eng | REQ-17 acceptance beyond the synthetic adapter |
 | OQ-2 | The intended post-migration redesign ("change how it works") is not yet specified; which parts of this suite does it supersede? | product | roadmap ADRs |
-| OQ-3 | Should the buffer survive restarts (warm restart), or is NG1 permanent? | product/eng | NG1, CN-7 |
+| OQ-3 | Should the buffer survive restarts (warm restart), or is NG1 permanent? | product/eng | NG1, INV-40 |
 | OQ-4 | When is REQ-24 (predecessor byte-compatibility) sunset, releasing GAP-18/19 and the `?json` shape to be fixed forward? | product | REQ-24, GAP-18, GAP-19 |
 | OQ-5 | One process per chain (NG3) — does multi-dataset serving enter the roadmap? | product | NG3 |
 | OQ-6 | The supported-network set for REQ-15 (is Cronos/Hedera/Tac in scope?) | ops | GAP-16 priority |

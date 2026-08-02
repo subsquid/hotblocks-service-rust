@@ -25,7 +25,7 @@ loop:
 
 **WP-3 — Batch atomicity & visibility.** [MUST] All effects of one input batch — its
 appends/reorgs, its finality advance, and the resulting eviction — become visible to
-readers as one committed state (CN-2). Readers never observe a half-applied batch.
+readers as one committed state (INV-16). Readers never observe a half-applied batch.
 The commit point is the atomic publication of the new buffer state; there is no
 acknowledgement to the adapter — redelivered blocks are absorbed idempotently (WP-13).
 
@@ -110,19 +110,16 @@ livelock of GAP-5).
    without ever delaying block delivery for it.
 
 **WP-12 — Finality arbitration.** [MUST] The service maintains the maximum finality
-report seen in the current session and applies T4 with that maximum. Regressive reports
-(lower than an already-applied finality) are ignored without error. A report naming a
-buffered height with a different hash than the buffered block is an integrity violation
-(WP-5 handling — alarm + session teardown, not process death; GAP-7). So are two
-session reports naming one height under different hashes — at most one can match the
-block when it arrives, so the contradiction is decidable the moment the second report
-lands, held block or not. A report above
-the buffered head finalizes the entire buffer (the report is then re-validated when the
-named block arrives — see INV-12's check note). At most `P-PENDING-REPORTS` such
-obligations are held at once: their arrival rate is upstream's to choose (FM-26), so an
-unbounded obligation list would be a memory sink an adversarial adapter controls
-(PF-1). Exceeding the bound is a session error, not a silent drop — dropping an
-obligation would forfeit the hash check that catches a forged watermark.
+report seen in the current session — one ref, no history — and applies T4 with it.
+Regressive reports (lower than an already-applied finality) are ignored without error.
+A report naming a buffered height with a different hash than the buffered block is an
+integrity violation (WP-5 handling — alarm + session teardown, not process death;
+GAP-7). So is a report naming the current maximum's height under a different hash: at
+most one of the two can match the block when it arrives, so the contradiction is
+decidable the moment the second report lands, held block or not. A report above the
+buffered head finalizes the entire buffer and is re-validated when the named block
+arrives (INV-12's check note); a higher report replaces it, and the replaced
+obligation's own check is not owed (ADR-16 ⚠ pending ratification).
 
 **WP-13 — Commit & redelivery.** [MUST] There is no partial visibility and no replay
 journal: the committed buffer state *is* the only state. After any session restart the
@@ -136,7 +133,7 @@ or absurd — may terminate the process or degrade it into a permanently failing
 **WP-15 — Restart continuity.** [MUST] The process recovers by construction: T1 seeds
 from the upstream finalized head, which by INV-11's contract can never be reorged away
 upstream. There is no local recovered state and therefore no recovery divergence
-(CN-7). Anything a client held from before the restart remains valid under REQ-1/2
+(INV-40). Anything a client held from before the restart remains valid under REQ-1/2
 semantics (their next request either streams or conflicts).
 
 ## Transition catalog
@@ -178,9 +175,15 @@ decreases (INV-12).
 `excess = max(0, n − P-CACHE-SIZE)`. Evict `k = min(excess, f − 1)` oldest blocks:
 `B' = ⟨b_{k+1}…bₙ⟩`, `f' = f − k`. If `excess > k` (finality lags): with
 `autoAdjust = false`, the over-window state persists and MUST raise the standing alarm
-OB-6; with `autoAdjust = true`, first `f ← excess + 1` (force-advance, alarmed per
-RS-4), then evict as above, restoring the bound. Eviction never removes an unfinalized
-block and never anything except the oldest prefix (INV-14).
+OB-6; with `autoAdjust = true`, first `f ← excess + 1`, then evict as above, restoring
+the bound. Eviction never removes an unfinalized block and never anything except the
+oldest prefix (INV-14).
+
+The force-advance is the sanctioned finality override (DEF-24, ADR-9): it declares
+potentially-unfinalized blocks irreversible, trading rollback safety for the memory
+bound, and MUST be alarmed per advance (OB-6). Afterwards INV-11 protects the advanced
+position like any other, so a reorg deeper than the forced point becomes FM-19/FM-30 —
+the accepted risk, made loud.
 
 **WP-25 — T6 REBASE.** *Pre:* fork signal handled per WP-10, target `t` found. *Post:*
 buffer unchanged; `S.base = t`, `stalled = 0`. (Included for completeness: T6 mutates
