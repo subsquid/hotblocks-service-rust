@@ -42,13 +42,20 @@ the batch is rejected whole (no partial application), the condition is alarmed (
 and the session is torn down per WP-9. It is never applied partially, never
 process-fatal, and never silently dropped (INV-41, ADR-11 ⚠ pending ratification; GAP-1).
 
-**WP-6 — Duplicate absorption.** [MUST] Re-delivery of a block already buffered with
-the same hash and same parent link (e.g. after session restart or fork replay) is a
-strict no-op: the buffer — including everything above the duplicate — is unchanged,
-and no reader observes any effect. This holds at every position, including at or
-below `finalized(C)`. Treating a duplicate as a reorganization (truncating the newer
-suffix, or tripping the finality guard) is non-conforming (GAP-29). Idempotency is
-required under at-least-once delivery (DEF-20).
+**WP-6 — Duplicate absorption & equivocation.** [MUST] Re-delivery of a block already
+buffered with the same hash and same parent link (e.g. after session restart or fork
+replay) is a strict no-op: the buffer — including everything above the duplicate — is
+unchanged, and no reader observes any effect. This holds at every position, including
+at or below `finalized(C)`. Treating a duplicate as a reorganization (truncating the
+newer suffix, or tripping the finality guard) is non-conforming (GAP-29). Idempotency
+is required under at-least-once delivery (DEF-20).
+
+A delivery whose ref matches a buffered block but whose parent link differs is neither
+a duplicate nor a reorganization: it is **equivocation** — one hash claiming two
+ancestries (DEF-8) — and is an integrity violation (WP-5 handling; GAP-33). Applying
+it as a reorg would leave the ref unchanged while its history silently changed, which
+no client can detect: the conflict protocol compares parent hashes of *later* blocks
+(RP-11), and those still link.
 
 **WP-7 — No content-based rejection.** [MUST] The buffer layer judges blocks only by
 linkage (DEF-5) and refs; payload content never causes rejection at this layer.

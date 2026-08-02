@@ -19,11 +19,12 @@ both fields are equal.
 `(number: Height, hash: Hash, parentNumber: Height, parentHash: Hash, timestamp: ℕ|⊥, payload: Record)`
 where `timestamp` is milliseconds since epoch (⊥ where the chain family has none) and
 `payload` is the canonical record (DEF-6). `ref(b) = (b.number, b.hash)`,
-`parentRef(b) = (b.parentNumber, b.parentHash)`. Required, without exception:
-`b.parentNumber < b.number`. The buffer is seeded at the upstream *finalized* head
-(T1), so a chain family's root block is never buffered and never an argument of any
-transition; a chain younger than its own finality depth is out of scope, and a root
-delivered as input is an integrity violation like any other malformed block (WP-5).
+`parentRef(b) = (b.parentNumber, b.parentHash)`. Required: `b.parentNumber < b.number`,
+with one exception — a chain family's **root** block, which has no parent and carries
+`parentNumber = number` with a `parentHash` naming no block. A chain younger than its
+own finality depth seeds there (T1), so the root is buffered in practice; it can only
+ever be a buffer's seed, never an argument of T2/T3, so no transition may relax the
+requirement.
 
 **DEF-5 — Parent link.** `linked(a, b) ≡ a.number = b.parentNumber ∧ a.hash = b.parentHash`.
 This is the *only* adjacency relation in the core: contiguity of heights is NOT assumed
@@ -38,6 +39,12 @@ chain family in 14 §payload.
 **DEF-7 — Data component.** A named slice of a block's data acquired separately from
 the header: the chain family defines the set (for EVM: transactions, receipts, event
 logs, execution traces, state diffs). The data selection (DEF-22) picks a subset.
+
+**DEF-8 — Block identity.** A block's identity is its ref (DEF-3): a hash names one
+block (DEF-2), so it names one parent link. Two deliveries sharing a ref but
+disagreeing on `parentRef` are upstream equivocation, not two blocks — WP-6 makes that
+contradiction an integrity violation rather than a reorganization, because a client
+holding the ref has no way to observe its ancestry changing underneath.
 
 ## State
 

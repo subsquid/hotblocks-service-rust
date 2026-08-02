@@ -45,7 +45,10 @@ wait per RP-4),
    be validated against any buffered block and completes empty even if its
    `parentHash` is nonsense (explicitly tolerated; the client discovers the mismatch
    when the height enters the window).
-3. **below window** — `from ≤ first(C).parentNumber`: window-underflow (RP-8).
+3. **below window** — `from ≤ first(C).parentNumber`: window-underflow (RP-8). Void
+   when `first(C)` is a root (DEF-4's exception, `parentNumber = number`): nothing
+   exists below a root, so every `from ≤ head` resolves to the window and is served
+   from the root up.
 
 **RP-4 — Bounded waiting.** [MUST] The above-head wait lasts at most `P-WAIT-BLOCK`;
 it is released early by any commit that reaches `from` (LIV-4). At most one

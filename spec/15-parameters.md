@@ -48,7 +48,7 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 | P-WAIT-BLOCK | above-head wait (RP-4) | 5 s | — |
 | P-RESP-BUDGET | response production budget (RP-20) | 60 s | — |
 | P-RESP-BUFFER | per-request buffered-unsent bound (RP-21) | 32 frames | — |
-| P-FORK-REFS-MAX | max refs in a conflict (RP-7) | 101 (window path) / 100 (head path) | — |
+| P-FORK-REFS-MAX | max refs in a conflict (RP-7) | 101 — the window path emits an inclusive span of 101 refs, the head path up to 100; the bound is the larger, and the count within it is a free variable (13) | — |
 | P-DISCONNECT-REAP | resource release after disconnect (RP-21) | ⊥ unmeasured | ⚠ 2 s |
 | P-MAX-CONCURRENT-STREAMS | admission cap for concurrent stream requests (RP-23) | ⊥ unbounded today (GAP-28) | ⚠ 64 |
 | P-WAKE-LATENCY | commit→waiter wakeup (LIV-4) | ⊥ unmeasured | ⚠ 100 ms |

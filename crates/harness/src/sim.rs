@@ -99,17 +99,18 @@ pub struct SimChain {
 }
 
 impl SimChain {
-    /// Generated heights start here: DEF-4 admits no root block, and the
-    /// buffer is seeded at the upstream finalized head, so every generated
-    /// block links to a real parent — height 0's block is outside the chain.
-    pub const FIRST_HEIGHT: u64 = 1;
-
     pub fn generate(seed: u64, len: u64) -> Self {
         let mut blocks = Vec::with_capacity(len as usize);
-        for n in Self::FIRST_HEIGHT..Self::FIRST_HEIGHT + len {
+        for n in 0..len {
+            // Block 0 is the root: parentNumber = number, parent hash names
+            // no block (DEF-4's sole exception).
             let hash = hash_at(seed, n, 0);
-            let parent_hash = hash_at(seed, n - 1, 0);
-            let pn = n - 1;
+            let parent_hash = if n == 0 {
+                "0x0".to_string()
+            } else {
+                hash_at(seed, n - 1, 0)
+            };
+            let pn = if n == 0 { 0 } else { n - 1 };
             let line = format!(
                 "{{\"number\":{n},\"parentNumber\":{pn},\"hash\":\"{hash}\",\"parentHash\":\"{parent_hash}\",\"seed\":{seed}}}\n"
             );
@@ -126,13 +127,8 @@ impl SimChain {
         SimChain { seed, blocks }
     }
 
-    /// Heights index the chain; `FIRST_HEIGHT` is its base.
-    fn at(&self, n: u64) -> &Block {
-        &self.blocks[(n - Self::FIRST_HEIGHT) as usize]
-    }
-
     pub fn header(&self, n: u64) -> ModelBlock {
-        let b = self.at(n);
+        let b = &self.blocks[n as usize];
         ModelBlock {
             number: b.number,
             hash: b.hash.clone(),
@@ -142,16 +138,7 @@ impl SimChain {
     }
 
     pub fn block_ref(&self, n: u64) -> BlockRef {
-        self.at(n).block_ref()
-    }
-
-    pub fn tip(&self) -> BlockRef {
-        self.blocks.last().unwrap().block_ref()
-    }
-
-    /// The generated height range, `FIRST_HEIGHT ..= tip`.
-    pub fn heights(&self) -> std::ops::RangeInclusive<u64> {
-        Self::FIRST_HEIGHT..=self.blocks.last().unwrap().number
+        self.blocks[n as usize].block_ref()
     }
 
     pub fn len(&self) -> u64 {
@@ -189,13 +176,6 @@ impl SimSource {
 
     pub fn ledger(&self) -> Arc<Mutex<Ledger>> {
         Arc::clone(&self.ledger)
-    }
-
-    /// The generated chain is contiguous from `SimChain::FIRST_HEIGHT`; a
-    /// height below it names a block outside the chain (`None`).
-    fn at_height(chain: &[Block], n: u64) -> Option<&Block> {
-        n.checked_sub(SimChain::FIRST_HEIGHT)
-            .and_then(|i| chain.get(i as usize))
     }
 
     /// Record a batch at yield time: only what was actually delivered enters
@@ -250,9 +230,7 @@ impl DataSource for SimSource {
     }
 
     async fn get_finalized_head(&self) -> anyhow::Result<BlockRef> {
-        Ok(Self::at_height(&self.chain, self.init_finalized)
-            .expect("init_finalized names a generated block")
-            .block_ref())
+        Ok(self.chain[self.init_finalized as usize].block_ref())
     }
 
     fn get_finalized_stream(
@@ -327,8 +305,7 @@ impl DataSource for SimSource {
                 if batch.len() == batch_size {
                     let last = batch.last().unwrap().number;
                     let fin = last.checked_sub(fin_lag)
-                        .and_then(|n| Self::at_height(&chain, n))
-                        .map(|b| b.block_ref());
+                        .map(|n| chain[n as usize].block_ref());
                     let out = BlockBatch { blocks: std::mem::take(&mut batch), finalized_head: fin };
                     Self::record(&ledger, &out, false);
                     yield Ok(out);
@@ -336,10 +313,7 @@ impl DataSource for SimSource {
             }
             if !batch.is_empty() {
                 let last = batch.last().unwrap().number;
-                let fin = last
-                    .checked_sub(fin_lag)
-                    .and_then(|n| Self::at_height(&chain, n))
-                    .map(|b| b.block_ref());
+                let fin = last.checked_sub(fin_lag).map(|n| chain[n as usize].block_ref());
                 let out = BlockBatch { blocks: std::mem::take(&mut batch), finalized_head: fin };
                 Self::record(&ledger, &out, false);
                 yield Ok(out);
@@ -490,9 +464,20 @@ mod tests {
             false,
         );
 
-        let model = ledger.into_inner().unwrap().replay(100, false);
-        assert_eq!(model.len(), 2, "the forged parent must trigger a reorg");
-        assert_eq!(model.head(), rf(2, "h2"));
-        assert_eq!(model.blocks().last().unwrap().parent_number, 0);
+        // The ledger keeps both linkage tuples: collapsing them by ref would
+        // hide the equivocation from the model, which is the only component
+        // that can call it (WP-6).
+        let lg = ledger.into_inner().unwrap();
+        let delivered: Vec<ModelBlock> = lg.events.iter().flat_map(|e| e.blocks.clone()).collect();
+        assert!(delivered.contains(&two) && delivered.contains(&forged_two));
+
+        let mut model = RefModel::init(root, 100, false);
+        assert_eq!(model.apply_batch(&[one, two], None), ApplyOutcome::Applied);
+        assert_eq!(
+            model.apply_batch(&[forged_two], None),
+            ApplyOutcome::IntegrityViolation("ref equivocation")
+        );
+        assert_eq!(model.len(), 3, "the rejected batch left the buffer whole");
+        assert_eq!(model.blocks().last().unwrap().parent_number, 1);
     }
 }
