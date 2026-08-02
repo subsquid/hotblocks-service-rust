@@ -271,12 +271,10 @@ impl Chain {
         &self.blocks[0]
     }
 
-    /// The buffered ref at `number`, if that height is held (unique by INV-2).
-    pub fn ref_at(&self, number: u64) -> Option<BlockRef> {
-        self.blocks
-            .iter()
-            .find(|b| b.number == number)
-            .map(|b| b.block_ref())
+    /// The buffered block at `number` (unique by INV-2). Comparisons against
+    /// input need the whole block: identity is ref *and* parent link (DEF-8).
+    pub fn block_at(&self, number: u64) -> Option<&Block> {
+        self.blocks.iter().find(|b| b.number == number)
     }
 
     pub fn last_block(&self) -> &Block {

@@ -159,10 +159,8 @@ impl RefModel {
         if blocks.is_empty() {
             return ApplyOutcome::SessionError("empty input batch (DEF-20)");
         }
-        // DEF-20 shape, checked before the checkpoint: a batch that is not
-        // ascending and pairwise linked is adapter malformation (WP-11.5 owes
-        // the split at every discontinuity), and applying it block by block
-        // would let an append-then-reorg pair pass as if it were well formed.
+        // DEF-20 shape, before the checkpoint: applied block by block, an
+        // append-then-reorg pair would pass as if it were well formed.
         if blocks
             .windows(2)
             .any(|w| w[0].number >= w[1].number || !linked(&w[0], &w[1]))
@@ -259,10 +257,8 @@ impl RefModel {
         }) {
             return ApplyOutcome::Applied;
         }
-        // WP-6 equivocation: the same ref under a second parent link is one
-        // hash claiming two ancestries (DEF-8). Applying it as a reorg would
-        // change a buffered block's history while its ref stays put, which no
-        // client can observe.
+        // WP-6/DEF-8 equivocation: one ref, two ancestries. As a reorg it
+        // would rewrite history under an unchanged ref — unobservable.
         if self
             .blocks
             .iter()
@@ -469,10 +465,8 @@ mod tests {
     fn the_same_ref_under_a_second_parent_is_equivocation() {
         let mut m = RefModel::init(seed(), 100, false);
         assert_eq!(m.apply_batch(&chain(2..=3), None), ApplyOutcome::Applied);
-        // Same ref as the buffered block 3, one height lower on the parent.
-        // Absorbing it hides the substitution; applying it as a reorg changes
-        // block 3's ancestry while its ref stays put — equally undetectable.
-        // WP-6/DEF-8: the contradiction is an integrity violation.
+        // Same ref, lower parent: absorbing hides it, reorging rewrites
+        // block 3's ancestry under an unchanged ref. WP-6/DEF-8: violation.
         let forged = ModelBlock {
             number: 3,
             hash: "h3".into(),
@@ -492,9 +486,8 @@ mod tests {
     #[test]
     fn a_batch_that_is_not_pairwise_linked_is_rejected_whole() {
         let mut m = RefModel::init(seed(), 100, false);
-        // Ascending but unlinked: block 4 does not sit on block 2. Applying
-        // block by block would append 2, then treat 4 as a gap; DEF-20 makes
-        // the whole batch an adapter fault before anything mutates.
+        // Ascending but unlinked: block by block this appends 2 then gaps on
+        // 4; DEF-20 rejects the batch before anything mutates.
         assert_eq!(
             m.apply_batch(&[blk(2, "h2", "h1"), blk(4, "h4", "h3")], None),
             ApplyOutcome::SessionError("malformed input batch (DEF-20)")

@@ -151,7 +151,11 @@ Notation: state before `C = (⟨b₁…bₙ⟩, f)`; incoming block `x` (DEF-4).
 DEF-33 tabulates the catalog.
 
 **WP-20 — T1 INIT (and re-INIT).** *Pre:* upstream reachable; `fh = adapter.finalizedHead()`
-resolves and the single block at `fh` is acquirable. *Post:*
+resolves and the single block at `fh` is acquirable — and *is* `fh`: the acquired
+block's ref MUST equal the reported one, since the two calls may land on different
+nodes of a fleet and an unchecked block would become the buffer's finality anchor.
+A mismatch, an empty seed batch, and a multi-block seed batch are source faults —
+ladder (WP-9), or FM-31 at startup, never a process fault. *Post:*
 `C = (⟨block(fh)⟩, f = 1)`; session `base = fh`, `stalled = 0`. Failure of T1 at
 process start is a startup failure (exit, FM-31); failure of a re-INIT (WP-9 ladder)
 re-enters the ladder. T1 discards any previous buffer entirely; it is the sanctioned
@@ -159,9 +163,9 @@ destructive reset and MUST be alarmed when it discards a non-trivial buffer (OB-
 A re-INIT ends the current epoch and starts the next (INV-12, ADR-14): `fh` below the
 previous epoch's finalized head is permitted — FM-26 lets upstream's finalized head
 oscillate — and MUST be alarmed as a watermark regression. `fh` naming a height the
-buffer being discarded holds under a different hash is unrecoverable divergence
-(FM-30), not a re-seed; outside that buffer the check has nothing to run against and
-is not owed.
+buffer being discarded holds under a different ref, or under the same ref with a
+different parent link (DEF-8), is unrecoverable divergence (FM-30), not a re-seed;
+outside that buffer the check has nothing to run against and is not owed.
 
 **WP-21 — T2 APPEND.** *Pre:* `linked(bₙ, x)`. *Post:*
 `B' = ⟨b₁…bₙ, x⟩`, `f' = f`. The only way the chain grows.

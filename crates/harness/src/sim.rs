@@ -464,9 +464,8 @@ mod tests {
             false,
         );
 
-        // The ledger keeps both linkage tuples: collapsing them by ref would
-        // hide the equivocation from the model, which is the only component
-        // that can call it (WP-6).
+        // Both linkage tuples survive: collapsing by ref would hide the
+        // equivocation from the model, the only component that can call it.
         let lg = ledger.into_inner().unwrap();
         let delivered: Vec<ModelBlock> = lg.events.iter().flat_map(|e| e.blocks.clone()).collect();
         assert!(delivered.contains(&two) && delivered.contains(&forged_two));

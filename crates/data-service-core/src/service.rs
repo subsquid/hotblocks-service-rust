@@ -19,21 +19,30 @@ pub struct DataServiceOptions<S> {
     pub auto_adjust_finalized_head: bool,
 }
 
-/// FM-30: a T1 re-seed named a height the buffer it would discard holds
-/// under a different hash (WP-20/INV-12) — unrecoverable divergence, not a
-/// re-seed.
+/// FM-30: a T1 re-seed named a height the buffer it would discard holds under
+/// a different ref *or* a different parent link (WP-20/INV-12, DEF-8) —
+/// unrecoverable divergence, not a re-seed.
 #[derive(Debug)]
 pub struct DivergentReseed {
     pub seed: BlockRef,
+    pub seed_parent: BlockRef,
     pub held: BlockRef,
+    pub held_parent: BlockRef,
 }
 
 impl std::fmt::Display for DivergentReseed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "re-seed names {}#{} but the buffer holds {} at that height",
-            self.seed.number, self.seed.hash, self.held.hash
+            "re-seed names {}#{} (parent {}#{}) but the buffer holds {}#{} (parent {}#{}) at that height",
+            self.seed.number,
+            self.seed.hash,
+            self.seed_parent.number,
+            self.seed_parent.hash,
+            self.held.number,
+            self.held.hash,
+            self.held_parent.number,
+            self.held_parent.hash,
         )
     }
 }
@@ -249,22 +258,44 @@ impl<S: DataSource> DataService<S> {
             Some(r) => r.context("error fetching seed block")?,
             None => anyhow::bail!("finalized stream yielded no blocks during init"),
         };
-        assert!(
+        // Source fault, not a defect: to the ladder, never a panic in the task.
+        anyhow::ensure!(
             batch.blocks.len() == 1,
-            "expected exactly one seed block, got {}",
+            "expected exactly one seed block at {}, got {}",
+            head.number,
             batch.blocks.len()
         );
         let seed = batch.blocks.into_iter().next().unwrap();
+        // WP-20: the two calls may hit different nodes of a fleet, so the
+        // delivered block is the seed only if it is the one that was named.
+        anyhow::ensure!(
+            seed.number == head.number && seed.hash == head.hash,
+            "seed block {}#{} does not match the reported finalized head {}#{}",
+            seed.number,
+            seed.hash,
+            head.number,
+            head.hash
+        );
         let mut guard = self.chain_write();
         if let Some(prev) = guard.as_ref() {
-            // WP-20: a seed naming a height the buffer being discarded holds
-            // under a different hash is unrecoverable divergence (FM-30),
-            // not a re-seed. Discard nothing.
-            if let Some(held) = prev.ref_at(seed.number) {
-                if held.hash != seed.hash {
+            // WP-20: a seed contradicting the buffer it would discard — by ref
+            // or by parent link (DEF-8) — is FM-30. Discard nothing.
+            if let Some(held) = prev.block_at(seed.number) {
+                if held.hash != seed.hash
+                    || held.parent_number != seed.parent_number
+                    || held.parent_hash != seed.parent_hash
+                {
                     return Err(anyhow::Error::new(DivergentReseed {
                         seed: seed.block_ref(),
-                        held,
+                        seed_parent: BlockRef {
+                            number: seed.parent_number,
+                            hash: seed.parent_hash.clone(),
+                        },
+                        held: held.block_ref(),
+                        held_parent: BlockRef {
+                            number: held.parent_number,
+                            hash: held.parent_hash.clone(),
+                        },
                     }));
                 }
             }
