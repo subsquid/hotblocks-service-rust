@@ -159,6 +159,16 @@ impl RefModel {
         if blocks.is_empty() {
             return ApplyOutcome::SessionError("empty input batch (DEF-20)");
         }
+        // DEF-20 shape, checked before the checkpoint: a batch that is not
+        // ascending and pairwise linked is adapter malformation (WP-11.5 owes
+        // the split at every discontinuity), and applying it block by block
+        // would let an append-then-reorg pair pass as if it were well formed.
+        if blocks
+            .windows(2)
+            .any(|w| w[0].number >= w[1].number || !linked(&w[0], &w[1]))
+        {
+            return ApplyOutcome::SessionError("malformed input batch (DEF-20)");
+        }
         self.atomic_step(|m| {
             for x in blocks {
                 match m.push(x) {
@@ -238,8 +248,9 @@ impl RefModel {
     }
 
     fn push(&mut self, x: &ModelBlock) -> ApplyOutcome {
-        // WP-6: identical duplicate is a no-op — identity is the full
-        // parentRef (spec 13 §apply_batch), not just (number, hash).
+        // WP-6: identical duplicate is a no-op. Checked before DEF-4, because
+        // a redelivered root (parentNumber = number, DEF-4's sole exception)
+        // must be absorbed here, not rejected below.
         if self.blocks.iter().any(|b| {
             b.number == x.number
                 && b.hash == x.hash
@@ -247,6 +258,18 @@ impl RefModel {
                 && b.parent_hash == x.parent_hash
         }) {
             return ApplyOutcome::Applied;
+        }
+        // WP-6 equivocation: the same ref under a second parent link is one
+        // hash claiming two ancestries (DEF-8). Applying it as a reorg would
+        // change a buffered block's history while its ref stays put, which no
+        // client can observe.
+        if self
+            .blocks
+            .iter()
+            .any(|b| b.number == x.number && b.hash == x.hash)
+        {
+            self.alarm(Alarm::IntegrityViolation("ref equivocation"));
+            return ApplyOutcome::IntegrityViolation("ref equivocation");
         }
         if x.parent_number >= x.number {
             self.alarm(Alarm::IntegrityViolation("descending height"));
@@ -339,8 +362,12 @@ impl RefModel {
 
     /// RP-3 range resolution against the current state (the snapshot).
     pub fn query(&self, from: u64, parent_hash: Option<&str>) -> QueryVerdict {
-        // Below-window means below `first`'s parent link (RP-3 case 3).
-        if from <= self.blocks[0].parent_number {
+        // Below-window means below `first`'s parent link. A buffered root
+        // (parentNumber = number, DEF-4's exception) has nothing below it:
+        // every `from` up to its height is a window query served from it.
+        let first = &self.blocks[0];
+        let rooted = first.parent_number == first.number;
+        if !rooted && from <= first.parent_number {
             return QueryVerdict::Backfill;
         }
         let last = self.blocks.last().unwrap();
@@ -439,25 +466,90 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_with_a_forged_parent_height_is_not_absorbed() {
+    fn the_same_ref_under_a_second_parent_is_equivocation() {
         let mut m = RefModel::init(seed(), 100, false);
         assert_eq!(m.apply_batch(&chain(2..=3), None), ApplyOutcome::Applied);
-        // Same (number, hash) as the buffered block 3, one height lower on the
-        // parent: identity is the full parentRef (DEF-3), so this takes the
-        // reorg path — matching (number, hash) alone made it a silent no-op.
+        // Same ref as the buffered block 3, one height lower on the parent.
+        // Absorbing it hides the substitution; applying it as a reorg changes
+        // block 3's ancestry while its ref stays put — equally undetectable.
+        // WP-6/DEF-8: the contradiction is an integrity violation.
         let forged = ModelBlock {
             number: 3,
             hash: "h3".into(),
             parent_number: 1,
             parent_hash: "h1".into(),
         };
-        assert_eq!(m.apply_batch(&[forged], None), ApplyOutcome::Applied);
-        assert_eq!(m.len(), 2);
+        assert_eq!(
+            m.apply_batch(&[forged], None),
+            ApplyOutcome::IntegrityViolation("ref equivocation")
+        );
+        // WP-5: the rejected batch left the buffer whole.
+        assert_eq!(m.len(), 3);
         assert_eq!(m.head(), rf(3, "h3"));
+        assert_eq!(m.blocks()[2].parent_number, 2);
     }
 
     #[test]
-    fn query_below_the_buffer_base_is_backfill() {
+    fn a_batch_that_is_not_pairwise_linked_is_rejected_whole() {
+        let mut m = RefModel::init(seed(), 100, false);
+        // Ascending but unlinked: block 4 does not sit on block 2. Applying
+        // block by block would append 2, then treat 4 as a gap; DEF-20 makes
+        // the whole batch an adapter fault before anything mutates.
+        assert_eq!(
+            m.apply_batch(&[blk(2, "h2", "h1"), blk(4, "h4", "h3")], None),
+            ApplyOutcome::SessionError("malformed input batch (DEF-20)")
+        );
+        // Descending: an append-then-reorg pair that would otherwise "apply".
+        let b3 = ModelBlock {
+            number: 3,
+            hash: "h3".into(),
+            parent_number: 1,
+            parent_hash: "h1".into(),
+        };
+        assert_eq!(
+            m.apply_batch(&[b3, blk(2, "h2", "h1")], None),
+            ApplyOutcome::SessionError("malformed input batch (DEF-20)")
+        );
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.head(), rf(1, "h1"));
+    }
+
+    fn root() -> ModelBlock {
+        // DEF-4's root convention: parentNumber = number, parent hash names
+        // no block — exactly what the simulator generates for block 0.
+        ModelBlock {
+            number: 0,
+            hash: "h0".into(),
+            parent_number: 0,
+            parent_hash: "0x0".into(),
+        }
+    }
+
+    #[test]
+    fn root_redelivery_is_a_noop() {
+        let mut m = RefModel::init(root(), 100, false);
+        assert_eq!(m.apply_batch(&chain(1..=2), None), ApplyOutcome::Applied);
+        // WP-6: an identical duplicate is a no-op even for the root, whose
+        // self-parent convention must not trip the DEF-4 height check.
+        assert_eq!(m.apply_batch(&[root()], None), ApplyOutcome::Applied);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m.head(), rf(2, "h2"));
+    }
+
+    #[test]
+    fn query_serves_data_at_a_buffered_root() {
+        let mut m = RefModel::init(root(), 100, false);
+        assert_eq!(m.apply_batch(&chain(1..=1), None), ApplyOutcome::Applied);
+        // Block 0 is buffered and servable; nothing exists below a root, so
+        // this is a window query, not a backfill.
+        match m.query(0, None) {
+            QueryVerdict::Data { blocks, .. } => assert_eq!(blocks[0].number, 0),
+            other => panic!("buffered root must be served, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_below_a_non_root_base_is_backfill() {
         let m = RefModel::init(blk(10, "h10", "h9"), 100, false);
         assert_eq!(m.query(9, None), QueryVerdict::Backfill);
         assert!(matches!(m.query(10, None), QueryVerdict::Data { .. }));

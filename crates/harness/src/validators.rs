@@ -27,6 +27,168 @@ pub fn sim_extract(v: &serde_json::Value) -> Option<(u64, u64, String, String)> 
     ))
 }
 
+/// One independently decodable unit of a response body: a zstd frame or a
+/// gzip member (REQ-6, IB-2).
+#[derive(Debug, Clone)]
+pub struct Frame {
+    /// Byte length of the frame within the body — the cut point a client may
+    /// truncate at.
+    pub bytes: usize,
+    pub text: String,
+}
+
+/// Split a body into its frames, decoding each **on its own**. A body that is
+/// one frame carrying several records yields one `Frame` with several lines,
+/// which is what `validate_framing` rejects: whole-stream decoding cannot tell
+/// the two apart, so it is not evidence of REQ-6 framing.
+pub fn split_frames(body: &[u8], content_encoding: &str) -> anyhow::Result<Vec<Frame>> {
+    let mut frames = Vec::new();
+    let mut pos = 0;
+    while pos < body.len() {
+        let (consumed, out) = match content_encoding {
+            "zstd" => decode_one_zstd_frame(&body[pos..])?,
+            "gzip" => decode_one_gzip_member(&body[pos..])?,
+            other => anyhow::bail!("unexpected content-encoding: {other}"),
+        };
+        anyhow::ensure!(consumed > 0, "frame consumed no input at byte {pos}");
+        pos += consumed;
+        frames.push(Frame {
+            bytes: consumed,
+            text: String::from_utf8(out)?,
+        });
+    }
+    Ok(frames)
+}
+
+/// Decode exactly one zstd frame, returning (bytes consumed, output).
+fn decode_one_zstd_frame(input: &[u8]) -> anyhow::Result<(usize, Vec<u8>)> {
+    use zstd::stream::raw::{Decoder, InBuffer, Operation, OutBuffer};
+
+    let mut decoder = Decoder::new()?;
+    let mut in_buf = InBuffer::around(input);
+    let mut scratch = vec![0u8; 64 * 1024];
+    let mut out = Vec::new();
+    loop {
+        let mut out_buf = OutBuffer::around(&mut scratch[..]);
+        let hint = decoder.run(&mut in_buf, &mut out_buf)?;
+        let produced = out_buf.pos();
+        out.extend_from_slice(&scratch[..produced]);
+        if hint == 0 {
+            break; // frame complete — anything after it is the next frame
+        }
+        anyhow::ensure!(
+            in_buf.pos < in_buf.src.len() || produced > 0,
+            "truncated zstd frame"
+        );
+    }
+    Ok((in_buf.pos, out))
+}
+
+/// Decode exactly one gzip member, returning (bytes consumed, output).
+///
+/// The header is parsed here (RFC 1952) and the payload inflated raw, because
+/// flate2's gzip-aware `Decompress` needs a zlib backend this build does not
+/// have — and a member-crossing decoder cannot report a boundary anyway.
+fn decode_one_gzip_member(input: &[u8]) -> anyhow::Result<(usize, Vec<u8>)> {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    let header = gzip_header_len(input)?;
+    let mut dec = Decompress::new(false);
+    let mut out = Vec::new();
+    let mut scratch = vec![0u8; 64 * 1024];
+    loop {
+        let consumed = header + dec.total_in() as usize;
+        anyhow::ensure!(consumed <= input.len(), "truncated gzip member");
+        let before_out = dec.total_out();
+        let status = dec.decompress(&input[consumed..], &mut scratch, FlushDecompress::None)?;
+        let produced = (dec.total_out() - before_out) as usize;
+        out.extend_from_slice(&scratch[..produced]);
+        match status {
+            Status::StreamEnd => break,
+            _ => anyhow::ensure!(
+                header + dec.total_in() as usize > consumed || produced > 0,
+                "gzip member made no progress"
+            ),
+        }
+    }
+    // CRC32 + ISIZE close the member.
+    let total = header + dec.total_in() as usize + 8;
+    anyhow::ensure!(total <= input.len(), "gzip member lacks its trailer");
+    Ok((total, out))
+}
+
+/// Length of one gzip member's header (RFC 1952 §2.3).
+fn gzip_header_len(input: &[u8]) -> anyhow::Result<usize> {
+    anyhow::ensure!(input.len() >= 10, "gzip member shorter than its header");
+    anyhow::ensure!(
+        input[0] == 0x1f && input[1] == 0x8b && input[2] == 8,
+        "not a deflate gzip member"
+    );
+    let flags = input[3];
+    let mut pos = 10;
+    if flags & 0x04 != 0 {
+        anyhow::ensure!(input.len() >= pos + 2, "truncated FEXTRA");
+        let xlen = u16::from_le_bytes([input[pos], input[pos + 1]]) as usize;
+        pos += 2 + xlen;
+    }
+    for flag in [0x08, 0x10] {
+        if flags & flag != 0 {
+            let end = input[pos..]
+                .iter()
+                .position(|b| *b == 0)
+                .ok_or_else(|| anyhow::anyhow!("unterminated gzip header string"))?;
+            pos += end + 1;
+        }
+    }
+    if flags & 0x02 != 0 {
+        pos += 2;
+    }
+    anyhow::ensure!(pos <= input.len(), "truncated gzip header");
+    Ok(pos)
+}
+
+/// REQ-6/IB-2: the body is a concatenation of independent per-block frames,
+/// each carrying exactly one record, and every frame boundary is a safe cut —
+/// the prefix ending there decodes to exactly the records before it.
+pub fn validate_framing(body: &[u8], content_encoding: &str) -> Result<Vec<String>, String> {
+    let enc = if content_encoding == "identity" {
+        "gzip"
+    } else {
+        content_encoding
+    };
+    let frames = split_frames(body, enc).map_err(|e| format!("REQ-6: {e}"))?;
+    if frames.is_empty() {
+        return Err("REQ-6: successful body carries no frame".into());
+    }
+    for (i, f) in frames.iter().enumerate() {
+        if !f.text.ends_with('\n') {
+            return Err(format!("REQ-6: frame {i} is not newline-terminated"));
+        }
+        if f.text.trim_end_matches('\n').contains('\n') {
+            return Err(format!(
+                "REQ-6: frame {i} carries {} records — frames are per block",
+                f.text.matches('\n').count()
+            ));
+        }
+    }
+    // Truncation safety (ADR-10): cutting at any frame boundary leaves every
+    // delivered record valid and complete.
+    let mut cut = 0;
+    for (i, f) in frames.iter().enumerate() {
+        cut += f.bytes;
+        let prefix = split_frames(&body[..cut], enc)
+            .map_err(|e| format!("REQ-6: prefix through frame {i} does not decode: {e}"))?;
+        if prefix.len() != i + 1 {
+            return Err(format!(
+                "REQ-6: prefix through frame {i} decoded {} records, expected {}",
+                prefix.len(),
+                i + 1
+            ));
+        }
+    }
+    Ok(frames.into_iter().map(|f| f.text).collect())
+}
+
 /// Decode a stream body per its content-encoding into the concatenated
 /// payload text. Both encodings are per-block frames/members (REQ-6).
 pub fn decode_body(body: &[u8], content_encoding: &str) -> anyhow::Result<String> {
@@ -193,7 +355,13 @@ no eligible height"
     Ok(records)
 }
 
-/// Validate a conflict body (INV-22 shape: non-empty, ascending).
+/// `P-FORK-REFS-MAX`: the conflict-ref ceiling RP-7 bounds `prev` by. The
+/// window path emits an inclusive span of 101 refs, the head path up to 100;
+/// the contract is the larger, and which count a response picks inside it is a
+/// declared free variable (13 §free-variables).
+pub const MAX_FORK_REFS: usize = 101;
+
+/// Validate a conflict body (INV-22 shape: non-empty, ascending, bounded).
 pub fn validate_conflict(body: &serde_json::Value) -> Result<Vec<BlockRef>, String> {
     let arr = body
         .get("previousBlocks")
@@ -201,6 +369,12 @@ pub fn validate_conflict(body: &serde_json::Value) -> Result<Vec<BlockRef>, Stri
         .ok_or("INV-22: conflict body lacks previousBlocks")?;
     if arr.is_empty() {
         return Err("INV-22: empty previousBlocks (GAP-6)".into());
+    }
+    if arr.len() > MAX_FORK_REFS {
+        return Err(format!(
+            "RP-7: {} refs exceed P-FORK-REFS-MAX ({MAX_FORK_REFS})",
+            arr.len()
+        ));
     }
     let mut refs = vec![];
     for v in arr {
@@ -552,6 +726,87 @@ mod tests {
             validate_error(409, &without, body).unwrap(),
             ErrorClass::Conflict
         );
+    }
+
+    fn zstd_frame(text: &str) -> Vec<u8> {
+        zstd::encode_all(text.as_bytes(), 1).unwrap()
+    }
+
+    fn gzip_member(text: &str) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut e = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        e.write_all(text.as_bytes()).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn conflict_refs_are_bounded() {
+        let refs = |n: usize| {
+            serde_json::json!({
+                "previousBlocks": (0..n)
+                    .map(|i| serde_json::json!({"number": i, "hash": format!("h{i}")}))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            validate_conflict(&refs(MAX_FORK_REFS)).unwrap().len(),
+            MAX_FORK_REFS
+        );
+        // RP-7 bounds `prev`; an unbounded list is a response a client must
+        // buffer without limit, so the ceiling is part of the contract.
+        let err = validate_conflict(&refs(MAX_FORK_REFS + 1)).unwrap_err();
+        assert!(err.contains("P-FORK-REFS-MAX"), "{err}");
+    }
+
+    #[test]
+    fn framing_accepts_one_frame_per_record() {
+        for (enc, frame) in [
+            ("zstd", zstd_frame as fn(&str) -> Vec<u8>),
+            ("gzip", gzip_member as fn(&str) -> Vec<u8>),
+        ] {
+            let mut body = frame("{\"n\":1}\n");
+            body.extend(frame("{\"n\":2}\n"));
+            body.extend(frame("{\"n\":3}\n"));
+            let records = validate_framing(&body, enc).unwrap();
+            assert_eq!(records.len(), 3, "{enc}: one frame per record");
+            assert_eq!(records[1], "{\"n\":2}\n");
+        }
+    }
+
+    #[test]
+    fn framing_rejects_records_glued_into_one_frame() {
+        // Whole-stream decoding cannot tell this from the case above: the
+        // decoded bytes are identical. REQ-6 is about the framing, so the
+        // validator must reject it (and a client truncating mid-frame would
+        // lose a whole block, not a record).
+        for (enc, frame) in [
+            ("zstd", zstd_frame as fn(&str) -> Vec<u8>),
+            ("gzip", gzip_member as fn(&str) -> Vec<u8>),
+        ] {
+            let glued = frame("{\"n\":1}\n{\"n\":2}\n");
+            assert_eq!(
+                decode_body(&glued, enc).unwrap(),
+                "{\"n\":1}\n{\"n\":2}\n",
+                "{enc}: the glued body decodes fine as a stream"
+            );
+            let err = validate_framing(&glued, enc).unwrap_err();
+            assert!(err.contains("frames are per block"), "{enc}: {err}");
+        }
+    }
+
+    #[test]
+    fn framing_cuts_at_every_frame_boundary() {
+        // ADR-10: truncation at a record boundary is a normal outcome, so
+        // every prefix must decode to exactly the records before the cut.
+        let mut body = zstd_frame("{\"n\":1}\n");
+        let first = body.len();
+        body.extend(zstd_frame("{\"n\":2}\n"));
+        assert_eq!(validate_framing(&body[..first], "zstd").unwrap().len(), 1);
+        assert_eq!(validate_framing(&body, "zstd").unwrap().len(), 2);
+        // A cut inside a frame is not a record boundary and must not pass as
+        // one: the validator reports the truncation instead of a short body.
+        assert!(validate_framing(&body[..first + 4], "zstd").is_err());
     }
 
     #[test]

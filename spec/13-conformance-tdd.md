@@ -48,10 +48,18 @@ new_session():             fin_max ← ⊥      # WP-12 is per session; T6 rebas
 
 apply_batch(blocks, finrep):
   require blocks ≠ []         else session_error       # DEF-20: batches are non-empty
+  require ⟨blocks⟩ ascending ∧ pairwise linked  else session_error   # DEF-20 shape:
+                                        # checked before any mutation, so a malformed
+                                        # batch cannot half-apply (WP-11.5 owes the
+                                        # split at every discontinuity)
   checkpoint ← (B, f, fin_max)           # WP-5: a violating batch is rejected whole
   for x in blocks:
     if ∃ b ∈ B: b.number = x.number ∧ b.hash = x.hash ∧ parentRef(b) = parentRef(x):
-        continue                        # WP-6: identical duplicate is a no-op
+        continue                        # WP-6: identical duplicate is a no-op —
+                                        # checked first, so a redelivered root
+                                        # (DEF-4's exception) is absorbed here
+    if ∃ b ∈ B: ref(b) = ref(x) ∧ parentRef(b) ≠ parentRef(x):
+        integrity_violation             # WP-6 equivocation: one ref, two ancestries
     require x.parentNumber < x.number     else integrity_violation        # DEF-4
     if linked(last(B), x):  B.append(x)                                   # T2
     else:
@@ -106,7 +114,8 @@ fork_signal(prev):
 
 query(from, parentHash):                                # RP-3..RP-13
   snap ← (B, f)                                         # INV-21
-  if from ≤ snap.B[1].parentNumber:
+  if snap.B[1] is not a root                            # DEF-4's exception: nothing
+     and from ≤ snap.B[1].parentNumber:                 #  exists below a root
      return BACKFILL                                    # RP-8 (oracle: simulator
                                                         #  ledger supplies the range)
   if from > last(snap.B).number:
@@ -127,8 +136,7 @@ The model deliberately exposes no standalone finality-only transition; a test th
 feeds an empty batch is testing a shape no conforming adapter emits. The single
 above-head obligation of WP-23 is `fin_max` itself (ADR-16), so an upstream reporting
 finality faster than it delivers blocks buys no state in the model and none in the
-service (PF-1). Simulators seed above genesis: DEF-4 admits no root block, and a
-history that starts at one is testing a shape the buffer never holds.
+service (PF-1).
 
 **Free variables** (the SUT may vary; everything else must match the model):
 
@@ -156,7 +164,10 @@ history that starts at one is testing a shape the buffer never holds.
 
 ## Structural validators (kind-agnostic, every response)
 
-decodable per negotiated encoding → records self-delimiting → ascending → pairwise
+decodable per negotiated encoding → **one frame per record**, each frame decoded on
+its own and every frame boundary re-decoded as a prefix (REQ-6/IB-2: whole-stream
+decoding cannot tell N frames from one frame holding N records, so it is not evidence
+of framing) → records self-delimiting → ascending → pairwise
 linked → coverage starts at the lowest response-eligible height ≥ the requested one
 and never below it (DEF-30) → records follow the snapshot's branch → no
 duplicates → watermark metadata parses and finalized ≤ head → conflict bodies
@@ -199,7 +210,7 @@ fault matrix, no differential runner, no benchmarks yet.
 | INV-16 | CT-1/3 | P | model asserts one committed state per applied batch (CT-1 smoke); no swarm |
 | INV-20 | CT-5/3/4 | P | structural validator on live responses + dual-encoding equality (CT-1 smoke) |
 | INV-21 | CT-3 | U | |
-| INV-22 | CT-1/5 | P ! | conflict shape + ref membership validated live (CT-1 smoke); GAP-6: empty-`prev` conflict emitted on empty backfill |
+| INV-22 | CT-1/5 | P ! | conflict shape, `P-FORK-REFS-MAX` bound, and ref membership validated live (CT-1 smoke); GAP-6: empty-`prev` conflict emitted on empty backfill |
 | INV-23 | CT-1 | P | progress guarantee + empty-form distinction checked (CT-1 smoke) |
 | INV-24 | CT-1/3 | P ! | watermarks compared against the reference model (CT-1 smoke); GAP-30: post-wait empty form can lack them |
 | INV-25 | CT-5 | P | golden fixtures (one network) + ledger byte-fidelity and dual-encoding compare (CT-1 smoke) |
@@ -225,7 +236,7 @@ fault matrix, no differential runner, no benchmarks yet.
 | LIV-10 | CT-8 | U | |
 | LIV-11 | CT-7 | U | |
 | LIV-12 | CT-8 | U | |
-| REQ-1..6 | CT-1/5 | P | endpoint smoke + one fork recovery |
+| REQ-1..6 | CT-1/5 | P | endpoint smoke + one fork recovery; REQ-6 framing (one frame per record, every boundary a safe cut) validated on both encodings (CT-1 smoke) |
 | REQ-7 | CT-5 | P | one-network golden corpus |
 | REQ-8 | CT-5 | P | selection combinations exercised only via recorded-corpus configs |
 | REQ-9 | CT-4 | P ! | GAP-3 |
@@ -276,19 +287,21 @@ P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry p
 | GAP-30 | The post-wait re-resolution is not dispatched through full range resolution: a height evicted during the wait yields the empty form — without the mandatory watermark metadata — instead of a window-underflow response. The same watermark-less form also fires pre-wait: the below-window check and the query run under two separate lock acquisitions, so eviction racing admission hits it too | RP-3, RP-8, INV-24, IB-5 | P2 | CT-3: request just above head racing eviction across the wait (and across admission); assert backfill or a watermarked empty form |
 | GAP-31 | The response budget and disconnect reap are bypassed by unbounded internal waits: the first backfill batch is awaited without a deadline, and a stalled consumer blocks the producer indefinitely between budget checks | RP-20, RP-21, LIV-3, LIV-10 | P2 | CT-8: stalled upstream during a backfill request, and a stalled reader mid-stream; assert termination within `P-RESP-BUDGET` + `P-DISCONNECT-REAP` |
 | GAP-27 | No differential runner against the predecessor exists, though byte-compatibility (REQ-24) is the migration's acceptance criterion; the worst historical payload bug was found by a manual diff | REQ-24, HC-8 | P1 | build HC-8; run recorded-corpus diff in CI nightly |
+| GAP-33 | A delivery whose ref matches a buffered block under a different parent link is applied as a reorganization: the buffered block's ancestry changes while its ref does not, so no client can detect the substitution (the base check compares later blocks' parent hashes, which still link). WP-6 requires an integrity violation; the reference model now raises one, the service does not | WP-6, DEF-8, INV-13 | P1 | CT-1: deliver `(n, h)` with a second parent link after `(n, h)` is buffered; assert integrity violation + session restart, not truncation |
 | GAP-32 | Enabled verification-check failures (DEF-25: receipts root, logs bloom) and the log-index/cumulative-gas coherence checks bypass WP-11.2's bounded per-block retry on the head path: they surface as an immediate session error the ladder retries forever, instead of bounded per-block retry then fail-loud | WP-11.2, WP-11.3, LIV-2 | P2 | CT-4: enable a verification switch against an upstream serving one persistently forged block; assert `P-ENRICH-RETRIES` bounded retries then an alarmed session error, not an unbounded restart loop |
 
 ## Build order
 
 1. **Phase 0 — harness skeleton** *(done 2026-07-31, `crates/harness`; hardened
-   2026-08-02: model absorbed ADR-15's stepwise
+   2026-08-02: model absorbed the DEF-4 root convention and ADR-15's stepwise
    descent, one-session replay keyed by each delivered
    `(number, hash, parentNumber, parentHash)` tuple with read-path deliveries
-   excluded,
+   excluded, buffered-root resolution aligned between model and SUT,
    watermark bounds/strictness and IB-1/IB-2/IB-5/IB-6 transport rules added to
    HC-6, the free-variable-2 pin removed from CT-1; the suite's consolidation
-   2026-08-02 dropped the root convention and the pending-report list from the
-   model, ADR-16)*: HC-1
+   2026-08-02 dropped the pending-report list (ADR-16), made equivocation an
+   integrity violation (WP-6), and added DEF-20 batch-shape and REQ-6 framing
+   validation)*: HC-1
    simulator + HC-2 ledger + HC-5 reference model + HC-6 validators; wire CT-1 smoke
    (happy-path history) and the spec checker (MG-7). *Exit met:* CT-1 green on the
    happy path; INV-23 flipped U→P; INV-1..3, 20, 22, 24, 25 strengthened.
@@ -345,7 +358,7 @@ the executed-test-count ratchet; the latter remains part of HC-11.
 | HC-3 | Fault-injecting upstream stub (per-method, per-component: error, null, wrong-block, malformed, delay, equivocate) | CT-4, CT-9 | P | method-routed mock upstream exists in two timing tests; no fault matrix |
 | HC-4 | Recorded-corpus replay (real upstream captures) | CT-5 | C | cassette + golden fixtures wired in CI (one network) |
 | HC-5 | Executable reference model (this doc's pseudocode) | CT-1..3 | P | core transitions + query verdicts in `crates/harness`; backfill/wait paths not yet modeled |
-| HC-6 | Structural validators as a library | every CT | P | reusable core in `crates/harness`: decode, full DEF-5 linkage, snapshot-judged coverage start + branch, conflict shape, mandatory body content types, IB-2 DATA negotiation (`Content-Encoding` + `Vary`), RP-13 taxonomy, and watermark rules; the full route-by-route IB sweep remains CT-5 work |
+| HC-6 | Structural validators as a library | every CT | P | reusable core in `crates/harness`: decode, per-frame splitting with prefix re-decode (REQ-6), full DEF-5 linkage, snapshot-judged coverage start + branch, conflict shape and `P-FORK-REFS-MAX` bound, mandatory body content types, IB-2 DATA negotiation (`Content-Encoding` + `Vary`), RP-13 taxonomy, and watermark rules; the full route-by-route IB sweep remains CT-5 work |
 | HC-7 | Client driver: poll loop, RP-7 recovery, fuzzer, disconnector | CT-1..3, 8, 9 | U | |
 | HC-8 | Differential runner vs predecessor implementation | CT-5, REQ-24, GAP-27 | U | acceptance criterion of the migration; absent |
 | HC-9 | Load/swarm driver (S3..S6) | CT-3, 8 | U | |
