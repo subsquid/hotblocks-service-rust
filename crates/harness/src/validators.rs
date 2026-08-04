@@ -8,6 +8,7 @@
 
 use crate::model::ModelBlock;
 use crate::sim::Ledger;
+use anyhow::Context;
 use data_service_core::types::BlockRef;
 use flate2::read::MultiGzDecoder;
 use std::io::Read;
@@ -52,6 +53,38 @@ pub fn split_frames(body: &[u8]) -> anyhow::Result<Vec<Frame>> {
     Ok(frames)
 }
 
+/// Split a gzip body into independently decoded members.
+///
+/// The buffered decoder stops after one member and returns the unconsumed
+/// suffix, so no later member boundary is lost to read-ahead.
+fn split_gzip_members(body: &[u8]) -> anyhow::Result<Vec<Frame>> {
+    let mut frames = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        let offset = body.len() - rest.len();
+        let before = rest.len();
+        let mut decoder = flate2::bufread::GzDecoder::new(rest);
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .with_context(|| format!("gzip member at byte {offset} does not decode"))?;
+
+        let next = decoder.into_inner();
+        let consumed = before - next.len();
+        anyhow::ensure!(
+            consumed > 0,
+            "gzip member consumed no input at byte {offset}"
+        );
+        frames.push(Frame {
+            bytes: consumed,
+            text: String::from_utf8(out)
+                .with_context(|| format!("gzip member at byte {offset} is not UTF-8"))?,
+        });
+        rest = next;
+    }
+    Ok(frames)
+}
+
 /// Decode exactly one zstd frame, returning (bytes consumed, output).
 fn decode_one_zstd_frame(input: &[u8]) -> anyhow::Result<(usize, Vec<u8>)> {
     use zstd::stream::raw::{Decoder, InBuffer, Operation, OutBuffer};
@@ -79,9 +112,9 @@ fn decode_one_zstd_frame(input: &[u8]) -> anyhow::Result<(usize, Vec<u8>)> {
 /// REQ-6/IB-2: independent per-block frames, one record each.
 ///
 /// zstd's raw decoder reports per-frame byte counts, so frames are enumerated
-/// and every boundary re-decoded as a prefix (ADR-10's cut). gzip has no such
-/// accounting; the single-member decoder stands in for it — it stops after
-/// member one, so glued members surface as all records landing there.
+/// and every boundary re-decoded as a prefix (ADR-10's cut). gzip's buffered
+/// decoder returns the untouched suffix after each member, allowing every
+/// member to be decoded and checked independently.
 pub fn validate_framing(body: &[u8], content_encoding: &str) -> Result<Vec<String>, String> {
     let records = match content_encoding {
         "zstd" => {
@@ -103,23 +136,8 @@ pub fn validate_framing(body: &[u8], content_encoding: &str) -> Result<Vec<Strin
             frames.into_iter().map(|f| f.text).collect::<Vec<_>>()
         }
         "gzip" | "identity" => {
-            let all = decode_body(body, "gzip").map_err(|e| format!("REQ-6: {e}"))?;
-            let mut first = Vec::new();
-            flate2::read::GzDecoder::new(body)
-                .read_to_end(&mut first)
-                .map_err(|e| format!("REQ-6: first gzip member does not decode: {e}"))?;
-            let first = String::from_utf8(first).map_err(|e| format!("REQ-6: {e}"))?;
-            if !all.starts_with(&first) {
-                return Err("REQ-6: first member is not a prefix of the body".into());
-            }
-            // One member per block ⇒ member one holds exactly record one.
-            let mut out = vec![first];
-            out.extend(
-                all[out[0].len()..]
-                    .split_inclusive('\n')
-                    .map(str::to_string),
-            );
-            out
+            let frames = split_gzip_members(body).map_err(|e| format!("REQ-6: {e:#}"))?;
+            frames.into_iter().map(|frame| frame.text).collect()
         }
         other => return Err(format!("REQ-6: unexpected content-encoding: {other}")),
     };
@@ -781,6 +799,25 @@ mod tests {
             let err = validate_framing(&glued, enc).unwrap_err();
             assert!(err.contains("frames are per block"), "{enc}: {err}");
         }
+    }
+
+    #[test]
+    fn gzip_framing_rejects_multiple_records_in_a_later_member() {
+        let mut valid = gzip_member("{\"n\":1}\n");
+        valid.extend(gzip_member("{\"n\":2}\n"));
+        valid.extend(gzip_member("{\"n\":3}\n"));
+
+        let mut invalid = gzip_member("{\"n\":1}\n");
+        invalid.extend(gzip_member("{\"n\":2}\n{\"n\":3}\n"));
+
+        assert_eq!(
+            decode_body(&valid, "gzip").unwrap(),
+            decode_body(&invalid, "gzip").unwrap()
+        );
+        assert_eq!(validate_framing(&valid, "gzip").unwrap().len(), 3);
+
+        let err = validate_framing(&invalid, "gzip").unwrap_err();
+        assert!(err.contains("frame 1 carries 2 records"), "{err}");
     }
 
     #[test]
