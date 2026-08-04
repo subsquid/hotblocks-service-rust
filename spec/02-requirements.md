@@ -108,7 +108,7 @@ ADR-14), never above the buffered head's height without validation, and contradi
 or regressive finality reports are tolerated without state corruption.
 *Acceptance:* under regressive/contradictory injected finality reports, the finalized
 watermark is monotone within each epoch and the process stays healthy.
-*Trace:* WP-12, WP-20, INV-12; GAP-7; ADR-6, ADR-14.
+*Trace:* WP-12, WP-20, INV-12; ADR-6, ADR-14.
 
 **REQ-12 — Bounded window.** [MUST]
 The buffer holds at most `P-CACHE-SIZE` blocks plus transient batch overshoot
@@ -191,7 +191,7 @@ process continues to run.
 *Acceptance:* fault corpus (CT-4) and fuzz (CT-9) never produce process exit or a
 permanently failing endpoint; after every injected fault the service either serves
 correctly or has exited by an explicit FM-30/FM-31 path.
-*Trace:* FM-1, FM-30, FM-31, INV-41; GAP-1.
+*Trace:* FM-1, FM-30, FM-31, INV-41.
 
 **REQ-23 — Graceful shutdown.** [MUST]
 On the stop signal the service stops accepting work and exits within

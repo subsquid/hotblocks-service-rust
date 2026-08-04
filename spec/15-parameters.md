@@ -1,7 +1,7 @@
 # 15 — Parameter registry
 
 **Mutable doc #2.** Every `P-*`/`W-*` symbol used anywhere in the suite has a row.
-"Observed" is the current implementation's value (or behavior) as of 2026-08-02;
+"Observed" is the current implementation's value (or behavior) as of 2026-08-04;
 "Target" is the intended value — ⚠ marks a proposal awaiting ratification (ADR-13
 covers the batch; individual ratifications link their ADR). `—` = no distinct target
 (observed is intended). ⊥ = not implemented/measured.
@@ -10,7 +10,7 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 
 | Parameter | Role | Observed | Target |
 |---|---|---|---|
-| P-CACHE-SIZE | window size (DEF-24, WP-24) | 1000 (default, configurable) | — |
+| P-CACHE-SIZE | window size (DEF-24, WP-24) | 1000 (default; configurable integer ≥ 1) | — |
 | P-BLOCKTIME-CACHE | ingest-time cache capacity (IB table) | 1000 | — |
 | P-BLOCKTIME-TTL | ingest-time cache TTL | 30 min | — |
 | P-MEM-PER-BLOCK | memory model coefficient (PF-1) | ⊥ unmeasured | ⚠ measure in CT-6 |

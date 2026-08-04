@@ -10,7 +10,11 @@ along a chain but MAY skip values (chain families with gaps in the coordinate sp
 admitted; see REQ-17). Arithmetic on heights is ordinary integer arithmetic.
 
 **DEF-2 — Hash.** An opaque non-empty string identifying one block. Equality is exact
-string equality; the core performs no normalization, decoding, or case folding.
+string equality; the core performs no normalization, decoding, or case folding. Any
+hash admitted to buffer or finality state MUST also be representable as an HTTP field
+value because IB-4 exposes finality hashes as response metadata: CR, LF, forbidden
+control bytes, and DEL are rejected at the ingestion boundary before any buffer
+mutation.
 
 **DEF-3 — BlockRef.** The pair `(number: Height, hash: Hash)`. Two refs are equal iff
 both fields are equal.
@@ -123,9 +127,9 @@ chain's own finality signal) or `offset(k)` (the newest block at height ≤ `hea
 exactly `head − k` on contiguous-height families, DEF-1) for chains without one.
 Fixed at startup.
 
-**DEF-24 — Retention policy.** `(P-CACHE-SIZE, autoAdjust: bool)` — the window size
-(a target maximum buffered block count) and which of the two precedences applies when
-lagging finality blocks eviction:
+**DEF-24 — Retention policy.** `(P-CACHE-SIZE, autoAdjust: bool)` — the positive
+integer window size (`P-CACHE-SIZE ≥ 1`, a target maximum buffered block count) and
+which of the two precedences applies when lagging finality blocks eviction:
 
 | autoAdjust | Precedence |
 |---|---|

@@ -8,8 +8,10 @@ same change (IB-20).
 ## General transport rules
 
 **IB-1.** The API is HTTP/1.1+ on the configured port. Request bodies are JSON.
-Unknown routes → 404; wrong method on a known route → 405. Text bodies are
-`text/plain`; JSON bodies `application/json`.
+Unknown routes → 404; only that status is bound (headers and body are unspecified),
+and this transport outcome is not RP-13's endpoint-level NOT_FOUND. Wrong method on a
+known route → 405. Text bodies bound below are `text/plain`; JSON bodies
+`application/json`.
 
 **IB-2 — Compression negotiation.** Non-empty successful responses (200) of
 `POST /stream` are always content-encoded: `zstd` when the request's
@@ -50,7 +52,9 @@ Body ≤ `P-REQ-BODY-MAX` bytes. Unknown fields ignored (pinned — ADR-1).
 frame is one JSON record terminated by `\n` (the canonical record, DEF-6). Chunked
 transfer; no `Content-Length`. Headers on 200 and 204:
 `x-sqd-finalized-head-number: <decimal>`, `x-sqd-finalized-head-hash: <hash>` —
-the snapshot's finalized head (RP-9).
+the snapshot's finalized head (RP-9). DEF-2's HTTP field-value constraint is checked
+on the seed, every ordinary block and parent hash, and every finality report before
+the corresponding input can mutate the buffer.
 
 **IB-5 — Empty (204).** No body; the finalized-head headers are present. Meaning:
 RP-12's empty form.

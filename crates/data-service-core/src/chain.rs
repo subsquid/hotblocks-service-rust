@@ -1,9 +1,11 @@
 //! In-memory chain buffer — exact port of `chain.ts`.
 
-use crate::types::{Block, BlockHeader, BlockRef, DataResponse, InvalidBaseBlock};
+use crate::types::{
+    Block, BlockHeader, BlockRef, DataResponse, IntegrityViolation, InvalidBaseBlock,
+};
 
 /// Returns true if `a` is the direct parent of `b`.
-fn is_chain(a: &Block, b: &Block) -> bool {
+pub(crate) fn is_chain(a: &Block, b: &Block) -> bool {
     a.number == b.parent_number && a.hash == b.parent_hash
 }
 
@@ -23,6 +25,26 @@ fn bisect(blocks: &[Block], target: u64) -> usize {
     lo
 }
 
+/// What a `push` did to the buffer. An absorbed duplicate is a strict no-op
+/// (WP-6), so its ingest-time observables must not be rewritten either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Push {
+    Inserted,
+    Absorbed,
+}
+
+/// Undo log for the batch currently being applied (WP-5).
+///
+/// Only the *originals* a truncation removed are saved — blocks the open batch
+/// appended itself need no record — so an append-only batch costs nothing.
+struct BatchUndo {
+    /// Leading blocks the batch has not touched yet.
+    intact: usize,
+    /// The originals above `intact`, in buffer order.
+    removed: Vec<Block>,
+    finalized_head: usize,
+}
+
 /// An in-memory sliding window of recent blocks, with a finalized-head pointer.
 ///
 /// Mirrors the TypeScript `Chain` class from `chain.ts`.
@@ -32,6 +54,7 @@ pub struct Chain {
     finalized_head: usize,
     max_size: usize,
     auto_adjust_finalized_head: bool,
+    undo: Option<BatchUndo>,
 }
 
 impl Chain {
@@ -42,55 +65,151 @@ impl Chain {
             finalized_head: 0,
             max_size,
             auto_adjust_finalized_head,
+            undo: None,
         }
+    }
+
+    // ----- batch atomicity (WP-5) -----------------------------------------
+
+    /// Open a batch. Everything until `commit_batch` can be undone whole, so a
+    /// violation found late — a finality report the arriving blocks contradict
+    /// — rejects the batch instead of leaving it half applied.
+    ///
+    /// Batches do not nest; opening one discards any log still open.
+    pub fn begin_batch(&mut self) {
+        debug_assert!(
+            self.undo.is_none(),
+            "an open batch was neither committed nor rolled back"
+        );
+        self.undo = Some(BatchUndo {
+            intact: self.blocks.len(),
+            removed: Vec::new(),
+            finalized_head: self.finalized_head,
+        });
+    }
+
+    /// Accept the open batch. Compaction must follow, never precede: it shifts
+    /// the indices the log is written in.
+    pub fn commit_batch(&mut self) {
+        self.undo = None;
+    }
+
+    /// Restore the buffer to what it was at `begin_batch`.
+    pub fn rollback_batch(&mut self) {
+        let Some(undo) = self.undo.take() else { return };
+        self.blocks.truncate(undo.intact);
+        self.blocks.extend(undo.removed);
+        self.finalized_head = undo.finalized_head;
+    }
+
+    /// Save the originals a truncation down to `from` is about to drop.
+    fn record_removal(&mut self, from: usize) {
+        let Chain { blocks, undo, .. } = self;
+        let Some(undo) = undo.as_mut() else { return };
+        if from >= undo.intact {
+            return; // nothing but this batch's own appends
+        }
+        let mut originals = blocks[from..undo.intact].to_vec();
+        originals.append(&mut undo.removed);
+        undo.removed = originals;
+        undo.intact = from;
     }
 
     // ----- mutation -------------------------------------------------------
 
     /// Push a new block onto the chain, potentially triggering a reorg.
     ///
-    /// Mirrors `Chain.push` in chain.ts.
-    pub fn push(&mut self, new_block: Block) {
+    /// Mirrors `Chain.push` in chain.ts. Input the buffer contradicts is an
+    /// integrity violation the caller resolves by rejecting the batch and
+    /// tearing down the session (WP-5), never by dying (WP-14).
+    pub fn push(&mut self, new_block: Block) -> Result<Push, IntegrityViolation> {
+        // WP-6, decided against the block this height already holds — one per
+        // height (INV-2), so bisect names the only candidate. Both outcomes
+        // come before DEF-4 so a redelivered root, whose parent coordinate is
+        // its own height (DEF-4's sole exception), is absorbed rather than
+        // rejected below.
+        let at = bisect(&self.blocks, new_block.number);
+        if let Some(held) = self.blocks.get(at) {
+            if held.number == new_block.number && held.hash == new_block.hash {
+                // An identical redelivery is a strict no-op at every position,
+                // including at or below the finalized head.
+                if held.parent_number == new_block.parent_number
+                    && held.parent_hash == new_block.parent_hash
+                {
+                    return Ok(Push::Absorbed);
+                }
+                // Same ref, another ancestry: neither duplicate nor reorg.
+                return Err(IntegrityViolation::RefEquivocation {
+                    number: new_block.number,
+                    hash: new_block.hash,
+                });
+            }
+        }
+
         // DEF-4; a descending block leaves `blocks` unsorted and `bisect` blind.
-        assert!(
-            new_block.parent_number < new_block.number,
-            "block claims a parent at or above its own height"
-        );
+        if new_block.parent_number >= new_block.number {
+            return Err(IntegrityViolation::DescendingHeight {
+                number: new_block.number,
+                parent_number: new_block.parent_number,
+            });
+        }
+
         if self.last_block().number == new_block.parent_number {
-            assert!(
-                is_chain(self.last_block(), &new_block),
-                "chain hash mismatch on sequential push"
-            );
+            if !is_chain(self.last_block(), &new_block) {
+                return Err(IntegrityViolation::ParentHashMismatch {
+                    number: new_block.number,
+                    buffered: self.last_block().hash.clone(),
+                    claimed: new_block.parent_hash,
+                });
+            }
             self.blocks.push(new_block);
-            return;
+            return Ok(Push::Inserted);
         }
 
         let pos = bisect(&self.blocks, new_block.parent_number);
-        assert!(
-            pos >= self.finalized_head,
-            "attempt to revert finalized head"
-        );
-        assert!(
-            pos < self.blocks.len(),
-            "there is a gap between received block and the current head"
-        );
+        if pos < self.finalized_head {
+            return Err(IntegrityViolation::WriteBelowFinality {
+                number: new_block.number,
+            });
+        }
+        // Above every buffered height, or DEF-1 height gap: either way the
+        // named parent is not held, which is a gap and not a reorg.
+        if self
+            .blocks
+            .get(pos)
+            .is_none_or(|p| p.number != new_block.parent_number)
+        {
+            return Err(IntegrityViolation::ParentNotBuffered {
+                number: new_block.number,
+                parent_number: new_block.parent_number,
+            });
+        }
+        if self.blocks[pos].hash != new_block.parent_hash {
+            return Err(IntegrityViolation::ParentHashMismatch {
+                number: new_block.number,
+                buffered: self.blocks[pos].hash.clone(),
+                claimed: new_block.parent_hash,
+            });
+        }
 
-        let prev = &self.blocks[pos];
-        assert!(
-            is_chain(prev, &new_block),
-            "chain hash mismatch on reorg push"
-        );
+        self.record_removal(pos + 1);
         self.blocks.truncate(pos + 1);
         self.blocks.push(new_block);
+        Ok(Push::Inserted)
     }
 
     /// Advance the finalized head pointer to `head`.
     ///
     /// Mirrors `Chain.finalize` in chain.ts.
-    /// Returns `true` if the finalized head actually advanced.
-    pub fn finalize(&mut self, head: &BlockRef) -> bool {
-        if head.number < self.first_block_number() {
-            return false;
+    /// Returns `true` if the finalized head actually advanced. A report the
+    /// buffer contradicts is an integrity violation the caller resolves by
+    /// tearing down the session (WP-5), never by dying.
+    pub fn finalize(&mut self, head: &BlockRef) -> Result<bool, IntegrityViolation> {
+        // A regressive report is ignored before its hash is inspected: the
+        // running session maximum already superseded this height (WP-12). This
+        // also subsumes `head.number < self.first_block_number()`.
+        if head.number < self.blocks[self.finalized_head].number {
+            return Ok(false);
         }
 
         let current = self.finalized_head;
@@ -98,7 +217,7 @@ impl Chain {
         if head.number > self.last_block_number() {
             // Finalize everything — safe per DataSource stream guarantees.
             self.finalized_head = self.blocks.len() - 1;
-            return self.finalized_head > current;
+            return Ok(self.finalized_head > current);
         }
 
         let pos = if head.number == self.last_block_number() {
@@ -107,13 +226,22 @@ impl Chain {
             bisect(&self.blocks, head.number)
         };
 
-        assert!(
-            self.blocks[pos].number == head.number && self.blocks[pos].hash == head.hash,
-            "attempt to finalize a block that is not part of the current chain"
-        );
+        // DEF-1 permits height gaps, so `bisect` can land above the report.
+        if self.blocks[pos].number != head.number {
+            return Err(IntegrityViolation::UnbufferedFinality {
+                number: head.number,
+            });
+        }
+        if self.blocks[pos].hash != head.hash {
+            return Err(IntegrityViolation::FinalityHashMismatch {
+                number: head.number,
+                buffered: self.blocks[pos].hash.clone(),
+                reported: head.hash.clone(),
+            });
+        }
 
         self.finalized_head = self.finalized_head.max(pos);
-        self.finalized_head > current
+        Ok(self.finalized_head > current)
     }
 
     /// Trim old finalized blocks to keep the buffer at or below `max_size`.
@@ -124,6 +252,10 @@ impl Chain {
     ///
     /// Mirrors `Chain.compact` in chain.ts.
     pub fn compact(&mut self) -> bool {
+        debug_assert!(
+            self.undo.is_none(),
+            "compaction shifts the indices an open undo log is written in"
+        );
         let extra = self.blocks.len().saturating_sub(self.max_size);
         if extra == 0 {
             return true;
@@ -351,7 +483,7 @@ mod root_conflict_tests {
     #[test]
     fn conflict_prev_never_carries_the_root_sentinel() {
         let mut chain = Chain::new(blk(0, "h0", 0, "0x0"), 10, false);
-        chain.push(blk(1, "h1", 0, "h0"));
+        chain.push(blk(1, "h1", 0, "h0")).unwrap();
 
         let err = chain.query(1, Some("wrong")).unwrap_err();
         assert_eq!(
@@ -405,7 +537,8 @@ mod tests {
                 &format!("h{i}"),
                 i - 1,
                 &format!("h{}", i - 1),
-            ));
+            ))
+            .unwrap();
         }
         c
     }
@@ -419,21 +552,45 @@ mod tests {
         assert_eq!(c.last_block_number(), 4);
     }
 
+    /// WP-14: no input content ends the process. Each violation is reported,
+    /// and the buffer it was rejected against is left exactly as it was.
     #[test]
-    #[should_panic(expected = "chain hash mismatch on sequential push")]
-    fn push_bad_hash() {
+    fn push_reports_violations_and_leaves_the_buffer_intact() {
         let mut c = Chain::new(genesis(), 100, false);
-        // Wrong parent hash for block 1.
-        c.push(make_block(1, "h1", 0, "wrong"));
-    }
+        assert!(matches!(
+            c.push(make_block(1, "h1", 0, "wrong")),
+            Err(IntegrityViolation::ParentHashMismatch { number: 1, .. })
+        ));
+        assert_eq!(c.size(), 1);
 
-    #[test]
-    #[should_panic(expected = "block claims a parent at or above its own height")]
-    fn push_descending_height() {
-        let mut c = chain_of(11);
         // Parent ref names the buffered tip, but the block sits below it:
         // appending would leave `blocks` unsorted and `bisect` unusable.
-        c.push(make_block(5, "h5b", 10, "h10"));
+        let mut c = chain_of(11);
+        assert!(matches!(
+            c.push(make_block(5, "h5b", 10, "h10")),
+            Err(IntegrityViolation::DescendingHeight {
+                number: 5,
+                parent_number: 10
+            })
+        ));
+        assert_eq!((c.size(), c.last_block_number()), (11, 10));
+
+        // Above every buffered height — a gap, not a reorg.
+        assert!(matches!(
+            c.push(make_block(20, "h20", 19, "h19")),
+            Err(IntegrityViolation::ParentNotBuffered {
+                number: 20,
+                parent_number: 19
+            })
+        ));
+        assert_eq!((c.size(), c.last_block_number()), (11, 10));
+
+        // A buffered parent height held under another hash.
+        assert!(matches!(
+            c.push(make_block(6, "h6b", 5, "forged")),
+            Err(IntegrityViolation::ParentHashMismatch { number: 6, .. })
+        ));
+        assert_eq!((c.size(), c.last_block_number()), (11, 10));
     }
 
     // ---- push / reorg ----------------------------------------------------
@@ -442,32 +599,29 @@ mod tests {
     fn push_reorg() {
         let mut c = chain_of(5); // 0..=4
                                  // Reorg: replace blocks 3 and 4 with an alternate chain.
-        c.push(make_block(3, "h3b", 2, "h2")); // reorg at pos 3
+        c.push(make_block(3, "h3b", 2, "h2")).unwrap(); // reorg at pos 3
         assert_eq!(c.size(), 4);
         assert_eq!(c.last_block().hash, "h3b");
         // Now extend.
-        c.push(make_block(4, "h4b", 3, "h3b"));
+        c.push(make_block(4, "h4b", 3, "h3b")).unwrap();
         assert_eq!(c.size(), 5);
     }
 
     #[test]
-    #[should_panic(expected = "attempt to revert finalized head")]
     fn push_reorg_below_finalized() {
         let mut c = chain_of(5);
         c.finalize(&BlockRef {
             number: 3,
             hash: "h3".into(),
-        });
-        // Try to reorg back to block 2.
-        c.push(make_block(3, "h3b", 2, "h2"));
-    }
-
-    #[test]
-    #[should_panic(expected = "there is a gap between received block and the current head")]
-    fn push_gap() {
-        let mut c = chain_of(5);
-        // Block 10 is way ahead — gap.
-        c.push(make_block(10, "h10", 9, "h9"));
+        })
+        .unwrap();
+        // Try to reorg back to block 2 (INV-11).
+        assert!(matches!(
+            c.push(make_block(3, "h3b", 2, "h2")),
+            Err(IntegrityViolation::WriteBelowFinality { number: 3 })
+        ));
+        assert_eq!((c.size(), c.last_block_number()), (5, 4));
+        assert_eq!(c.get_finalized_head().number, 3);
     }
 
     // ---- finalize --------------------------------------------------------
@@ -475,36 +629,37 @@ mod tests {
     #[test]
     fn finalize_advances() {
         let mut c = chain_of(5);
-        assert!(c.finalize(&BlockRef {
-            number: 3,
-            hash: "h3".into()
-        }));
+        assert!(c
+            .finalize(&BlockRef {
+                number: 3,
+                hash: "h3".into()
+            })
+            .unwrap());
         assert_eq!(c.get_finalized_head().number, 3);
     }
 
     #[test]
-    fn finalize_noop_below_first() {
-        let c = chain_of(5);
-        // Block 0's parent number is 0, which is the first block number.
-        // A head.number < first_block_number (0) would be impossible here.
-        // Test: finalized head number below first block number.
-        let mut c2 = Chain::new(make_block(10, "h10", 9, "h9"), 100, false);
-        // head.number = 5 < first_block_number (10) → no-op
-        assert!(!c2.finalize(&BlockRef {
-            number: 5,
-            hash: "h5".into()
-        }));
-        assert_eq!(c2.get_finalized_head().number, 10);
-        let _ = c;
+    fn finalize_noop_below_the_finalized_head() {
+        // The whole buffer sits above the report, so nothing it names exists.
+        let mut c = Chain::new(make_block(10, "h10", 9, "h9"), 100, false);
+        assert!(!c
+            .finalize(&BlockRef {
+                number: 5,
+                hash: "h5".into()
+            })
+            .unwrap());
+        assert_eq!(c.get_finalized_head().number, 10);
     }
 
     #[test]
     fn finalize_above_last_finalizes_all() {
         let mut c = chain_of(5); // blocks 0..=4
-        assert!(c.finalize(&BlockRef {
-            number: 100,
-            hash: "nonexistent".into()
-        }));
+        assert!(c
+            .finalize(&BlockRef {
+                number: 100,
+                hash: "nonexistent".into()
+            })
+            .unwrap());
         assert_eq!(c.get_finalized_head().number, 4);
     }
 
@@ -514,13 +669,158 @@ mod tests {
         c.finalize(&BlockRef {
             number: 5,
             hash: "h5".into(),
-        });
-        // Finalize at a lower number — must be a no-op (returns false).
-        assert!(!c.finalize(&BlockRef {
-            number: 3,
-            hash: "h3".into()
-        }));
+        })
+        .unwrap();
+        // A lower report is ignored before its hash is inspected: the running
+        // session maximum already superseded this height (WP-12).
+        assert!(!c
+            .finalize(&BlockRef {
+                number: 3,
+                hash: "wrong-hash".into()
+            })
+            .unwrap());
         assert_eq!(c.get_finalized_head().number, 5);
+    }
+
+    // ---- duplicate absorption (WP-6) -------------------------------------
+
+    #[test]
+    fn identical_redelivery_leaves_the_buffer_alone() {
+        let mut c = chain_of(5); // 0..=4
+        c.finalize(&BlockRef {
+            number: 2,
+            hash: "h2".into(),
+        })
+        .unwrap();
+
+        // Mid-buffer: the suffix above the duplicate must survive. Treating
+        // this as a reorg is what made readers observe a head regression.
+        c.push(make_block(3, "h3", 2, "h2")).unwrap();
+        assert_eq!(c.last_block_number(), 4);
+        assert_eq!(c.size(), 5);
+
+        // At and below the finalized head: the finality guard must not fire.
+        c.push(make_block(2, "h2", 1, "h1")).unwrap();
+        c.push(make_block(1, "h1", 0, "h0")).unwrap();
+        assert_eq!(c.last_block_number(), 4);
+        assert_eq!(c.size(), 5);
+        assert_eq!(c.get_finalized_head().number, 2);
+
+        // The head itself.
+        c.push(make_block(4, "h4", 3, "h3")).unwrap();
+        assert_eq!(c.last_block_number(), 4);
+        assert_eq!(c.size(), 5);
+    }
+
+    #[test]
+    fn a_redelivered_root_is_absorbed_not_rejected() {
+        // A root's parent coordinate repeats its own height (DEF-4's sole
+        // exception), so absorption must be decided before the height check.
+        let mut c = Chain::new(make_block(0, "h0", 0, "0x0"), 10, false);
+        c.push(make_block(1, "h1", 0, "h0")).unwrap();
+        c.push(make_block(0, "h0", 0, "0x0")).unwrap();
+        assert_eq!(c.last_block_number(), 1);
+        assert_eq!(c.size(), 2);
+    }
+
+    #[test]
+    fn the_same_ref_under_a_second_parent_is_equivocation() {
+        // DEF-8: absorbing it would hide the substitution, reorging it would
+        // rewrite ancestry under an unchanged ref. Neither is observable.
+        let mut c = chain_of(5);
+        assert!(matches!(
+            c.push(make_block(3, "h3", 2, "h2-other")),
+            Err(IntegrityViolation::RefEquivocation { number: 3, .. })
+        ));
+        assert_eq!((c.size(), c.last_block_number()), (5, 4));
+        assert_eq!(c.blocks[3].parent_hash, "h2");
+    }
+
+    #[test]
+    fn a_genuine_reorg_is_still_a_reorg() {
+        // Absorption keys on the full linkage tuple, so a different hash at a
+        // buffered height must still truncate.
+        let mut c = chain_of(5);
+        c.push(make_block(3, "h3b", 2, "h2")).unwrap();
+        assert_eq!(c.last_block_number(), 3);
+        assert_eq!(c.size(), 4);
+    }
+
+    // ---- batch atomicity -------------------------------------------------
+
+    fn refs(c: &Chain) -> Vec<(u64, String)> {
+        c.blocks
+            .iter()
+            .map(|b| (b.number, b.hash.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn rollback_restores_appends_reorgs_and_finality() {
+        let mut c = chain_of(5); // 0..=4
+        c.finalize(&BlockRef {
+            number: 2,
+            hash: "h2".into(),
+        })
+        .unwrap();
+        let before = refs(&c);
+
+        // Append-only batch: nothing is saved, everything is still undone.
+        c.begin_batch();
+        c.push(make_block(5, "h5", 4, "h4")).unwrap();
+        c.push(make_block(6, "h6", 5, "h5")).unwrap();
+        c.rollback_batch();
+        assert_eq!(refs(&c), before);
+
+        // A batch that appends, then reorgs below its own appends, then
+        // reorgs again lower still — the originals come back in order.
+        c.begin_batch();
+        c.push(make_block(5, "h5", 4, "h4")).unwrap();
+        c.push(make_block(4, "h4b", 3, "h3")).unwrap();
+        c.push(make_block(3, "h3b", 2, "h2")).unwrap();
+        c.finalize(&BlockRef {
+            number: 3,
+            hash: "h3b".into(),
+        })
+        .unwrap();
+        assert_eq!(c.get_finalized_head().number, 3);
+        c.rollback_batch();
+        assert_eq!(refs(&c), before);
+        assert_eq!(c.get_finalized_head().number, 2);
+
+        // Committing keeps the batch and leaves no log behind.
+        c.begin_batch();
+        c.push(make_block(5, "h5", 4, "h4")).unwrap();
+        c.commit_batch();
+        c.rollback_batch();
+        assert_eq!(c.last_block_number(), 5);
+    }
+
+    #[test]
+    fn finalize_reports_a_contradicted_buffer_instead_of_dying() {
+        // WP-23 revalidation: the height arrived under another hash.
+        let mut c = chain_of(5);
+        assert!(matches!(
+            c.finalize(&BlockRef {
+                number: 3,
+                hash: "h3-forged".into()
+            }),
+            Err(IntegrityViolation::FinalityHashMismatch { number: 3, .. })
+        ));
+        // The buffer is untouched and still servable.
+        assert_eq!(c.get_finalized_head().number, 0);
+        assert_eq!(c.size(), 5);
+
+        // DEF-1 height gaps: nothing is buffered at the named height.
+        let mut sparse = Chain::new(make_block(10, "h10", 9, "h9"), 100, false);
+        sparse.push(make_block(20, "h20", 10, "h10")).unwrap();
+        assert!(matches!(
+            sparse.finalize(&BlockRef {
+                number: 15,
+                hash: "h15".into()
+            }),
+            Err(IntegrityViolation::UnbufferedFinality { number: 15 })
+        ));
     }
 
     // ---- compact ---------------------------------------------------------
@@ -531,7 +831,8 @@ mod tests {
         c.finalize(&BlockRef {
             number: 7,
             hash: "h7".into(),
-        });
+        })
+        .unwrap();
         // max_size was set to 1000 in chain_of, use small max_size.
         let mut c2 = Chain::new(genesis(), 5, false);
         for i in 1..10u64 {
@@ -540,12 +841,14 @@ mod tests {
                 &format!("h{i}"),
                 i - 1,
                 &format!("h{}", i - 1),
-            ));
+            ))
+            .unwrap();
         }
         c2.finalize(&BlockRef {
             number: 7,
             hash: "h7".into(),
-        });
+        })
+        .unwrap();
         // size is 10, max_size is 5 → need to trim 5 entries.
         assert!(c2.compact());
         // finalized_head was at index 7; after trimming 5 it should be at 2.
@@ -562,7 +865,8 @@ mod tests {
                 &format!("h{i}"),
                 i - 1,
                 &format!("h{}", i - 1),
-            ));
+            ))
+            .unwrap();
         }
         // finalized head still at 0, size=5 > max=3 → cannot trim.
         assert!(!c.compact());
@@ -577,7 +881,8 @@ mod tests {
                 &format!("h{i}"),
                 i - 1,
                 &format!("h{}", i - 1),
-            ));
+            ))
+            .unwrap();
         }
         assert!(c.compact());
         // After auto-adjust, the buffer should be within max_size.
@@ -616,7 +921,8 @@ mod tests {
         c.finalize(&BlockRef {
             number: 10,
             hash: "h10".into(),
-        });
+        })
+        .unwrap();
     }
 
     #[test]
@@ -662,7 +968,8 @@ mod tests {
                 &format!("h{i}"),
                 i - 1,
                 &format!("h{}", i - 1),
-            ));
+            ))
+            .unwrap();
         }
         // Query at block 150 with wrong hash.
         let err = c.query(150, Some("bad")).unwrap_err();
@@ -696,7 +1003,8 @@ mod tests {
         c.finalize(&BlockRef {
             number: 4,
             hash: "h4".into(),
-        });
+        })
+        .unwrap();
         // All upstream blocks are unknown (different hashes).
         let prev = vec![
             BlockRef {

@@ -36,6 +36,12 @@ fn linked(a: &ModelBlock, b: &ModelBlock) -> bool {
     a.number == b.parent_number && a.hash == b.parent_hash
 }
 
+fn is_header_safe_hash(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
+}
+
 /// Alarms the model raises. Surfacing them is INV-31 — no comparator reads
 /// this list yet (the matrix keeps INV-31 at U); tests may assert on it
 /// directly.
@@ -57,6 +63,23 @@ pub enum ApplyOutcome {
     Terminal,
     /// WP-10 on empty `prev`: session error, not a rebase.
     SessionError(&'static str),
+}
+
+/// Why a T1 reference-model initialization was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitError {
+    /// `P-CACHE-SIZE` must leave room for the seed block.
+    ZeroCacheSize,
+    /// DEF-2: a block hash is an opaque, non-empty string.
+    EmptyBlockHash,
+    /// DEF-2: the parent hash is also an opaque, non-empty string.
+    EmptyParentHash,
+    /// DEF-2/IB-4: a block hash must be representable as an HTTP field value.
+    HeaderUnsafeBlockHash,
+    /// DEF-2/IB-4: the parent hash obeys the same representation constraint.
+    HeaderUnsafeParentHash,
+    /// DEF-4: only equality (the root convention) may avoid strict descent.
+    ParentAboveBlock,
 }
 
 /// Model verdict for a stream query (RP-3 resolution).
@@ -93,7 +116,25 @@ pub struct RefModel {
 
 impl RefModel {
     /// T1 INIT: seed a one-block buffer.
-    pub fn init(seed: ModelBlock, cache_size: usize, auto_adjust: bool) -> Self {
+    pub fn init(seed: ModelBlock, cache_size: usize, auto_adjust: bool) -> Result<Self, InitError> {
+        if cache_size == 0 {
+            return Err(InitError::ZeroCacheSize);
+        }
+        if seed.hash.is_empty() {
+            return Err(InitError::EmptyBlockHash);
+        }
+        if seed.parent_hash.is_empty() {
+            return Err(InitError::EmptyParentHash);
+        }
+        if !is_header_safe_hash(&seed.hash) {
+            return Err(InitError::HeaderUnsafeBlockHash);
+        }
+        if !is_header_safe_hash(&seed.parent_hash) {
+            return Err(InitError::HeaderUnsafeParentHash);
+        }
+        if seed.parent_number > seed.number {
+            return Err(InitError::ParentAboveBlock);
+        }
         let m = RefModel {
             blocks: vec![seed],
             f: 0,
@@ -103,7 +144,7 @@ impl RefModel {
             alarms: vec![],
         };
         m.assert_well_formed();
-        m
+        Ok(m)
     }
 
     pub fn head(&self) -> BlockRef {
@@ -167,6 +208,26 @@ impl RefModel {
         {
             return ApplyOutcome::SessionError("malformed input batch (DEF-20)");
         }
+        // DEF-2: linkage cannot catch an empty hash — it links to an empty
+        // parent hash — so the emptiness is checked on its own.
+        if blocks
+            .iter()
+            .any(|b| b.hash.is_empty() || b.parent_hash.is_empty())
+        {
+            return ApplyOutcome::SessionError("empty block hash (DEF-2)");
+        }
+        if finalized_report.is_some_and(|r| r.hash.is_empty()) {
+            return ApplyOutcome::SessionError("empty finality hash (DEF-2)");
+        }
+        if blocks
+            .iter()
+            .any(|b| !is_header_safe_hash(&b.hash) || !is_header_safe_hash(&b.parent_hash))
+        {
+            return ApplyOutcome::SessionError("header-unsafe block hash (DEF-2/IB-4)");
+        }
+        if finalized_report.is_some_and(|r| !is_header_safe_hash(&r.hash)) {
+            return ApplyOutcome::SessionError("header-unsafe finality hash (DEF-2/IB-4)");
+        }
         self.atomic_step(|m| {
             for x in blocks {
                 match m.push(x) {
@@ -217,6 +278,9 @@ impl RefModel {
     /// report replaces the maximum, and the replaced obligation's own check is
     /// not owed (ADR-16).
     fn note_report(&mut self, r: &BlockRef) -> ApplyOutcome {
+        if r.number < self.finalized().number {
+            return ApplyOutcome::Applied;
+        }
         if let Some(m) = &self.fin_max {
             if r.number == m.number && r.hash != m.hash {
                 self.alarm(Alarm::IntegrityViolation("conflicting finality reports"));
@@ -296,6 +360,9 @@ impl RefModel {
 
     /// T4 FINALIZE (WP-23).
     fn finalize(&mut self, r: &BlockRef) -> ApplyOutcome {
+        if r.number < self.finalized().number {
+            return ApplyOutcome::Applied; // regressive finality — no-op (WP-12)
+        }
         if r.number < self.blocks[0].number {
             return ApplyOutcome::Applied; // stale — no-op
         }
@@ -440,10 +507,53 @@ mod tests {
     }
 
     #[test]
+    fn init_rejects_an_invalid_seed_or_cache_size() {
+        assert!(matches!(
+            RefModel::init(seed(), 0, false),
+            Err(InitError::ZeroCacheSize)
+        ));
+
+        let mut bad = seed();
+        bad.hash.clear();
+        assert!(matches!(
+            RefModel::init(bad, 100, false),
+            Err(InitError::EmptyBlockHash)
+        ));
+
+        let mut bad = seed();
+        bad.parent_hash.clear();
+        assert!(matches!(
+            RefModel::init(bad, 100, false),
+            Err(InitError::EmptyParentHash)
+        ));
+
+        let mut bad = seed();
+        bad.hash = "bad\nhash".into();
+        assert!(matches!(
+            RefModel::init(bad, 100, false),
+            Err(InitError::HeaderUnsafeBlockHash)
+        ));
+
+        let mut bad = seed();
+        bad.parent_hash = "bad\rparent".into();
+        assert!(matches!(
+            RefModel::init(bad, 100, false),
+            Err(InitError::HeaderUnsafeParentHash)
+        ));
+
+        let mut bad = seed();
+        bad.parent_number = bad.number + 1;
+        assert!(matches!(
+            RefModel::init(bad, 100, false),
+            Err(InitError::ParentAboveBlock)
+        ));
+    }
+
+    #[test]
     fn duplicate_redelivery_is_a_noop() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         assert_eq!(m.apply_batch(&chain(2..=4), None), ApplyOutcome::Applied);
-        // Redelivering block 3 must not truncate block 4 (WP-6 / GAP-29).
+        // Redelivering block 3 must not truncate block 4 (WP-6).
         assert_eq!(
             m.apply_batch(&[blk(3, "h3", "h2")], None),
             ApplyOutcome::Applied
@@ -454,7 +564,7 @@ mod tests {
 
     #[test]
     fn seed_redelivery_is_a_noop() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         assert_eq!(m.apply_batch(&chain(2..=3), None), ApplyOutcome::Applied);
         // WP-6 holds at every position, including the buffer's first block.
         assert_eq!(m.apply_batch(&[seed()], None), ApplyOutcome::Applied);
@@ -464,7 +574,7 @@ mod tests {
 
     #[test]
     fn the_same_ref_under_a_second_parent_is_equivocation() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         assert_eq!(m.apply_batch(&chain(2..=3), None), ApplyOutcome::Applied);
         // Same ref, lower parent: absorbing hides it, reorging rewrites
         // block 3's ancestry under an unchanged ref. WP-6/DEF-8: violation.
@@ -486,7 +596,7 @@ mod tests {
 
     #[test]
     fn a_batch_that_is_not_pairwise_linked_is_rejected_whole() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         // Ascending but unlinked: block by block this appends 2 then gaps on
         // 4; DEF-20 rejects the batch before anything mutates.
         assert_eq!(
@@ -521,7 +631,7 @@ mod tests {
 
     #[test]
     fn root_redelivery_is_a_noop() {
-        let mut m = RefModel::init(root(), 100, false);
+        let mut m = RefModel::init(root(), 100, false).unwrap();
         assert_eq!(m.apply_batch(&chain(1..=2), None), ApplyOutcome::Applied);
         // WP-6: an identical duplicate is a no-op even for the root, whose
         // self-parent convention must not trip the DEF-4 height check.
@@ -532,7 +642,7 @@ mod tests {
 
     #[test]
     fn query_serves_data_at_a_buffered_root() {
-        let mut m = RefModel::init(root(), 100, false);
+        let mut m = RefModel::init(root(), 100, false).unwrap();
         assert_eq!(m.apply_batch(&chain(1..=1), None), ApplyOutcome::Applied);
         // Block 0 is buffered and servable; nothing exists below a root, so
         // this is a window query, not a backfill.
@@ -544,14 +654,14 @@ mod tests {
 
     #[test]
     fn query_below_a_non_root_base_is_backfill() {
-        let m = RefModel::init(blk(10, "h10", "h9"), 100, false);
+        let m = RefModel::init(blk(10, "h10", "h9"), 100, false).unwrap();
         assert_eq!(m.query(9, None), QueryVerdict::Backfill);
         assert!(matches!(m.query(10, None), QueryVerdict::Data { .. }));
     }
 
     #[test]
     fn fork_signal_exhausted_prev_descends_one_below_the_lowest_ref() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         assert_eq!(m.apply_batch(&chain(2..=5), None), ApplyOutcome::Applied);
         // Upstream names height 4 under an unknown hash: no buffered ref
         // matches, so the base is the newest block strictly below the lowest
@@ -564,7 +674,7 @@ mod tests {
 
     #[test]
     fn fork_signal_matching_the_finalized_block_rebases() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         assert_eq!(
             m.apply_batch(&chain(2..=5), Some(&rf(4, "h4"))),
             ApplyOutcome::Applied
@@ -577,7 +687,7 @@ mod tests {
 
     #[test]
     fn fork_signal_entirely_below_finality_is_terminal() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         assert_eq!(
             m.apply_batch(&chain(2..=5), Some(&rf(4, "h4"))),
             ApplyOutcome::Applied
@@ -588,7 +698,7 @@ mod tests {
 
     #[test]
     fn descending_height_is_rejected() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         assert_eq!(m.apply_batch(&chain(2..=2), None), ApplyOutcome::Applied);
         let bad = ModelBlock {
             number: 3,
@@ -604,7 +714,7 @@ mod tests {
 
     #[test]
     fn empty_input_batch_is_an_adapter_fault() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         assert_eq!(
             m.apply_batch(&[], Some(&rf(2, "A"))),
             ApplyOutcome::SessionError("empty input batch (DEF-20)")
@@ -613,7 +723,7 @@ mod tests {
 
     #[test]
     fn the_obligation_is_validated_when_its_block_arrives() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         // Report (3, A) rides on block 2 and stays open above the head.
         assert_eq!(
             m.apply_batch(&chain(2..=2), Some(&rf(3, "A"))),
@@ -631,7 +741,7 @@ mod tests {
 
     #[test]
     fn a_higher_report_replaces_the_open_obligation() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         assert_eq!(
             m.apply_batch(&chain(2..=2), Some(&rf(5, "A"))),
             ApplyOutcome::Applied
@@ -650,7 +760,7 @@ mod tests {
 
     #[test]
     fn equal_height_contradictory_reports_are_a_violation() {
-        let mut m = RefModel::init(seed(), 100, false);
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
         assert_eq!(
             m.apply_batch(&chain(2..=2), Some(&rf(4, "A"))),
             ApplyOutcome::Applied
@@ -659,5 +769,22 @@ mod tests {
             m.apply_batch(&chain(3..=3), Some(&rf(4, "B"))),
             ApplyOutcome::IntegrityViolation("conflicting finality reports")
         );
+    }
+
+    #[test]
+    fn a_regressive_report_after_session_reset_is_ignored() {
+        let mut m = RefModel::init(seed(), 100, false).unwrap();
+        assert_eq!(
+            m.apply_batch(&chain(2..=3), Some(&rf(2, "h2"))),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.finalized(), rf(2, "h2"));
+
+        m.begin_session();
+        assert_eq!(
+            m.apply_batch(&[blk(3, "h3", "h2")], Some(&rf(1, "wrong-hash"))),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.finalized(), rf(2, "h2"));
     }
 }

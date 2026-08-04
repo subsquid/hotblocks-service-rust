@@ -55,7 +55,7 @@ acquisition, one probe) is contained to that activity plus declared shared budge
 |---|---|---|
 | FM-30 | **Unrecoverable divergence** (FM-19) or equivalent contradiction that no retry can heal | terminal alarm: raise OB-7 terminal state, drain in-flight responses, then exit non-zero (ADR-12); MUST NOT continue serving while appearing healthy with ingestion silently dead (GAP-4) |
 | FM-31 | Startup failure (T1 impossible: bad config, unreachable upstream) | exit non-zero with diagnostic (REQ-32) |
-| FM-32 | Internal panic/defect in one activity | contain (FM-3); if the writer is affected: recover via ladder/T1 or exit — never zombie (INV-41, GAP-1) |
+| FM-32 | Internal panic/defect in one activity | contain (FM-3); if the writer is affected: recover via ladder/T1 or exit — never zombie (INV-41) |
 | FM-33 | Crash / kill at any point | restart per REQ-13; recovery contract INV-40 |
 | FM-34 | Dual instance behind one address | tolerated: the protocol is stateless per request (RP-5); clients may see version flapping between instances but never corruption — each response is one instance's snapshot. INV-29's monotonicity is scoped per instance for exactly this reason (ADR-14); no affinity or epoch token is offered (ADR-1 pins the wire) |
 

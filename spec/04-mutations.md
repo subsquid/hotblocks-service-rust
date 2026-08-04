@@ -27,7 +27,7 @@ loop:
 appends/reorgs, its finality advance, and the resulting eviction — become visible to
 readers as one committed state (INV-16). Readers never observe a half-applied batch.
 A batch that violates DEF-20's shape (ascending, pairwise linked) is rejected before
-anything mutates, not discovered block by block (GAP-35).
+anything mutates, not discovered block by block.
 The commit point is the atomic publication of the new buffer state; there is no
 acknowledgement to the adapter — redelivered blocks are absorbed idempotently (WP-13).
 
@@ -42,19 +42,19 @@ height above head with no buffered parent), a parent-hash mismatch at a buffered
 height, an attempt to modify at or below `finalized(C)` — is an **integrity violation**:
 the batch is rejected whole (no partial application), the condition is alarmed (OB-7),
 and the session is torn down per WP-9. It is never applied partially, never
-process-fatal, and never silently dropped (INV-41, ADR-11 ⚠ pending ratification; GAP-1).
+process-fatal, and never silently dropped (INV-41, ADR-11 ⚠ pending ratification).
 
 **WP-6 — Duplicate absorption & equivocation.** [MUST] Re-delivery of a block already
 buffered with the same hash and same parent link (e.g. after session restart or fork
 replay) is a strict no-op: the buffer — including everything above the duplicate — is
 unchanged, and no reader observes any effect. This holds at every position, including
 at or below `finalized(C)`. Treating a duplicate as a reorganization (truncating the
-newer suffix, or tripping the finality guard) is non-conforming (GAP-29). Idempotency
+newer suffix, or tripping the finality guard) is non-conforming. Idempotency
 is required under at-least-once delivery (DEF-20).
 
 A delivery whose ref matches a buffered block but whose parent link differs is neither
 a duplicate nor a reorganization: it is **equivocation** — one hash claiming two
-ancestries (DEF-8) — and is an integrity violation (WP-5 handling; GAP-33). Applying
+ancestries (DEF-8) — and is an integrity violation (WP-5 handling). Applying
 it as a reorg would leave the ref unchanged while its history silently changed, which
 no client can detect: the conflict protocol compares parent hashes of *later* blocks
 (RP-11), and those still link.
@@ -122,8 +122,8 @@ livelock of GAP-5).
 report seen in the current session — one ref, no history — and applies T4 with it.
 Regressive reports (lower than an already-applied finality) are ignored without error.
 A report naming a buffered height with a different hash than the buffered block is an
-integrity violation (WP-5 handling — alarm + session teardown, not process death;
-GAP-7). So is a report naming the current maximum's height under a different hash: at
+integrity violation (WP-5 handling — alarm + session teardown, not process death).
+So is a report naming the current maximum's height under a different hash: at
 most one of the two can match the block when it arrives, so the contradiction is
 decidable the moment the second report lands, held block or not. A report above the
 buffered head finalizes the entire buffer and is re-validated when the named block
@@ -154,8 +154,9 @@ DEF-33 tabulates the catalog.
 resolves and the single block at `fh` is acquirable — and *is* `fh`: the acquired
 block's ref MUST equal the reported one, since the two calls may land on different
 nodes of a fleet and an unchecked block would become the buffer's finality anchor.
-A mismatch, an empty seed batch, and a multi-block seed batch are source faults —
-ladder (WP-9), or FM-31 at startup, never a process fault. *Post:*
+The acquired seed MUST also satisfy DEF-2 and DEF-4 before it enters the buffer.
+A mismatch, a malformed seed, an empty seed batch, and a multi-block seed batch are
+source faults — ladder (WP-9), or FM-31 at startup, never a process fault. *Post:*
 `C = (⟨block(fh)⟩, f = 1)`; session `base = fh`, `stalled = 0`. Failure of T1 at
 process start is a startup failure (exit, FM-31); failure of a re-INIT (WP-9 ladder)
 re-enters the ladder. T1 discards any previous buffer entirely; it is the sanctioned
