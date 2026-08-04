@@ -46,7 +46,7 @@ fn simple_chain(len: u64) -> Vec<Block> {
                 &format!("h{i}"),
                 i.saturating_sub(1),
                 &if i == 0 {
-                    "".to_string()
+                    "0x0".to_string()
                 } else {
                     format!("h{}", i - 1)
                 },

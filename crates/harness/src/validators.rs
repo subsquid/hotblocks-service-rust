@@ -68,7 +68,6 @@ fn split_gzip_members(body: &[u8]) -> anyhow::Result<Vec<Frame>> {
         decoder
             .read_to_end(&mut out)
             .with_context(|| format!("gzip member at byte {offset} does not decode"))?;
-
         let next = decoder.into_inner();
         let consumed = before - next.len();
         anyhow::ensure!(
@@ -111,51 +110,32 @@ fn decode_one_zstd_frame(input: &[u8]) -> anyhow::Result<(usize, Vec<u8>)> {
 
 /// REQ-6/IB-2: independent per-block frames, one record each.
 ///
-/// zstd's raw decoder reports per-frame byte counts, so frames are enumerated
-/// and every boundary re-decoded as a prefix (ADR-10's cut). gzip's buffered
-/// decoder returns the untouched suffix after each member, allowing every
-/// member to be decoded and checked independently.
+/// Each raw zstd frame or gzip member is enumerated and decoded exactly once.
+/// Because each unit is decoded from its own body suffix and consumes a known
+/// byte span, every boundary it reports is also a legal prefix cut (ADR-10).
 pub fn validate_framing(body: &[u8], content_encoding: &str) -> Result<Vec<String>, String> {
-    let records = match content_encoding {
-        "zstd" => {
-            let frames = split_frames(body).map_err(|e| format!("REQ-6: {e}"))?;
-            // ADR-10: every frame boundary is a valid cut.
-            let mut cut = 0;
-            for (i, f) in frames.iter().enumerate() {
-                cut += f.bytes;
-                let prefix = split_frames(&body[..cut])
-                    .map_err(|e| format!("REQ-6: prefix through frame {i} does not decode: {e}"))?;
-                if prefix.len() != i + 1 {
-                    return Err(format!(
-                        "REQ-6: prefix through frame {i} decoded {} frames, expected {}",
-                        prefix.len(),
-                        i + 1
-                    ));
-                }
-            }
-            frames.into_iter().map(|f| f.text).collect::<Vec<_>>()
-        }
-        "gzip" | "identity" => {
-            let frames = split_gzip_members(body).map_err(|e| format!("REQ-6: {e:#}"))?;
-            frames.into_iter().map(|frame| frame.text).collect()
-        }
+    let frames = match content_encoding {
+        "zstd" => split_frames(body),
+        "gzip" => split_gzip_members(body),
         other => return Err(format!("REQ-6: unexpected content-encoding: {other}")),
-    };
-    if records.is_empty() {
+    }
+    .map_err(|e| format!("REQ-6: {e:#}"))?;
+    if frames.is_empty() {
         return Err("REQ-6: successful body carries no frame".into());
     }
-    for (i, text) in records.iter().enumerate() {
+    for (i, frame) in frames.iter().enumerate() {
+        let text = &frame.text;
         if !text.ends_with('\n') {
             return Err(format!("REQ-6: frame {i} is not newline-terminated"));
         }
-        if text.trim_end_matches('\n').contains('\n') {
+        let records = text.bytes().filter(|byte| *byte == b'\n').count();
+        if records != 1 {
             return Err(format!(
-                "REQ-6: frame {i} carries {} records — frames are per block",
-                text.matches('\n').count()
+                "REQ-6: frame {i} carries {records} records — frames are per block"
             ));
         }
     }
-    Ok(records)
+    Ok(frames.into_iter().map(|frame| frame.text).collect())
 }
 
 /// Decode a stream body per its content-encoding into the concatenated
@@ -177,7 +157,7 @@ pub fn decode_body(body: &[u8], content_encoding: &str) -> anyhow::Result<String
 }
 
 /// One validated record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordRef {
     pub number: u64,
     pub parent_number: u64,
@@ -238,6 +218,11 @@ pub fn validate_data(
         // DEF-2: hashes are non-empty; an empty one links to anything.
         if hash.is_empty() || parent_hash.is_empty() {
             return Err(format!("DEF-2: record {number} carries an empty hash"));
+        }
+        if parent_number > number {
+            return Err(format!(
+                "DEF-4: record {number} claims parent height {parent_number} above itself"
+            ));
         }
         if let Some(prev) = records.last() {
             if number <= prev.number {
@@ -441,13 +426,15 @@ pub enum Outcome {
     Class(ErrorClass),
     /// Wrong method on a known route (IB-1).
     MethodNotAllowed,
+    /// Unknown route: IB-1 binds only the status, not an RP-13 body shape.
+    UnknownRoute,
     /// Readiness negative or probe failure (14's operation table, RP-10).
     Unavailable,
 }
 
-/// Validate any response's non-DATA outcome — the validator library's
-/// every-response entry point. `/stream` outcomes must additionally be RP-13
-/// classes; use [`validate_error`] there.
+/// Validate a response's route-bound non-DATA outcome. `/stream` outcomes must
+/// additionally be RP-13 classes; use [`validate_error`] there. An unknown
+/// route is deliberately route-aware and uses [`validate_unknown_route`].
 pub fn validate_outcome(
     status: u16,
     headers: &WireHeaders,
@@ -467,6 +454,18 @@ pub fn validate_outcome(
             Ok(Outcome::Unavailable)
         }
         _ => validate_error(status, headers, body).map(Outcome::Class),
+    }
+}
+
+/// Validate IB-1's unknown-route outcome. Only the 404 status is bound; the
+/// body and headers are intentionally outside the contract.
+pub fn validate_unknown_route(status: u16) -> Result<Outcome, String> {
+    if status == 404 {
+        Ok(Outcome::UnknownRoute)
+    } else {
+        Err(format!(
+            "IB-1: unknown route returned {status}, expected 404"
+        ))
     }
 }
 
@@ -518,9 +517,10 @@ pub fn validate_error(
             Ok(ErrorClass::InvalidRequest)
         }
         404 => {
-            // 14 pins the status and nothing else for an unknown route; the
-            // routes whose 404 text *is* pinned are checked by their own
-            // binding assertions (CT-5), not here.
+            expect_text(headers.content_type, status)?;
+            if body.is_empty() {
+                return Err("IB-7: 404 carries no text diagnostic".into());
+            }
             std::str::from_utf8(body).map_err(|e| format!("IB-7: 404 body is not text: {e}"))?;
             Ok(ErrorClass::NotFound)
         }
@@ -647,6 +647,13 @@ mod tests {
     }
 
     #[test]
+    fn first_record_cannot_name_a_parent_above_itself() {
+        let malformed = line(5, "h5", 6, "h6");
+        let err = validate_data(&malformed, 5, sim_extract, &DataOracle::default()).unwrap_err();
+        assert!(err.starts_with("DEF-4"), "{err}");
+    }
+
+    #[test]
     fn watermark_numerals_must_round_trip() {
         // IB-4 pins a decimal; u64::from_str also accepts `+` and leading
         // zeros, which would normalize a wire-format deviation away.
@@ -738,15 +745,16 @@ mod tests {
 
     #[test]
     fn unknown_route_404_is_status_only() {
-        // 14 pins the status and nothing else for an unknown route; routes
-        // whose 404 text is pinned assert it themselves (CT-5).
+        // IB-1 pins only this status. RP-13 endpoint-level NOT_FOUND still
+        // owes the text diagnostic that IB-7 binds.
         let bare = WireHeaders::default();
+        assert_eq!(validate_unknown_route(404).unwrap(), Outcome::UnknownRoute);
+        assert!(validate_unknown_route(400).is_err());
+        assert!(validate_error(404, &bare, b"").is_err());
         assert_eq!(
-            validate_error(404, &bare, b"").unwrap(),
+            validate_error(404, &text_headers(), b"not found").unwrap(),
             ErrorClass::NotFound
         );
-        // 400 still owes a text diagnostic (IB-7).
-        assert!(validate_error(400, &bare, b"").is_err());
     }
 
     #[test]
@@ -818,6 +826,25 @@ mod tests {
 
         let err = validate_framing(&invalid, "gzip").unwrap_err();
         assert!(err.contains("frame 1 carries 2 records"), "{err}");
+    }
+
+    #[test]
+    fn framing_rejects_an_extra_blank_record() {
+        for (enc, frame) in [
+            ("zstd", zstd_frame as fn(&str) -> Vec<u8>),
+            ("gzip", gzip_member as fn(&str) -> Vec<u8>),
+        ] {
+            let body = frame("{\"n\":1}\n\n");
+            let err = validate_framing(&body, enc).unwrap_err();
+            assert!(err.contains("carries 2 records"), "{enc}: {err}");
+        }
+    }
+
+    #[test]
+    fn framing_rejects_identity_as_a_response_encoding() {
+        let body = gzip_member("{\"n\":1}\n");
+        let err = validate_framing(&body, "identity").unwrap_err();
+        assert!(err.contains("unexpected content-encoding"), "{err}");
     }
 
     #[test]

@@ -76,15 +76,22 @@ fn block_timestamp_cache() -> &'static Mutex<BlockTimestampCache> {
         .get_or_init(|| Mutex::new(BlockTimestampCache::new(1000, Duration::from_secs(30 * 60))))
 }
 
-pub fn record_block_ingestion(block_number: u64) {
-    let now_ms = SystemTime::now()
+/// Wall-clock milliseconds since the epoch.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64;
+        .as_millis() as u64
+}
+
+/// Record when `block_number` became queryable. The instant is the caller's:
+/// a batch publishes its observables only after committing, but each block
+/// still owns the moment it landed rather than the moment the batch ended.
+pub fn record_block_ingestion(block_number: u64, ingested_at_ms: u64) {
     block_timestamp_cache()
         .lock()
         .unwrap()
-        .set(&block_number.to_string(), now_ms);
+        .set(&block_number.to_string(), ingested_at_ms);
 }
 
 pub fn get_block_ingestion_timestamp(height: &str) -> Option<u64> {
@@ -227,11 +234,7 @@ impl Metrics {
         if value == 0 {
             self.last_block_lag_ms.set(-1.0);
         } else {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as f64;
-            self.last_block_lag_ms.set(now_ms - value as f64);
+            self.last_block_lag_ms.set(now_ms() as f64 - value as f64);
         }
     }
 
@@ -247,16 +250,15 @@ impl Metrics {
         self.finalized_block.set(value as f64);
     }
 
-    pub fn observe_block_lag(&self, block_timestamp_ms: u64) {
+    /// `observed_at_ms` is when the block became queryable, not when this is
+    /// called: deferring publication past a batch commit must not be charged
+    /// to the block as lag.
+    pub fn observe_block_lag(&self, block_timestamp_ms: u64, observed_at_ms: u64) {
         if block_timestamp_ms == 0 {
             return;
         }
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as f64;
         self.block_lag_ms
-            .observe(now_ms - block_timestamp_ms as f64);
+            .observe(observed_at_ms as f64 - block_timestamp_ms as f64);
     }
 
     pub fn track_processing_time(&self, start: Instant) {

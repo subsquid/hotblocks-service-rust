@@ -1,6 +1,6 @@
 # 13 — Conformance & TDD program
 
-**Mutable doc #1.** Statuses dated **2026-08-03**, derived from the actual test
+**Mutable doc #1.** Statuses dated **2026-08-05**, derived from the actual test
 inventory of the current implementation (not aspiration).
 
 ## Harness architecture
@@ -40,7 +40,12 @@ state: B: list<Block>, f: int (1-based), base: Ref, stalled: int,
        fin_max: Ref|⊥    # WP-12 running maximum for the session — the only
                          # finality obligation held (ADR-16)
 
-init(fh_block):            B ← [fh_block]; f ← 1; base ← ref(fh_block); stalled ← 0
+init(fh_block):            require P_CACHE_SIZE ≥ 1       else configuration_error
+                           require hash(fh_block) ≠ "" and parentHash(fh_block) ≠ ""
+                           require hash(fh_block), parentHash(fh_block) HTTP-field-safe
+                           require parentNumber(fh_block) ≤ number(fh_block)
+                                                            else source_error  # DEF-2/4
+                           B ← [fh_block]; f ← 1; base ← ref(fh_block); stalled ← 0
                            new_session()
 
 new_session():             fin_max ← ⊥      # WP-12 is per session; T6 rebase stays
@@ -52,6 +57,12 @@ apply_batch(blocks, finrep):
                                         # checked before any mutation, so a malformed
                                         # batch cannot half-apply (WP-11.5 owes the
                                         # split at every discontinuity)
+  require ∀x ∈ blocks: hash(x) ≠ "" ∧ parentHash(x) ≠ ""   else session_error  # DEF-2:
+                                        # linkage cannot catch it — an empty hash links
+                                        # to an empty parent hash
+  require ∀x ∈ blocks: hash(x), parentHash(x) HTTP-field-safe  else session_error
+  require finrep = ⊥ ∨ hash(finrep) ≠ ""       else session_error              # DEF-2
+  require finrep = ⊥ ∨ hash(finrep) HTTP-field-safe  else session_error            # IB-4
   checkpoint ← (B, f, fin_max)           # WP-5: a violating batch is rejected whole
   for x in blocks:
     if ∃ b ∈ B: b.number = x.number ∧ b.hash = x.hash ∧ parentRef(b) = parentRef(x):
@@ -77,6 +88,7 @@ apply_batch(blocks, finrep):
   base ← ref(last(B))
 
 note_report(r):
+  if r.number < finalized(B).number: return       # stale across session reset (WP-12)
   if fin_max ≠ ⊥ and r.number = fin_max.number and r.hash ≠ fin_max.hash:
      integrity_violation                # equal-height contradiction
   if fin_max = ⊥ or r.number > fin_max.number:
@@ -89,6 +101,7 @@ settle_report():
      else: f ← len(B)                   # WP-23 provisional, revalidated on arrival
 
 finalize(r):
+  if r.number < finalized(B).number: return                              # WP-12
   if r.number < B[1].number: return
   if r.number > last(B).number: f ← len(B); return                        # WP-23
   i ← index with B[i].number = r.number
@@ -164,16 +177,17 @@ service (PF-1).
 
 ## Structural validators (kind-agnostic, every response)
 
-decodable per negotiated encoding → **one frame per record**, each frame decoded on
-its own and every frame boundary re-decoded as a prefix (REQ-6/IB-2: whole-stream
-decoding cannot tell N frames from one frame holding N records, so it is not evidence
-of framing) → records self-delimiting → ascending → pairwise
+decodable per negotiated encoding → **one frame per record**, with raw frame/member
+boundaries enumerated once and each unit decoded independently (REQ-6/IB-2: this makes
+every prefix ending at an enumerated boundary independently decodable in linear work;
+whole-stream decoding cannot tell N frames from one frame holding N records) → records
+self-delimiting → each block satisfies DEF-2/4 → ascending → pairwise
 linked → coverage starts at the lowest response-eligible height ≥ the requested one
 and never below it (DEF-30) → records follow the snapshot's branch → no
 duplicates → watermark metadata parses and finalized ≤ head → conflict bodies
-non-empty/ascending → error bodies match the RP-13 taxonomy shape → outcomes outside
-that taxonomy (405 wrong method, 503 readiness — IB-1 and 14's operation table) match
-their binding → empty form carries watermarks.
+non-empty/ascending → endpoint error bodies match the RP-13 taxonomy shape → outcomes
+outside that taxonomy (unknown-route 404, 405 wrong method, 503 readiness — IB-1 and
+14's operation table) match their route-aware binding → empty form carries watermarks.
 
 "Response-eligible" is decided by the **eligible chain** — for a window-underflow
 query the backfill prefix RP-8 owes, spliced onto the snapshot; otherwise the snapshot
@@ -184,7 +198,7 @@ Every record inside the eligible range is matched on hash *and* parentRef — th
 record has no predecessor for pairwise linkage to check, so a forged parent there is
 otherwise invisible.
 
-## Traceability matrix (2026-08-03)
+## Traceability matrix (2026-08-05)
 
 Status: **C** covered (black-box, automated) / **P** partial / **U** unchecked.
 `!` = known-violated today (see gap register). Current inventory: unit tests on the
@@ -193,8 +207,9 @@ fork-recovery scenario, backfill-error 500, shutdown; acquisition retry + finali
 no-stall timing tests; payload golden fixtures (one network); upstream-client retry
 classification and socket-transport suites. The Phase-0 harness (`crates/harness`)
 adds an executable reference model, a seeded adapter-level simulator with a
-linkage-tuple provenance ledger, a validator library, and the CT-1 smoke run. No
-fault matrix, no differential runner, no benchmarks yet.
+linkage-tuple provenance ledger, a validator library, the CT-1 smoke run, and a set of
+CT-1/CT-4 SUT-vs-model differentials over hand-written pathological histories. No fault
+matrix, no generated differential corpus, no benchmarks yet.
 
 | Property | CT | Status | Note |
 |---|---|---|---|
@@ -202,8 +217,8 @@ fault matrix, no differential runner, no benchmarks yet.
 | INV-4 | CT-7 | U ! | GAP-2: violated during catch-up; no soak exists |
 | INV-5 | CT-1 | P | the reference model consumes no clock; no replay-speed differential yet |
 | INV-10 | CT-3 | U | |
-| INV-11 | CT-1/4 | P | unit tests incl. rejection cases; no adapter-driven corpus |
-| INV-12 | CT-2/4 | U ! | GAP-7: arbitration missing; regression corpus absent; the epoch-boundary contradiction check (ADR-14) landed 2026-08-02 with a lifecycle test — full CT-2 exercise absent |
+| INV-11 | CT-1/4 | P | unit tests incl. rejection cases; a sub-finality write is reported, not fatal, and a redelivery is absorbed before the guard; no adapter-driven corpus |
+| INV-12 | CT-2/4 | P | production and model retain the per-session maximum across fork rebase; a lifecycle regression covers a lower contradictory report and later settlement without a fresh report; the epoch-boundary contradiction check (ADR-14) has lifecycle coverage — full CT-2 exercise and the remaining CT-4 corpus are absent |
 | INV-13 | CT-1/4 | P | unit-level only |
 | INV-14 | CT-1 | U | no ledger reconciliation |
 | INV-15 | CT-3 | U | |
@@ -223,7 +238,7 @@ fault matrix, no differential runner, no benchmarks yet.
 | INV-35 | CT-8 | U | |
 | INV-36 | CT-5 | U ! | GAP-8, GAP-20: inert options accepted |
 | INV-40 | CT-2 | U | |
-| INV-41 | CT-2/4 | U ! | GAP-1: integrity input still panics instead of reaching the ladder; the production supervisor now drains and exits non-zero rather than reporting a clean stop or remaining a zombie (lifecycle tests, 2026-08-02) |
+| INV-41 | CT-2/4 | P | no input content ends the process: buffer and finality violations are reported and their batch rolled back, with SUT-vs-model differentials over a contradicted parent link, a contradicted finality report, and a redelivery; the supervisor still drains and exits non-zero on a vanished writer (FM-32). Kill-point matrix absent |
 | LIV-1 | CT-6 | P | finality-decoupling timing test only |
 | LIV-2 | CT-4/7 | U ! | GAP-4: alarms are log-only; the silent terminal stop itself is closed (non-zero exit, 2026-08-02) |
 | LIV-3 | CT-3/8 | U ! | GAP-31: unbounded internal waits bypass the budget |
@@ -253,16 +268,17 @@ fault matrix, no differential runner, no benchmarks yet.
 
 Priorities: P0 active production risk · P1 correctness hole with plausible trigger ·
 P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry point.
+Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-7, GAP-29, GAP-33, GAP-35, GAP-36.
 
 | GAP | Statement | Violates | Prio | First test |
 |---|---|---|---|---|
-| GAP-1 | An integrity violation in the buffer (hash mismatch, gap, sub-finality write, contradictory finality, descending height) raises a process-internal panic while a shared lock is held. The production supervisor now treats the vanished writer as FM-32, drains, and exits non-zero, but upstream input can still terminate the process instead of leaving the buffer intact and entering the session ladder | INV-41, WP-5, FM-1, FM-32, REQ-22 | P0 | CT-4: adapter emits a batch whose parent hash mismatches the buffered tip at a buffered height; assert the batch is rejected, the session restarts (OB-7 event), and `/head` still answers |
+| GAP-1 | **Retired 2026-08-04.** Buffer and finality violations are reported instead of asserted: the batch rolls back whole and the session re-enters the ladder, so no input content ends the process | — | retired | — |
 | GAP-2 | During catch-up on the head stream, acquisition outruns finality tracking (range acquisition is bounded by the *latest* head and carries no finality reports, and the confirmation prober is rate-bound), so eviction is starved and the buffer grows past the window without bound (HZ-3 realized); only a log line reports it | INV-4, LIV-7, PF-1, INV-31 | P0 | CT-7: simulator with head far ahead and finality advancing normally; assert window excess stays ≤ bound or OB-6 level active *and* finality gauge tracks upstream within `P-SLO-FINALITY-LAG` |
 | GAP-3 | On the execution-trace and state-diff acquisition paths, upstream errors, null results, wrong-block results, and unparsable payloads are converted to empty components and served, instead of marking the block incoherent and retrying | INV-28, REQ-9, WP-11.3 | P0 | CT-4: fault-injecting upstream returns an error for the trace call of one block; assert the block is retried/alarmed, never served with an empty component |
 | GAP-4 | Alarms are log-only: no OB-7 (or OB-6) condition is visible on the scrape surface as a level or counter. The terminal-divergence exit path landed 2026-08-02 (rebase below finality and divergent re-seed end the run, drain within `P-SHUTDOWN-GRACE`, and exit non-zero per ADR-12), but an orchestrator still cannot distinguish alarm states before the exit | INV-31, OB-6, OB-7, LIV-2 | P2 | CT-4: induce each alarm condition (stall, over-window, integrity violation, terminal); scrape must show a level/counter change |
 | GAP-5 | A fork signal with an empty ref list rebases to the current head and immediately reopens the stream: a malformed adapter can hot-spin the loop forever with no backoff or alarm | WP-10, LIV-8, FM-13 | P1 | CT-4: adapter emits empty-`prev` fork signal; assert session-error handling (ladder), not spin |
 | GAP-6 | A window-underflow query whose upstream acquisition yields nothing returns a conflict with an **empty** ref list — a response that crashes the reference client and violates the conflict contract | INV-22, INV-27, RP-7 | P1 | CT-5: backfill against an empty simulator range; assert INTERNAL, never CONFLICT with empty refs |
-| GAP-7 | The per-session running-maximum arbitration of finality reports is documented but not implemented: a regressive report reaches the buffer and, if it names a mismatching hash, triggers the GAP-1 path | WP-12, INV-12 | P1 | CT-4: regressive-then-contradictory finality corpus; assert masked/ignored per WP-12 |
+| GAP-7 | **Retired 2026-08-04.** The per-session finality maximum is retained across fork rebase; lower reports are ignored and an above-head obligation settles when its block arrives | — | retired | — |
 | GAP-8 | Three verification switches (sender recovery, transaction commitment, withdrawal commitment) are accepted and silently do nothing | INV-36, REQ-14, REQ-32 | P1 | CT-5: forged-field corpus per switch; assert rejection when on — fails today |
 | GAP-9 | Two implemented verification checks lack the per-network exemptions (system/state-sync transactions) the baseline defines, producing false failures on those networks when enabled | REQ-14, REQ-15 | P2 | CT-4: quirk-network fixture with verification on; assert acceptance |
 | GAP-10 | Upstream error-classification hooks are dropped for single-call batches — precisely the head path — so not-ready/absent-block conditions lose their mapping and surface as raw errors | REQ-16, FM-23, FM-25 | P1 | CT-4: single-block acquisition against a "not ready" upstream response; assert classified retry, not session error |
@@ -277,19 +293,20 @@ P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry p
 | GAP-19 | Oversized request bodies return the generic invalid-request status instead of the payload-too-large status the predecessor uses | REQ-24, IB | P3 (OQ-4) | CT-5: oversized body; assert status per 14 |
 | GAP-20 | The upstream batch-size cap option is accepted but bypassed by the dominant call path | INV-36, REQ-16 | P2 | CT-5: metered upstream; assert max observed batch ≤ configured cap |
 | GAP-21 | The upstream rate limiter admits concurrent callers past the budget (check-then-act race) | REQ-16, HZ-7 | P2 | CT-8: concurrent acquisition against a metered upstream; assert rate ≤ limit + tolerance |
-| GAP-22 | Response-path defects (continuity check failure, unencodable header value) surface as panics inside the streaming task: silent truncation with no server-side alarm | INV-27, INV-31, FM-32 | P2 | CT-4: adapter violates backfill continuity mid-response; assert truncation **and** OB-7 event |
+| GAP-22 | A backfill continuity-check failure surfaces as a panic inside the streaming task: silent truncation with no server-side alarm | INV-27, INV-31, FM-32 | P2 | CT-4: adapter violates backfill continuity mid-response; assert truncation **and** OB-7 event |
 | GAP-23 | Steady-state status logs are unthrottled (per-block head lines, per-batch over-window errors) — log flood regression against the predecessor's throttling | REQ-31, OB-8 | P3 | CT-7: S1 soak; assert log/block ratio |
 | GAP-24 | A worker gauge that can never move is exposed, and runtime/process default metrics are absent | INV-30, REQ-30 | P3 | CT-5: metrics-vs-ledger sweep |
 | GAP-25 | No upstream-interaction observability (request/error/retry counters, upstream head view) exists | OB-4, REQ-30 | P2 | CT-5: scrape after scripted upstream faults; assert counters moved |
 | GAP-26 | Upstream endpoint credentials (URL userinfo/keys) are not redacted from error text and logs | IB-13 (operational security) | P2 | CT-4: inject failing upstream with a credentialed URL; scan logs |
 | GAP-28 | Stream admission is unbounded: aggregate snapshot and response-buffer memory scales with client count, so the memory ceiling is not derivable from configuration | RP-23, PF-1, INV-35 | P2 | CT-8: connection flood against a small window; assert refusals beyond `P-MAX-CONCURRENT-STREAMS` and a bounded footprint |
-| GAP-29 | Re-delivery of an already-buffered block is treated as a reorganization: the newer suffix above it is truncated (readers observe head regression and refetch), and a duplicate at or below the finalized head trips the integrity path — which with GAP-1 bricks the process. The reference model shared the defect (now fixed there), so SUT-vs-model comparison hid it | WP-6, INV-11, INV-14 | P1 | CT-1: generated history with duplicate redelivery; SUT-vs-model diff |
+| GAP-29 | **Retired 2026-08-04.** `push` absorbs a redelivery matching the buffered block on the full linkage tuple, decided before the DEF-4 height check | — | retired | — |
 | GAP-30 | The post-wait re-resolution is not dispatched through full range resolution: a height evicted during the wait yields the empty form — without the mandatory watermark metadata — instead of a window-underflow response. The same watermark-less form also fires pre-wait: the below-window check and the query run under two separate lock acquisitions, so eviction racing admission hits it too | RP-3, RP-8, INV-24, IB-5 | P2 | CT-3: request just above head racing eviction across the wait (and across admission); assert backfill or a watermarked empty form |
 | GAP-31 | The response budget and disconnect reap are bypassed by unbounded internal waits: the first backfill batch is awaited without a deadline, and a stalled consumer blocks the producer indefinitely between budget checks | RP-20, RP-21, LIV-3, LIV-10 | P2 | CT-8: stalled upstream during a backfill request, and a stalled reader mid-stream; assert termination within `P-RESP-BUDGET` + `P-DISCONNECT-REAP` |
 | GAP-27 | No differential runner against the predecessor exists, though byte-compatibility (REQ-24) is the migration's acceptance criterion; the worst historical payload bug was found by a manual diff | REQ-24, HC-8 | P1 | build HC-8; run recorded-corpus diff in CI nightly |
 | GAP-34 | Readiness probes upstream on every request (`is_ready` calls `get_head`), so probe frequency is upstream load an orchestrator controls, drawn from the budget ingestion shares. RP-10/RP-22 describe the local-view comparison ADR-17 proposes; until that lands, the coupling RP-22 no longer mentions is still real | RP-10, RP-22, REQ-16 | P2 | CT-8: probe `/readiness` at 1 Hz under S1; assert upstream call count is independent of probe rate |
-| GAP-35 | Input batches are applied block by block with no DEF-20 shape check: a batch that is not ascending and pairwise linked half-applies (append then reorg) or trips a `push` assertion, which with GAP-1 ends the process. The reference model rejects such a batch whole before mutating, so SUT and model diverge the moment CT-1 generates one | DEF-20, WP-3, WP-5 | P2 | CT-1: deliver `[b3(parent=b1), b2(parent=b1)]` in one batch; assert whole-batch rejection and an intact buffer |
-| GAP-33 | A delivery whose ref matches a buffered block under a different parent link is applied as a reorganization: the buffered block's ancestry changes while its ref does not, so no client can detect the substitution (the base check compares later blocks' parent hashes, which still link). WP-6 requires an integrity violation; the reference model now raises one, the service does not | WP-6, DEF-8, INV-13 | P1 | CT-1: deliver `(n, h)` with a second parent link after `(n, h)` is buffered; assert integrity violation + session restart, not truncation |
+| GAP-35 | **Retired 2026-08-04.** Batches are judged on DEF-20 shape — non-empty, ascending, pairwise linked — before anything mutates, so a malformed one is rejected whole instead of half-applying or silently dropping its out-of-order blocks | — | retired | — |
+| GAP-36 | **Retired 2026-08-05.** Seed hashes, ordinary block and parent hashes, and finality-report hashes are checked for HTTP field-value safety before any chain mutation, so no committed finality hash can panic `/stream` header construction | — | retired | — |
+| GAP-33 | **Retired 2026-08-04.** A ref that already names a buffered block, delivered under a second ancestry, is reported as an integrity violation instead of applied as a reorg | — | retired | — |
 | GAP-32 | Enabled verification-check failures (DEF-25: receipts root, logs bloom) and the log-index/cumulative-gas coherence checks bypass WP-11.2's bounded per-block retry on the head path: they surface as an immediate session error the ladder retries forever, instead of bounded per-block retry then fail-loud | WP-11.2, WP-11.3, LIV-2 | P2 | CT-4: enable a verification switch against an upstream serving one persistently forged block; assert `P-ENRICH-RETRIES` bounded retries then an alarmed session error, not an unbounded restart loop |
 
 ## Build order
@@ -307,10 +324,10 @@ P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry p
    simulator + HC-2 ledger + HC-5 reference model + HC-6 validators; wire CT-1 smoke
    (happy-path history) and the spec checker (MG-7). *Exit met:* CT-1 green on the
    happy path; INV-23 flipped U→P; INV-1..3, 20, 22, 24, 25 strengthened.
-2. **Phase 1 — P0 gaps**: failing tests for GAP-1, GAP-2, GAP-3 (in that order), then
-   fixes. *Exit:* the three P0 rows flip to C; register updated.
+2. **Phase 1 — P0 gaps**: failing tests for GAP-2 and GAP-3, then fixes. *Exit:* both
+   P0 rows flip to C; register updated.
 3. **Phase 2 — correctness core**: full CT-1 generation (reorg/finality/duplicate
-   histories), CT-2 kill-point matrix, CT-4 integrity corpus (GAP-5/6/7/11), CT-5
+   histories), CT-2 kill-point matrix, CT-4 integrity corpus (GAP-5/6/11), CT-5
    golden + config-honesty (GAP-8), HC-8 differential (GAP-27, GAP-13). *Exit:* all
    INV rows ≥ P, INV-11/12/13/22/27/28 = C.
 4. **Phase 3 — robustness**: CT-4 upstream-fault matrix (GAP-10/12/14/15), CT-9 fuzz
@@ -357,10 +374,10 @@ the executed-test-count ratchet; the latter remains part of HC-11.
 |---|---|---|---|---|
 | HC-1 | Scripted input simulator (adapter-level and upstream-level), deterministic, seedable | CT-1..4, 7 | P | adapter-level built in `crates/harness` (seeded, ledger-backed); upstream-level still ad hoc in timing tests |
 | HC-2 | Provenance ledger + comparator | CT-1, 4, 5; INV-14/25/30 | P | events retain each delivered `(number, hash, parentNumber, parentHash)` tuple, including same-ref parent equivocation; one-session model replay + byte-fidelity comparator in `crates/harness`; replay skips read-path backfill deliveries; fork/re-INIT event tagging and metrics-vs-ledger remain pending |
-| HC-3 | Fault-injecting upstream stub (per-method, per-component: error, null, wrong-block, malformed, delay, equivocate) | CT-4, CT-9 | P | method-routed mock upstream exists in two timing tests; no fault matrix |
+| HC-3 | Fault-injecting upstream stub (per-method, per-component: error, null, wrong-block, malformed, delay, equivocate) | CT-4, CT-9 | P | method-routed mock upstream exists in two timing tests; a scripted source (`harness::script`) replays hand-written pathological histories through SUT and model; no fault matrix |
 | HC-4 | Recorded-corpus replay (real upstream captures) | CT-5 | C | cassette + golden fixtures wired in CI (one network) |
 | HC-5 | Executable reference model (this doc's pseudocode) | CT-1..3 | P | core transitions + query verdicts in `crates/harness`; backfill/wait paths not yet modeled |
-| HC-6 | Structural validators as a library | every CT | P | reusable core in `crates/harness`: decode, per-frame splitting with prefix re-decode (REQ-6), full DEF-5 linkage, snapshot-judged coverage start + branch, conflict shape and `P-FORK-REFS-MAX` bound, mandatory body content types, IB-2 DATA negotiation (`Content-Encoding` + `Vary`), RP-13 taxonomy, and watermark rules; the full route-by-route IB sweep remains CT-5 work |
+| HC-6 | Structural validators as a library | every CT | P | reusable core in `crates/harness`: linear independent zstd-frame/gzip-member splitting (REQ-6), DEF-2/4/5 block shape and linkage, snapshot-judged coverage start + branch, conflict shape and `P-FORK-REFS-MAX` bound, mandatory endpoint body content types, route-aware unknown-route 404, IB-2 DATA negotiation (`Content-Encoding` + `Vary`), RP-13 taxonomy, and watermark rules; the full route-by-route IB sweep remains CT-5 work |
 | HC-7 | Client driver: poll loop, RP-7 recovery, fuzzer, disconnector | CT-1..3, 8, 9 | U | |
 | HC-8 | Differential runner vs predecessor implementation | CT-5, REQ-24, GAP-27 | U | acceptance criterion of the migration; absent |
 | HC-9 | Load/swarm driver (S3..S6) | CT-3, 8 | U | |

@@ -76,7 +76,8 @@ impl Ledger {
             seed.finalized_stream && seed.blocks.len() == 1,
             "first delivery must be the one-block T1 seed"
         );
-        let mut model = RefModel::init(seed.blocks[0].clone(), cache_size, auto_adjust);
+        let mut model = RefModel::init(seed.blocks[0].clone(), cache_size, auto_adjust)
+            .expect("ledger seed and replay cache size are valid");
         for (i, ev) in events.enumerate() {
             if ev.finalized_stream {
                 continue;
@@ -470,7 +471,7 @@ mod tests {
         let delivered: Vec<ModelBlock> = lg.events.iter().flat_map(|e| e.blocks.clone()).collect();
         assert!(delivered.contains(&two) && delivered.contains(&forged_two));
 
-        let mut model = RefModel::init(root, 100, false);
+        let mut model = RefModel::init(root, 100, false).unwrap();
         assert_eq!(model.apply_batch(&[one, two], None), ApplyOutcome::Applied);
         assert_eq!(
             model.apply_batch(&[forged_two], None),

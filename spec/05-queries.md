@@ -153,7 +153,7 @@ alarmed server-side, OB-7).
 | INVALID_REQUEST | RP-2 violation | no (fix the request) |
 | CONFLICT | base check failure (RP-11) | yes, via RP-7 recovery |
 | EMPTY | RP-12 empty result | yes (poll) |
-| NOT_FOUND | unknown metric / unknown ingest-time height / unknown route | no |
+| NOT_FOUND | unknown metric / unknown ingest-time height | no |
 | INTERNAL | acquisition or service failure before first record | yes (backoff) |
 
 No other terminal outcome exists; in particular a data payload is never accompanied by

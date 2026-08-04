@@ -209,25 +209,25 @@ async fn ct1_happy_path_matches_reference_model() {
     let text = v::decode_body(&resp.body, "zstd").unwrap();
     assert_eq!(framed.concat(), text);
     let gz = client.stream(0, None, "identity").await.unwrap();
-    assert_eq!(gz.content_encoding.as_deref(), Some("gzip"));
-    assert_eq!(
-        v::validate_framing(&gz.body, "gzip").unwrap().len(),
-        framed.len()
-    );
+    let gz_wm = v::validate_data_headers(&stream_headers(&gz), "identity").unwrap();
+    assert_eq!(gz_wm, wm);
+    let gz_framed = v::validate_framing(&gz.body, "gzip").unwrap();
+    let gz_text = v::decode_body(&gz.body, "gzip").unwrap();
+    assert_eq!(gz_framed.concat(), gz_text);
+    assert_eq!(gz_framed, framed, "REQ-6: backfill frame boundaries differ");
+    assert_eq!(gz_text, text, "INV-25: backfill encodings differ");
     let eligible: Vec<_> = (0..CHAIN_LEN).map(|n| sim.header(n)).collect();
-    let records = {
+    let (records, gz_records) = {
         let lg = ledger.lock().unwrap();
-        v::validate_data(
-            &text,
-            0,
-            v::sim_extract,
-            &v::DataOracle {
-                ledger: Some(&lg),
-                eligible: Some(&eligible),
-            },
-        )
-        .unwrap()
+        let oracle = v::DataOracle {
+            ledger: Some(&lg),
+            eligible: Some(&eligible),
+        };
+        let records = v::validate_data(&text, 0, v::sim_extract, &oracle).unwrap();
+        let gz_records = v::validate_data(&gz_text, 0, v::sim_extract, &oracle).unwrap();
+        (records, gz_records)
     };
+    assert_eq!(gz_records, records);
     assert_eq!(records[0].number, 0);
 
     // The ledger now also holds the read-path backfill deliveries of the
@@ -250,6 +250,30 @@ async fn ct1_happy_path_matches_reference_model() {
         v::Outcome::MethodNotAllowed
     );
     assert!(v::validate_error(r.status, &rh, &r.body).is_err());
+
+    // Unknown routes are a separate transport outcome: only 404 is bound,
+    // while endpoint-level NOT_FOUND continues to require IB-7's text body.
+    let r = client.get_raw("/unknown-route").await.unwrap();
+    assert_eq!(
+        v::validate_unknown_route(r.status).unwrap(),
+        v::Outcome::UnknownRoute
+    );
+
+    // The other half of the split, driven against the service rather than
+    // asserted in isolation: an unknown ingest-time height is RP-13's
+    // NOT_FOUND and owes the diagnostic IB-7 binds.
+    for path in ["/block-time/999999999", "/metrics/no-such-metric"] {
+        let r = client.get_raw(path).await.unwrap();
+        let rh = v::WireHeaders {
+            content_type: r.content_type.as_deref(),
+            ..v::WireHeaders::default()
+        };
+        assert_eq!(
+            v::validate_error(r.status, &rh, &r.body).unwrap(),
+            v::ErrorClass::NotFound,
+            "{path}"
+        );
+    }
 
     // Readiness carries the exact text the binding pins (14 §operations).
     let r = client.get_raw("/readiness").await.unwrap();

@@ -90,7 +90,8 @@ that buffer's extent the comparison has no state to run against and is not claim
 *Why:* a regressing or forged finality watermark breaks INV-11's meaning; scoping it
 to the epoch keeps the guarantee honest instead of promising what a re-seed from an
 oscillating upstream cannot deliver.
-*Check:* CT-4 — regressive/contradictory finality corpus (GAP-7 first test); CT-2 —
+*Check:* adapter lifecycle regression for the retained maximum across a fork rebase and
+a lower contradictory report; CT-4 — remaining contradictory-finality corpus; CT-2 —
 re-INIT against an upstream whose finalized head oscillates, asserting the alarm and
 the terminal path on contradiction.
 
@@ -257,12 +258,11 @@ compare against fresh reference model.
 No reachable input, timing, or internal error leaves the process running but
 permanently unable to ingest or serve (a "bricked" state). Every failure path ends in:
 recovery (ladder/T1), or explicit process exit (FM-30/FM-31). Applies to every shared
-internal structure: a failure while holding one must not poison it for all future work
-(GAP-1).
+internal structure: a failure while holding one must not poison it for all future work.
 *Why:* a process that answers liveness probes while dead inside defeats every
 orchestrator; this is the single worst divergence found in the current implementation.
 *Check:* CT-2 + CT-4 — inject integrity violations and panics mid-transition; assert
-either full recovery or exit, never zombie (GAP-1 first test).
+either full recovery or exit, never zombie.
 
 Each entry's *Check:* line names the test classes that decide it; 13's traceability
 matrix is the single record of what those classes cover today.

@@ -1,7 +1,7 @@
 //! DataService ingestion loop — exact port of `data-service.ts`.
 
-use crate::chain::Chain;
-use crate::metrics::{record_block_ingestion, Metrics};
+use crate::chain::{is_chain, Chain, Push};
+use crate::metrics::{now_ms, record_block_ingestion, Metrics};
 use crate::source::{BlockBatch, DataSource, StreamError, StreamRequest};
 use crate::types::{Block, BlockHeader, BlockRef, DataResponse, InvalidBaseBlock, QueryError};
 use anyhow::Context;
@@ -48,6 +48,92 @@ impl std::fmt::Display for DivergentReseed {
 }
 
 impl std::error::Error for DivergentReseed {}
+
+/// Whether `value` can be passed to `HeaderValue::from_str` without error.
+/// This is the allocation-free HTTP field-value byte check: HTAB and bytes
+/// from SP upwards are allowed, except DEL.
+fn is_header_safe_hash(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
+}
+
+/// A block a batch actually inserted, and when it became queryable. Absorbed
+/// duplicates are absent: WP-6 makes them strict no-ops, observables included.
+struct Ingested {
+    /// Position in the batch, not the height: unique by construction, so it
+    /// does not lean on DEF-20 to tell two entries apart.
+    index: usize,
+    at_ms: u64,
+}
+
+/// Validate everything decidable from an input batch alone. This runs before
+/// opening a chain batch so malformed source data cannot touch chain state.
+fn validate_ingest_batch(batch: &BlockBatch) -> Result<(), StreamError> {
+    if batch.blocks.is_empty() {
+        return Err(StreamError::Other(anyhow::anyhow!(
+            "DEF-20: empty input batch"
+        )));
+    }
+
+    // Validate hashes before any error path interpolates them into a message.
+    for block in &batch.blocks {
+        if block.hash.is_empty() {
+            return Err(StreamError::Other(anyhow::anyhow!(
+                "DEF-2: block hash at height {} is empty",
+                block.number
+            )));
+        }
+        if block.parent_hash.is_empty() {
+            return Err(StreamError::Other(anyhow::anyhow!(
+                "DEF-2: parent hash of block at height {} is empty",
+                block.number
+            )));
+        }
+        if !is_header_safe_hash(&block.hash) {
+            return Err(StreamError::Other(anyhow::anyhow!(
+                "DEF-2: block hash at height {} is not safe for an HTTP header value",
+                block.number
+            )));
+        }
+        if !is_header_safe_hash(&block.parent_hash) {
+            return Err(StreamError::Other(anyhow::anyhow!(
+                "DEF-2: parent hash of block at height {} is not safe for an HTTP header value",
+                block.number
+            )));
+        }
+    }
+    if let Some(report) = batch.finalized_head.as_ref() {
+        if report.hash.is_empty() {
+            return Err(StreamError::Other(anyhow::anyhow!(
+                "DEF-2: finality report at height {} carries an empty hash",
+                report.number
+            )));
+        }
+        if !is_header_safe_hash(&report.hash) {
+            return Err(StreamError::Other(anyhow::anyhow!(
+                "DEF-2: finality report at height {} is not safe for an HTTP header value",
+                report.number
+            )));
+        }
+    }
+
+    // DEF-20: the adapter owes ascending, pairwise-linked batches, splitting
+    // at every discontinuity (WP-11.5).
+    for pair in batch.blocks.windows(2) {
+        if pair[1].number <= pair[0].number || !is_chain(&pair[0], &pair[1]) {
+            return Err(StreamError::Other(anyhow::anyhow!(
+                "DEF-20: batch is not ascending and pairwise linked at {}#{} → {}#{}",
+                pair[0].number,
+                pair[0].hash,
+                pair[1].number,
+                pair[1].hash
+            )));
+        }
+    }
+
+    Ok(())
+}
 
 /// How the ingestion run ended. Anything but `Stopped` requires action from
 /// the binary: exit non-zero per IB-11 (FM-31 startup failure, FM-30
@@ -242,11 +328,20 @@ impl<S: DataSource> DataService<S> {
     /// Initialise: fetch finalized head, seed chain with that one block.
     /// Mirrors `DataService.init()` in data-service.ts.
     pub async fn init(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.buffer_size > 0,
+            "P-CACHE-SIZE must be a positive integer"
+        );
         let head = self
             .source
             .get_finalized_head()
             .await
             .context("failed to get finalized head during init")?;
+        anyhow::ensure!(!head.hash.is_empty(), "DEF-2: finalized head hash is empty");
+        anyhow::ensure!(
+            is_header_safe_hash(&head.hash),
+            "DEF-2: finalized head hash is not safe for an HTTP header value"
+        );
 
         let mut stream = self.source.get_finalized_stream(StreamRequest {
             from: head.number,
@@ -265,7 +360,14 @@ impl<S: DataSource> DataService<S> {
             head.number,
             batch.blocks.len()
         );
+        validate_ingest_batch(&batch)?;
         let seed = batch.blocks.into_iter().next().unwrap();
+        anyhow::ensure!(
+            seed.parent_number <= seed.number,
+            "DEF-4: seed block {} claims parent height {} above itself",
+            seed.number,
+            seed.parent_number
+        );
         // WP-20: the two calls may hit different nodes of a fleet, so the
         // delivered block is the seed only if it is the one that was named.
         anyhow::ensure!(
@@ -331,6 +433,10 @@ impl<S: DataSource> DataService<S> {
         let mut base: BlockRef = self.get_chain_ref(|c| c.get_header().block_ref());
         let mut stacked = 0i32;
         let mut first_block_ingested = false;
+        // A fork rebase stays in the same logical session (WP-12/T6), so the
+        // maximum outlives one concrete get_stream call. Other stream endings
+        // tear the session down and reset it below.
+        let mut finalized_max: Option<BlockRef> = None;
 
         loop {
             if self.stop_requested() {
@@ -339,6 +445,7 @@ impl<S: DataSource> DataService<S> {
 
             let session_result = if stacked > 5 {
                 // Full re-init.
+                finalized_max = None;
                 match self.init().await {
                     // WP-20: a divergent seed is FM-30, not a retry.
                     Err(e) if e.is::<DivergentReseed>() => {
@@ -349,11 +456,13 @@ impl<S: DataSource> DataService<S> {
                     Ok(()) => {
                         base = self.get_chain_ref(|c| c.get_header().block_ref());
                         info!(block = base.number, hash = %base.hash, "restarted data ingestion");
-                        self.ingest_session(&base, &mut first_block_ingested).await
+                        self.ingest_session(&base, &mut first_block_ingested, &mut finalized_max)
+                            .await
                     }
                 }
             } else {
-                self.ingest_session(&base, &mut first_block_ingested).await
+                self.ingest_session(&base, &mut first_block_ingested, &mut finalized_max)
+                    .await
             };
 
             if self.stop_requested() {
@@ -362,6 +471,7 @@ impl<S: DataSource> DataService<S> {
 
             match session_result {
                 Ok(()) => {
+                    finalized_max = None;
                     // Stream ended normally (shouldn't happen for head streams).
                     if !first_block_ingested {
                         let _ = self.started_tx.send(Err(()));
@@ -387,6 +497,8 @@ impl<S: DataSource> DataService<S> {
                     }
                 }
                 Err(StreamError::Fork { previous_blocks }) => {
+                    // T6 rebase: retain finalized_max for the replacement
+                    // stream; its obligation still applies to this session.
                     stacked = 0;
                     let fork_base = self.get_chain_ref(|c| c.get_fork_base(&previous_blocks));
                     match fork_base {
@@ -421,6 +533,7 @@ impl<S: DataSource> DataService<S> {
                     }
                 }
                 Err(StreamError::Other(err)) => {
+                    finalized_max = None;
                     if !first_block_ingested {
                         let _ = self.started_tx.send(Err(()));
                         error!(%err, "data ingestion terminated before first block");
@@ -450,6 +563,7 @@ impl<S: DataSource> DataService<S> {
         &self,
         base: &BlockRef,
         first_block_ingested: &mut bool,
+        finalized_max: &mut Option<BlockRef>,
     ) -> Result<(), StreamError> {
         let mut stream = self.source.get_stream(StreamRequest {
             // WP-14: at the coordinate ceiling there is no next block to ask for.
@@ -475,6 +589,7 @@ impl<S: DataSource> DataService<S> {
                 return Ok(());
             }
 
+            validate_ingest_batch(&batch)?;
             let start = Instant::now();
 
             // Hold the write lock only while processing this batch.
@@ -482,72 +597,44 @@ impl<S: DataSource> DataService<S> {
                 let mut guard = self.chain_write();
                 let chain = guard.as_mut().expect("chain not initialized");
 
-                // Track the highest finalized head seen across batches.
-                let batch_finalized = batch.finalized_head.clone();
-
-                for block in &batch.blocks {
-                    tracing::debug!(
-                        stage = "batch-received-main",
-                        block_number = block.number,
-                        block_hash = %block.hash,
-                        "batch block received on main thread {}#{}", block.number, block.hash
-                    );
-                    record_block_ingestion(block.number);
-                    let insert_start = Instant::now();
-                    chain.push(block.clone());
-                    let insert_elapsed = insert_start.elapsed();
-                    tracing::debug!(
-                        stage = "block-queryable",
-                        block_number = block.number,
-                        block_hash = %block.hash,
-                        "block available for query {}#{}", block.number, block.hash
-                    );
-                    if let Some(ts) = block.timestamp {
-                        self.metrics.observe_block_lag(ts);
+                // WP-5: the batch lands whole or not at all. A finality report
+                // the arriving blocks contradict is only decidable once they
+                // are in, so the buffer is restored rather than pre-checked.
+                chain.begin_batch();
+                let inserted_any = match self.apply_batch_locked(chain, &batch, finalized_max) {
+                    Ok(inserted) => {
+                        let inserted_any = !inserted.is_empty();
+                        chain.commit_batch();
+                        // Ingest-time observables are published only by a batch
+                        // that survived, each carrying the instant its own block
+                        // landed: a rolled-back block must not answer
+                        // `/block-time`, an absorbed duplicate must not rewrite
+                        // the time its block was first seen (WP-6), and no block
+                        // is charged for the batch it waited on.
+                        for Ingested { index, at_ms } in inserted {
+                            let block = &batch.blocks[index];
+                            record_block_ingestion(block.number, at_ms);
+                            if let Some(ts) = block.timestamp {
+                                self.metrics.observe_block_lag(ts, at_ms);
+                            }
+                        }
+                        inserted_any
                     }
-                    // Emit per-block pipeline timing log (speculative hot blocks only).
-                    if let Some(ref t) = block.timings {
-                        let compress_done = t.compress_done();
-                        let now = Instant::now();
-                        let enrich_ms =
-                            t.enrich_done.duration_since(t.body_received).as_secs_f64() * 1000.0;
-                        let normalize_ms =
-                            t.normalize_done.duration_since(t.enrich_done).as_secs_f64() * 1000.0;
-                        let compress_ms = t.compress_duration.as_secs_f64() * 1000.0;
-                        let queue_ms =
-                            insert_start.duration_since(compress_done).as_secs_f64() * 1000.0;
-                        let insert_ms = insert_elapsed.as_secs_f64() * 1000.0;
-                        let total_ms = now.duration_since(t.body_received).as_secs_f64() * 1000.0;
-                        tracing::info!(
-                            target: "block_timing",
-                            block_number = block.number,
-                            enrich_ms,
-                            normalize_ms,
-                            compress_ms,
-                            queue_ms,
-                            insert_ms,
-                            total_ms,
-                            "block_timing"
-                        );
+                    Err(e) => {
+                        chain.rollback_batch();
+                        return Err(e);
                     }
-                }
+                };
 
-                if !batch.blocks.is_empty() {
+                // At-least-once delivery admits a non-empty batch made only of
+                // absorbed redeliveries. It commits no new head and cannot
+                // complete startup (WP-6/WP-9).
+                if inserted_any {
                     let header = chain.get_header();
                     log_block_info(&header, "new head");
                     if !*first_block_ingested {
                         *first_block_ingested = true;
                         let _ = self.started_tx.send(Ok(()));
-                    }
-                }
-
-                // Apply finalized head (take the maximum seen so far).
-                // The TS code tracks `finalizedHead` across the whole session
-                // and only advances monotonically.
-                if let Some(fh) = &batch_finalized {
-                    if chain.finalize(fh) {
-                        let fh_header = chain.get_finalized_header();
-                        log_block_info(&fh_header, "new finalized head");
                     }
                 }
 
@@ -561,6 +648,118 @@ impl<S: DataSource> DataService<S> {
             self.metrics.track_processing_time(start);
         }
         Ok(())
+    }
+
+    /// Apply one batch and its finality report to an open batch scope. Every
+    /// error leaves the caller to roll back; nothing here is durable.
+    fn apply_batch_locked(
+        &self,
+        chain: &mut Chain,
+        batch: &BlockBatch,
+        finalized_max: &mut Option<BlockRef>,
+    ) -> Result<Vec<Ingested>, StreamError> {
+        let batch_finalized = batch.finalized_head.clone();
+        let mut inserted = Vec::new();
+
+        // Spec 13's `note_report`: the WP-12 staleness gate first, then the
+        // equal-height contradiction — decidable without applying the batch at
+        // all, so it costs nothing to reject it up front.
+        if let (Some(report), Some(current)) = (batch_finalized.as_ref(), finalized_max.as_ref()) {
+            if report.number >= chain.get_finalized_head().number
+                && report.number == current.number
+                && report.hash != current.hash
+            {
+                return Err(StreamError::Other(anyhow::anyhow!(
+                    "WP-12: conflicting finality reports at height {}: {} and {}",
+                    report.number,
+                    current.hash,
+                    report.hash
+                )));
+            }
+        }
+
+        for (index, block) in batch.blocks.iter().enumerate() {
+            tracing::debug!(
+                stage = "batch-received-main",
+                block_number = block.number,
+                block_hash = %block.hash,
+                "batch block received on main thread {}#{}", block.number, block.hash
+            );
+            let insert_start = Instant::now();
+            let outcome = chain.push(block.clone()).map_err(|e| {
+                StreamError::Other(
+                    anyhow::Error::new(e).context("WP-5: the batch contradicts the buffer"),
+                )
+            })?;
+            if outcome == Push::Inserted {
+                inserted.push(Ingested {
+                    index,
+                    at_ms: now_ms(),
+                });
+            }
+            let insert_elapsed = insert_start.elapsed();
+            tracing::debug!(
+                stage = "block-queryable",
+                block_number = block.number,
+                block_hash = %block.hash,
+                "block available for query {}#{}", block.number, block.hash
+            );
+            // Emit per-block pipeline timing log (speculative hot blocks only).
+            if let Some(ref t) = block.timings {
+                let compress_done = t.compress_done();
+                let now = Instant::now();
+                let enrich_ms =
+                    t.enrich_done.duration_since(t.body_received).as_secs_f64() * 1000.0;
+                let normalize_ms =
+                    t.normalize_done.duration_since(t.enrich_done).as_secs_f64() * 1000.0;
+                let compress_ms = t.compress_duration.as_secs_f64() * 1000.0;
+                let queue_ms = insert_start.duration_since(compress_done).as_secs_f64() * 1000.0;
+                let insert_ms = insert_elapsed.as_secs_f64() * 1000.0;
+                let total_ms = now.duration_since(t.body_received).as_secs_f64() * 1000.0;
+                tracing::info!(
+                    target: "block_timing",
+                    block_number = block.number,
+                    enrich_ms,
+                    normalize_ms,
+                    compress_ms,
+                    queue_ms,
+                    insert_ms,
+                    total_ms,
+                    "block_timing"
+                );
+            }
+        }
+
+        // First settle the previous batch's obligation against the blocks that
+        // just arrived. A later, higher report may replace it only after this
+        // check (spec 13's apply_batch ordering).
+        if let Some(fh) = finalized_max.as_ref() {
+            settle_obligation(chain, fh)?;
+        }
+
+        let mut raised_finalized_max = false;
+        if let Some(report) = batch_finalized {
+            let applied = chain.get_finalized_head();
+            if report.number >= applied.number
+                && finalized_max
+                    .as_ref()
+                    .is_none_or(|current| report.number > current.number)
+            {
+                *finalized_max = Some(report);
+                raised_finalized_max = true;
+            }
+        }
+
+        // Apply a newly raised maximum immediately. If it is above the head,
+        // Chain::finalize provisionally finalizes the whole buffer and this
+        // same obligation is checked on later batches.
+        if raised_finalized_max {
+            if let Some(fh) = finalized_max.as_ref() {
+                settle_obligation(chain, fh)?;
+            }
+        }
+
+        Ok(inserted)
     }
 
     /// Update metrics and notify block watchers.
@@ -763,6 +962,22 @@ impl<S: DataSource> DataService<S> {
             head: Some(head_stream),
             tail: Some(tail_arc),
         })
+    }
+}
+
+/// Discharge the session's WP-12 obligation against the current buffer. A
+/// contradiction ends the session (WP-5 ladder), leaving the buffer servable.
+fn settle_obligation(chain: &mut Chain, fh: &BlockRef) -> Result<(), StreamError> {
+    match chain.finalize(fh) {
+        Ok(true) => {
+            let fh_header = chain.get_finalized_header();
+            log_block_info(&fh_header, "new finalized head");
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(e) => Err(StreamError::Other(
+            anyhow::Error::new(e).context("WP-23: the finality obligation contradicts the buffer"),
+        )),
     }
 }
 

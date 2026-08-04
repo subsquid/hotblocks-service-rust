@@ -92,6 +92,48 @@ pub struct InvalidBaseBlock {
     pub prev: Vec<BlockRef>,
 }
 
+/// Input that contradicts the buffer it is applied to.
+///
+/// WP-5 handling: the caller rejects the batch whole, tears the session down
+/// and re-enters the ladder, leaving the buffer intact and readable. No input
+/// content may end the process (WP-14, INV-41).
+#[derive(Debug, thiserror::Error)]
+pub enum IntegrityViolation {
+    /// DEF-8/WP-6: one ref claiming two ancestries. Applied as a reorg it
+    /// would rewrite a buffered block's history while its ref stays put, and
+    /// no client can see it — the base check compares the parent hashes of
+    /// *later* blocks, and those still link.
+    #[error("block {number}#{hash} claims a second ancestry")]
+    RefEquivocation { number: u64, hash: String },
+    /// DEF-4: a parent at or above the block's own height would leave the
+    /// buffer unsorted and every bisect blind.
+    #[error("block {number} claims parent height {parent_number}, at or above itself")]
+    DescendingHeight { number: u64, parent_number: u64 },
+    /// The named parent height is not buffered — a gap, not a reorg.
+    #[error("block {number} names parent height {parent_number}, which is not buffered")]
+    ParentNotBuffered { number: u64, parent_number: u64 },
+    /// INV-11: a write at or below the finalized head.
+    #[error("block {number} would revert the finalized head")]
+    WriteBelowFinality { number: u64 },
+    /// DEF-5: the named parent is buffered under another hash.
+    #[error("block {number} names parent {claimed}, buffer holds {buffered}")]
+    ParentHashMismatch {
+        number: u64,
+        buffered: String,
+        claimed: String,
+    },
+    /// WP-23: finality named a height the buffer does not hold.
+    #[error("finality names unbuffered height {number}")]
+    UnbufferedFinality { number: u64 },
+    /// WP-23: the block that arrived at that height is not the one finalized.
+    #[error("finality at height {number} names {reported}, buffer holds {buffered}")]
+    FinalityHashMismatch {
+        number: u64,
+        buffered: String,
+        reported: String,
+    },
+}
+
 /// Error returned by `DataService::query`.
 ///
 /// Mirrors the TS `query` contract: a fork/invalid-base-block becomes an

@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,8 +83,8 @@ struct Args {
     http_retry_internal_server_errors: bool,
 
     /// Max number of blocks to buffer
-    #[arg(long, value_name = "number", default_value_t = 1000)]
-    block_cache_size: usize,
+    #[arg(long, value_name = "number", default_value = "1000")]
+    block_cache_size: NonZeroUsize,
 
     /// Port to listen on
     #[arg(short, long, value_name = "number", default_value_t = 3000)]
@@ -244,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut handle = run_data_service(DataServiceOptions {
         source,
-        block_cache_size: args.block_cache_size,
+        block_cache_size: args.block_cache_size.get(),
         port: args.port,
         auto_adjust_finalized_head: args.auto_adjust_finalized_head,
     })
@@ -326,6 +327,18 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn zero_block_cache_size_is_rejected_by_the_cli() {
+        let args = [
+            "evm-data-service",
+            "--http-rpc",
+            "http://localhost:8545",
+            "--block-cache-size",
+            "0",
+        ];
+        assert!(Args::try_parse_from(args).is_err());
+    }
 
     #[tokio::test]
     async fn vanished_ingestion_task_is_a_failure() {
