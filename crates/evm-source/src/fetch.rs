@@ -25,6 +25,9 @@ type Component<T> = std::result::Result<T, String>;
 #[derive(Debug, Clone, Default)]
 pub struct RpcOptions {
     pub finality_confirmation: Option<u64>,
+    /// How long the upstream finalized head may be served from cache.
+    /// `None` → `FINALIZED_HEAD_TTL`.
+    pub finalized_head_ttl: Option<std::time::Duration>,
     pub verify_block_hash: bool,
     pub verify_tx_sender: bool,
     pub verify_tx_root: bool,
@@ -36,12 +39,28 @@ pub struct RpcOptions {
     pub use_gas_used_for_receipts_root: bool,
 }
 
+/// `P-FINALITY-VIEW-TTL`. The head moves at the chain's finality rate, so asking
+/// per use buys no freshness.
+const FINALIZED_HEAD_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Fetch state for the Rpc layer.
 pub struct Rpc {
     pub client: Arc<RpcClient>,
     pub options: RpcOptions,
     chain_utils: OnceCell<ChainUtils>,
     receipts_method: OnceCell<ReceiptsMethod>,
+    finalized_head: std::sync::Mutex<FinalizedHeadCache>,
+}
+
+#[derive(Default)]
+struct FinalizedHeadCache {
+    /// Last observed upstream finalized head, with when it was observed.
+    observed: Option<(std::time::Instant, u64, String)>,
+    /// A refresh is already in flight; starting another buys nothing.
+    refreshing: bool,
+    /// Bumped by T1. A fetch issued under an older epoch is discarded, not
+    /// stored: it describes a chain the new epoch has abandoned.
+    epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +76,117 @@ impl Rpc {
             options,
             chain_utils: OnceCell::new(),
             receipts_method: OnceCell::new(),
+            finalized_head: std::sync::Mutex::new(FinalizedHeadCache::default()),
+        }
+    }
+
+    fn finalized_head_ttl(&self) -> std::time::Duration {
+        self.options
+            .finalized_head_ttl
+            .unwrap_or(FINALIZED_HEAD_TTL)
+    }
+
+    /// T1's read: replaces the cached view and opens a new epoch.
+    ///
+    /// A re-INIT may seed *below* the previous epoch (WP-20, ADR-14, FM-26), and
+    /// the old view would then stand as a report above the fresh buffer.
+    pub async fn resync_finalized_head(&self) -> Result<(u64, String)> {
+        let (number, hash) = self.get_latest_blockhash("finalized").await?;
+        let mut guard = self.finalized_head.lock().expect("finalized head cache");
+        guard.epoch = guard.epoch.wrapping_add(1);
+        guard.observed = Some((std::time::Instant::now(), number, hash.clone()));
+        Ok((number, hash))
+    }
+
+    /// The finalized head, cached and fetched on a miss. For callers that may
+    /// block on it: the prober runs off the ingestion path.
+    pub async fn get_finalized_head_cached(&self) -> Result<(u64, String)> {
+        if let Some(hit) = self.finalized_head_if_fresh() {
+            return Ok(hit);
+        }
+        let epoch = self.finalized_head_epoch();
+        let (number, hash) = self.get_latest_blockhash("finalized").await?;
+        self.store_finalized_head(epoch, number, hash.clone());
+        Ok((number, hash))
+    }
+
+    /// The last observed finalized head, never touching the network (ADR-6): a
+    /// stale answer costs a shorter stride range, a delayed one costs a block.
+    ///
+    /// Age is deliberately unchecked. It cannot span a re-seed — T1 replaces the
+    /// view — and within an epoch the view only rises.
+    pub fn finalized_head_hint(&self) -> Option<(u64, String)> {
+        let guard = self.finalized_head.lock().expect("finalized head cache");
+        guard
+            .observed
+            .as_ref()
+            .map(|(_, number, hash)| (*number, hash.clone()))
+    }
+
+    /// Start a background refresh if the hint has aged out. Idempotent, and
+    /// never awaited: a failed refresh leaves the previous hint standing.
+    pub fn refresh_finalized_head(self: &Arc<Self>) {
+        let epoch = {
+            let mut guard = self.finalized_head.lock().expect("finalized head cache");
+            if guard.refreshing {
+                return;
+            }
+            let fresh = guard
+                .observed
+                .as_ref()
+                .is_some_and(|(at, _, _)| at.elapsed() < self.finalized_head_ttl());
+            if fresh {
+                return;
+            }
+            guard.refreshing = true;
+            guard.epoch
+        };
+
+        let rpc = Arc::clone(self);
+        tokio::spawn(async move {
+            let fetched = rpc.get_latest_blockhash("finalized").await;
+            rpc.finalized_head
+                .lock()
+                .expect("finalized head cache")
+                .refreshing = false;
+            match fetched {
+                Ok((number, hash)) => rpc.store_finalized_head(epoch, number, hash),
+                Err(e) => warn!("upstream finalized head refresh failed: {e}"),
+            }
+        });
+    }
+
+    fn finalized_head_epoch(&self) -> u64 {
+        self.finalized_head
+            .lock()
+            .expect("finalized head cache")
+            .epoch
+    }
+
+    fn finalized_head_if_fresh(&self) -> Option<(u64, String)> {
+        let ttl = self.finalized_head_ttl();
+        let guard = self.finalized_head.lock().expect("finalized head cache");
+        let (observed_at, number, hash) = guard.observed.as_ref()?;
+        (observed_at.elapsed() < ttl).then(|| (*number, hash.clone()))
+    }
+
+    /// Store a fetch issued under `epoch`, keeping the epoch's maximum.
+    ///
+    /// Discarded outright once T1 has opened a newer epoch. Within one the view
+    /// is monotone, as WP-12 is for the reports it feeds: both fetch paths run
+    /// when it expires, so a lagging replica answering last would otherwise pull
+    /// the stride bound and probe filter back for a whole TTL.
+    fn store_finalized_head(&self, epoch: u64, number: u64, hash: String) {
+        let mut guard = self.finalized_head.lock().expect("finalized head cache");
+        if guard.epoch != epoch {
+            return;
+        }
+        let now = std::time::Instant::now();
+        match guard.observed.as_mut() {
+            // A lower answer is a lagging replica of the same chain, not a
+            // contradiction: the view stands, and it was just re-observed.
+            Some(observed) if observed.1 >= number => observed.0 = now,
+            _ => guard.observed = Some((now, number, hash)),
         }
     }
 
@@ -134,7 +264,7 @@ impl Rpc {
         &self,
         numbers: &[u64],
     ) -> Result<Vec<Option<(u64, String)>>> {
-        let (finalized_num, _) = self.get_latest_blockhash("finalized").await?;
+        let (finalized_num, _) = self.get_finalized_head_cached().await?;
         let numbers: Vec<u64> = numbers
             .iter()
             .filter(|&&n| n <= finalized_num)

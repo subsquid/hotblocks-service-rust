@@ -148,10 +148,17 @@ pub async fn ingest_range(
         let mut speculative_next: Option<u64> = None;
 
         while beg <= end {
-            // Head of the stream's commitment level bounds the backfill range
-            let (head_num, head_hash) = rpc.get_latest_blockhash(&commitment).await?;
+            // Strides are bounded by the *finalized* head on either stream: an
+            // out-of-order range is coherent only where no reorg can reach it
+            // (ADR-18). The hint is read, never awaited — and not even issued
+            // before the first delivery, since it spends the budget the block
+            // fetch needs (ADR-6, HZ-1).
+            if beg > from {
+                rpc.refresh_finalized_head();
+            }
+            let finalized = rpc.finalized_head_hint();
 
-            let top = head_num.min(end);
+            let top = finalized.as_ref().map_or(beg, |(num, _)| (*num).min(end));
 
             if top > beg && (top - beg) > stride_size as u64 {
                 // ── Backfill mode ────────────────────────────────────────────
@@ -160,11 +167,8 @@ pub async fn ingest_range(
                 poll_head = None;
                 poll_last_read = None;
 
-                let finalized_ref = if commitment == "finalized" {
-                    Some(BlockRef { number: head_num, hash: head_hash })
-                } else {
-                    None
-                };
+                // The range is final, so the report is true of it (WP-11.6).
+                let finalized_ref = finalized.map(|(number, hash)| BlockRef { number, hash });
 
                 let ranges: Vec<(u64, u64)> = {
                     let mut r = Vec::new();

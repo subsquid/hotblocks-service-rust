@@ -116,7 +116,21 @@ livelock of GAP-5).
    discontinuity: blocks before an upstream-reported divergence are delivered, then the
    fork signal (a client of the adapter never receives an unlinked sequence);
 6. [SHOULD] attach its newest finality knowledge to batches opportunistically (ADR-6)
-   without ever delaying block delivery for it.
+   without ever delaying block delivery for it. Where that knowledge comes from
+   confirmation probes, rounds of at most `P-PROBE-BATCH` refs are spaced by at least
+   `P-PROBE-INTERVAL` — the spacing holds back a round that settled nothing, not one
+   draining a backlog, or the watermark's rate becomes the timer's rather than the
+   upstream's. Refs awaiting confirmation are held in at most `P-PROBE-BACKLOG` end to
+   end (PF-1): a prober that cannot keep up drops its newest candidates, which later
+   ones subsume, rather than queueing without bound. And no finality read precedes a
+   stream's first delivered block — it is background work, and on a budget without
+   priority (ADR-3, HZ-1) a call issued ahead of the first fetch delays it exactly as an
+   awaited one would;
+7. [MUST] confine out-of-order (strided) acquisition to blocks at or below the upstream
+   finalized head, and carry that head as the report on every such batch — a range
+   assembled from concurrent requests is coherent only where a reorg cannot touch it,
+   and only there is a report about the range true by construction (ADR-18). Blocks
+   above it are acquired in order.
 
 **WP-12 — Finality arbitration.** [MUST] The service maintains the maximum finality
 report seen in the current session — one ref, no history — and applies T4 with it.
