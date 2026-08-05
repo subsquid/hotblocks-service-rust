@@ -54,25 +54,28 @@ const TEMPO: &[Quirk] = &[Quirk::TempoHeader, Quirk::LegacyFakeSignatureSystemTx
 
 /// PIP-74 needs data no RPC method returns.
 const PIP74: &[&str] = &["0x7f"];
-/// Tempo's account-abstraction type; encoder not ported (GAP-16).
-const TEMPO_AA: &[&str] = &["0x76"];
 /// Arbitrum's retryable types; encoders not ported (GAP-16).
 const ARBITRUM_RETRYABLES: &[&str] = &["0x66", "0x68", "0x69"];
 
 /// Every network known to deviate. Absent ones are treated as baseline; those
 /// the predecessor supports and this table still omits are GAP-16.
 const NETWORKS: &[Network] = &[
-    net(0x89, BOR, PIP74),                 // Polygon mainnet
-    net(0x13882, BOR, PIP74),              // Polygon Amoy
-    net(0x6d, BOR, PIP74),                 // Shibarium mainnet
-    net(0x3e7, HYPERLIQUID, &[]),          // Hyperliquid mainnet
-    net(0x3e6, HYPERLIQUID, &[]),          // Hyperliquid testnet
-    net(0x3dc, STABLE, &[]),               // Stable mainnet
-    net(0x899, STABLE, &[]),               // Stable testnet
-    net(0x1079, TEMPO, TEMPO_AA),          // Tempo mainnet
-    net(0xa5bf, TEMPO, TEMPO_AA),          // Tempo Moderato
-    net(0xa5bd, TEMPO, TEMPO_AA),          // Tempo Andantino
-    net(0xa4b1, &[], ARBITRUM_RETRYABLES), // Arbitrum One
+    // Bor-compatible
+    net(137, BOR, PIP74),    // Polygon mainnet
+    net(80_002, BOR, PIP74), // Polygon Amoy
+    net(109, BOR, PIP74),    // Shibarium mainnet
+    // Hyperliquid
+    net(999, HYPERLIQUID, &[]), // Mainnet
+    net(998, HYPERLIQUID, &[]), // Testnet
+    // Stable
+    net(988, STABLE, &[]),   // Mainnet
+    net(2_201, STABLE, &[]), // Testnet
+    // Tempo
+    net(4_217, TEMPO, &[]),  // Mainnet
+    net(42_431, TEMPO, &[]), // Moderato
+    net(42_429, TEMPO, &[]), // Andantino
+    // Arbitrum
+    net(42_161, &[], ARBITRUM_RETRYABLES), // One
 ];
 
 const fn net(
@@ -158,14 +161,24 @@ impl ChainUtils {
         block: &RpcBlock,
         receipts: &[&RpcReceipt],
     ) -> Result<String> {
-        let phantom = self.phantom_tx_hash(block);
-        let receipts: Vec<&RpcReceipt> = receipts
-            .iter()
-            .copied()
-            .filter(|r| !self.is_uncommitted_receipt(r, phantom.as_deref()))
+        let receipts: Vec<&RpcReceipt> = self
+            .committed_receipts(block, receipts.iter().copied())
             .collect();
 
         verification::receipts_root(&receipts, self.use_gas_used_for_receipts_root)
+    }
+
+    /// Receipts covered by the block's cumulative-gas sequence and receipt
+    /// trie. Every receipt-level coherence check must use this same view.
+    pub(crate) fn committed_receipts<'a>(
+        &'a self,
+        block: &RpcBlock,
+        receipts: impl IntoIterator<Item = &'a RpcReceipt> + 'a,
+    ) -> impl Iterator<Item = &'a RpcReceipt> + 'a {
+        let phantom = self.phantom_tx_hash(block);
+        receipts
+            .into_iter()
+            .filter(move |receipt| !self.is_uncommitted_receipt(receipt, phantom.as_deref()))
     }
 
     pub fn calculate_withdrawals_root(&self, withdrawals: &[&RpcWithdrawal]) -> Result<String> {

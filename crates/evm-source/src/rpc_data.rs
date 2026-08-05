@@ -161,6 +161,23 @@ pub struct TempoSignedAuthorization {
 pub struct TempoTokenLimit {
     pub token: String,
     pub limit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TempoSelectorRule {
+    pub selector: String,
+    #[serde(default)]
+    pub recipients: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempoCallScope {
+    pub target: String,
+    #[serde(default)]
+    pub selector_rules: Vec<TempoSelectorRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +190,14 @@ pub struct TempoSignedKeyAuthorization {
     pub expiry: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limits: Option<Vec<TempoTokenLimit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_calls: Option<Vec<TempoCallScope>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_admin: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     pub signature: TempoPrimitiveSignature,
 }
 
@@ -226,6 +251,7 @@ pub struct RpcTransaction {
     // Tempo 0x76 fields
     pub calls: Option<Vec<TempoCall>>,
     pub nonce_key: Option<String>,
+    pub timeout_timestamp: Option<String>,
     pub signature: Option<TempoSignatureObject>,
     pub fee_token: Option<String>,
     pub fee_payer_signature: Option<FeePayerSignature>,

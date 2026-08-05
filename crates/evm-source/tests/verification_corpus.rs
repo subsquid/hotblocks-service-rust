@@ -6,7 +6,10 @@
 //! (GAP-9), and a block with one forged field fails (GAP-8).
 
 use evm_source::chain_utils::ChainUtils;
-use evm_source::rpc_data::{RpcBlock, RpcLog, RpcReceipt, RpcTransaction, RpcWithdrawal};
+use evm_source::rpc_data::{
+    EIP7702Authorization, EIP7702AuthorizationItem, RpcBlock, RpcLog, RpcReceipt, RpcTransaction,
+    RpcWithdrawal,
+};
 use serde_json::Value;
 
 // ─── Corpus ───────────────────────────────────────────────────────────────────
@@ -77,6 +80,14 @@ const CORPUS: &[Case] = &[
         verifiable_header: true,
         receipts: true,
     },
+    // Stable v1.4 custom 0x3f transaction (nonce-key and timeout fields).
+    Case {
+        chain: "stable-testnet",
+        number: 61696562,
+        chain_id: 0x899,
+        verifiable_header: false,
+        receipts: false,
+    },
 ];
 
 fn fixture_path(chain: &str, number: u64, file: &str) -> std::path::PathBuf {
@@ -143,17 +154,14 @@ fn transactions_root_verifies_across_the_corpus() {
         if block.transactions.is_empty() {
             continue;
         }
-        // `None` — the block carries a type this build cannot encode (tempo).
-        let Some(computed) = utils(case)
+        let computed = utils(case)
             .calculate_transactions_root(&block)
             .unwrap_or_else(|e| panic!("{}: {e}", label(case)))
-        else {
-            continue;
-        };
+            .unwrap_or_else(|| panic!("{}: corpus transaction type is unencodable", label(case)));
         assert_eq!(computed, block.transactions_root, "{}", label(case));
         checked += 1;
     }
-    assert!(checked >= CORPUS.len() - 1, "only tempo is unverifiable");
+    assert_eq!(checked, CORPUS.len(), "every corpus block is verifiable");
 }
 
 #[test]
@@ -252,6 +260,166 @@ fn system_transactions_are_exempt_from_sender_recovery() {
             );
         }
     }
+}
+
+#[test]
+fn stable_custom_transaction_verifies_its_root_and_sender() {
+    let case = CORPUS
+        .iter()
+        .find(|case| case.chain == "stable-testnet")
+        .expect("Stable testnet fixture is in the corpus");
+    let block = load_block(case);
+    let tx = block
+        .transactions
+        .iter()
+        .find(|tx| tx.tx_type.as_deref() == Some("0x3f"))
+        .expect("fixture contains a Stable 0x3f transaction");
+
+    let root = utils(case)
+        .calculate_transactions_root(&block)
+        .expect("root computes")
+        .expect("Stable 0x3f is encodable");
+    assert_eq!(root, block.transactions_root);
+
+    let sender = utils(case)
+        .recover_tx_sender(tx)
+        .expect("sender recovery succeeds")
+        .expect("Stable 0x3f carries a recoverable signature");
+    assert_eq!(sender.to_lowercase(), tx.from.to_lowercase());
+}
+
+#[test]
+fn tempo_native_transactions_verify_their_root_and_senders() {
+    let case = CORPUS
+        .iter()
+        .find(|case| case.chain == "tempo-mainnet")
+        .expect("Tempo fixture is in the corpus");
+    let block = load_block(case);
+    let native: Vec<&RpcTransaction> = block
+        .transactions
+        .iter()
+        .filter(|tx| tx.tx_type.as_deref() == Some("0x76"))
+        .collect();
+    assert!(
+        !native.is_empty(),
+        "fixture contains Tempo 0x76 transactions"
+    );
+
+    let root = utils(case)
+        .calculate_transactions_root(&block)
+        .expect("root computes")
+        .expect("Tempo 0x76 is encodable");
+    assert_eq!(root, block.transactions_root);
+
+    for tx in native {
+        let sender = utils(case)
+            .recover_tx_sender(tx)
+            .unwrap_or_else(|e| panic!("Tempo tx {}: {e}", tx.hash))
+            .expect("Tempo 0x76 carries a recoverable sender");
+        assert_eq!(sender.to_lowercase(), tx.from.to_lowercase(), "{}", tx.hash);
+    }
+}
+
+#[test]
+fn unknown_transaction_type_is_not_treated_as_unsigned() {
+    let case = modern();
+    let mut tx = load_block(case).transactions[0].clone();
+    tx.tx_type = Some("0x99".to_string());
+
+    let error = utils(case)
+        .recover_tx_sender(&tx)
+        .expect_err("an unknown type must fail closed");
+    assert!(error
+        .to_string()
+        .contains("unsupported tx type for sender recovery"));
+}
+
+#[test]
+fn oversized_signature_scalars_return_errors_instead_of_panicking() {
+    let case = modern();
+    for field in ["r", "s"] {
+        let mut tx = load_block(case).transactions[0].clone();
+        match field {
+            "r" => tx.r = Some(format!("0x{}", "11".repeat(33))),
+            "s" => tx.s = Some(format!("0x{}", "11".repeat(33))),
+            _ => unreachable!(),
+        }
+
+        let error = utils(case)
+            .recover_tx_sender(&tx)
+            .expect_err("a 33-byte signature scalar must be invalid");
+        assert!(
+            error.to_string().contains("exceeds 256 bits"),
+            "unexpected {field} error: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn malformed_eip155_recovery_values_return_errors_instead_of_panicking() {
+    let case = modern();
+    let legacy = load_block(case)
+        .transactions
+        .into_iter()
+        .find(|tx| tx.tx_type.as_deref() == Some("0x0"))
+        .expect("fixture contains a legacy transaction");
+
+    for (v, chain_id, expected) in [
+        ("0x24", "0x1", "tx.v is invalid for chainId"),
+        (
+            "0xffffffffffffffff",
+            "0xffffffffffffffff",
+            "EIP-155 recovery value overflows u64",
+        ),
+    ] {
+        let mut tx = legacy.clone();
+        tx.v = Some(v.to_string());
+        tx.chain_id = Some(chain_id.to_string());
+
+        let error = utils(case)
+            .recover_tx_sender(&tx)
+            .expect_err("malformed EIP-155 arithmetic must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error for v={v}, chainId={chain_id}: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn eip7702_authorization_signature_keeps_its_high_128_bits() {
+    let case = modern();
+    let mut tx = load_block(case).transactions[0].clone();
+    tx.tx_type = Some("0x4".to_string());
+    tx.authorization_list = Some(vec![EIP7702AuthorizationItem::Standard(
+        EIP7702Authorization {
+            chain_id: "0x1".to_string(),
+            address: "0x0000000000000000000000000000000000001234".to_string(),
+            nonce: "0x0".to_string(),
+            y_parity: "0x1".to_string(),
+            r: "0x11111111111111111111111111111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            s: "0x22222222222222222222222222222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        },
+    )]);
+
+    let encoded =
+        evm_source::verification::encode_transaction(&tx).expect("type-4 transaction encodes");
+    let mut changed = tx;
+    let Some(EIP7702AuthorizationItem::Standard(auth)) = changed
+        .authorization_list
+        .as_mut()
+        .and_then(|items| items.first_mut())
+    else {
+        panic!("standard authorization");
+    };
+    auth.r = "0x33333333333333333333333333333333aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    let changed = evm_source::verification::encode_transaction(&changed)
+        .expect("changed type-4 transaction encodes");
+
+    assert_ne!(
+        encoded, changed,
+        "changing only the high half of authorization.r must change the wire bytes"
+    );
 }
 
 /// The node synthesises the state-sync transaction; it is not in the trie the

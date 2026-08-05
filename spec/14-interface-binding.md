@@ -115,6 +115,12 @@ symbols in 15.
 | `--skip-log-index-check`, `--skip-cumulative-gas-used-check`, `--use-gas-used-for-receipts-root` | off | coherence-check tuning (DEF-15 instantiation) |
 | `--profile-block-timings` | off | opt-in per-block timing telemetry (ADR-5 family; not in the predecessor) |
 
+Receipt-dependent policy is validated at startup: `--verify-receipts-root` and
+`--skip-cumulative-gas-used-check` require `--with-receipts`, while
+`--use-gas-used-for-receipts-root` additionally requires
+`--verify-receipts-root`. The other five verification switches operate on the
+header/transactions or on logs available through either acquisition path.
+
 Environment: `RUST_LOG`-style filter takes precedence; `SQD_TRACE/DEBUG/INFO/WARN/
 ERROR/FATAL` set the global level for chart compatibility (values are not
 namespace-interpreted — divergence from the predecessor's namespace globs, accepted).
