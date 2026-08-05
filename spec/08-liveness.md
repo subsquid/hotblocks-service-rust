@@ -51,10 +51,12 @@ head production rate (i.e. the gap strictly shrinks). Witness: OB-2 rate vs OB-4
 Check: CT-6 (S2).
 
 **LIV-7 — Finality keep-up.** Precondition: healthy upstream with advancing finality.
-Bound: `finalized(C)` trails the upstream finalized head by at most `P-SLO-FINALITY-LAG`
-blocks in steady state — including during catch-up, so that eviction (T5) can keep the
-window bound (GAP-2). Witness: OB-1 finalized gauge vs upstream. Check: CT-6 (S2),
-CT-7.
+Bound: `finalized(C)` trails `min(upstream finalized head, head(C))` by at most
+`P-SLO-FINALITY-LAG` blocks — in steady state and during catch-up alike, so that
+eviction (T5) can keep the window bound. The watermark can only name a block the buffer
+holds (INV-3), so tracking owes the distance to a *held* block and no more; how fast the
+buffer closes the rest of the gap is LIV-6's. Witness: OB-1 finalized gauge vs OB-4
+upstream finalized. Check: CT-6 (S2), CT-7.
 
 **LIV-8 — Reorg convergence.** Precondition: healthy upstream that settles on one
 branch. Bound: a depth-d reorganization (d < window above finality) converges — buffer

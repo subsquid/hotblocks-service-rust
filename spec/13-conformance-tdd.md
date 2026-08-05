@@ -209,14 +209,15 @@ classification and socket-transport suites. The Phase-0 harness (`crates/harness
 adds an executable reference model, a seeded adapter-level simulator with a
 linkage-tuple provenance ledger, a validator library, the CT-1 smoke run, and a set of
 CT-1/CT-4 SUT-vs-model differentials over hand-written pathological histories. Phase 1
-adds a fault-injecting JSON-RPC upstream and the CT-4 component-fault corpus that
-drives the real acquisition adapter against it. The fault matrix covers the trace and
-state-diff components only; no generated differential corpus, no benchmarks yet.
+adds a fault-injecting JSON-RPC upstream, the CT-4 component-fault corpus that drives
+the real acquisition adapter against it, and CT-7's deterministic catch-up entry point.
+The fault matrix covers the trace and state-diff components only; no generated
+differential corpus, no soak, no benchmarks yet.
 
 | Property | CT | Status | Note |
 |---|---|---|---|
 | INV-1..3 | CT-1 | P | unit tests + model asserts on every applied event (CT-1 smoke); no generated histories yet |
-| INV-4 | CT-7 | U ! | GAP-2: violated during catch-up; no soak exists |
+| INV-4 | CT-7 | P ! | CT-7's deterministic entry point drives the real adapter through a catch-up that starts below the upstream finalized head and asserts the committed buffer ends inside the window with auto-adjust off. The over-window branch is unasserted while its alarm stays log-only (GAP-4); the auto-adjust setting and the soak are absent |
 | INV-5 | CT-1 | P | the reference model consumes no clock; no replay-speed differential yet |
 | INV-10 | CT-3 | U | |
 | INV-11 | CT-1/4 | P | unit tests incl. rejection cases; a sub-finality write is reported, not fatal, and a redelivery is absorbed before the guard; no adapter-driven corpus |
@@ -247,11 +248,11 @@ state-diff components only; no generated differential corpus, no benchmarks yet.
 | LIV-4 | CT-1 | U | |
 | LIV-5 | CT-2 | U | |
 | LIV-6 | CT-6 | U | |
-| LIV-7 | CT-6/7 | U ! | GAP-2 |
+| LIV-7 | CT-6/7 | P | CT-7 asserts the bound at two altitudes — the reports the adapter carries mid-catch-up, and the watermark the service commits — against a stub whose finalized head sits far above the buffer. No benchmark measures the lag under load, and `P-SLO-FINALITY-LAG` is still ⚠ |
 | LIV-8 | CT-1/4 | P | single two-block reorg e2e test |
 | LIV-9 | CT-2 | P | one prompt-shutdown test |
 | LIV-10 | CT-8 | U | |
-| LIV-11 | CT-7 | U | |
+| LIV-11 | CT-7 | P ! | CT-7 asserts convergence — a buffer that outgrew its window while finality lagged is back inside it once the reports land. That the alarm clears with the excess is unasserted while it is log-only (GAP-4) |
 | LIV-12 | CT-8 | U | |
 | REQ-1..6 | CT-1/5 | P | endpoint smoke + one fork recovery; REQ-6 framing (one frame per record, every boundary a safe cut) validated on both encodings (CT-1 smoke) |
 | REQ-7 | CT-5 | P | one-network golden corpus |
@@ -270,12 +271,12 @@ state-diff components only; no generated differential corpus, no benchmarks yet.
 
 Priorities: P0 active production risk · P1 correctness hole with plausible trigger ·
 P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry point.
-Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-3, GAP-7, GAP-17, GAP-29, GAP-33, GAP-35, GAP-36.
+Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, GAP-3, GAP-7, GAP-17, GAP-29, GAP-33, GAP-35, GAP-36.
 
 | GAP | Statement | Violates | Prio | First test |
 |---|---|---|---|---|
 | GAP-1 | **Retired 2026-08-04.** Buffer and finality violations are reported instead of asserted: the batch rolls back whole and the session re-enters the ladder, so no input content ends the process | — | retired | — |
-| GAP-2 | During catch-up on the head stream, acquisition outruns finality tracking (range acquisition is bounded by the *latest* head and carries no finality reports, and the confirmation prober is rate-bound), so eviction is starved and the buffer grows past the window without bound (HZ-3 realized); only a log line reports it | INV-4, LIV-7, PF-1, INV-31 | P0 | CT-7: simulator with head far ahead and finality advancing normally; assert window excess stays ≤ bound or OB-6 level active *and* finality gauge tracks upstream within `P-SLO-FINALITY-LAG` |
+| GAP-2 | **Retired 2026-08-05.** Stride acquisition is bounded by the finalized head on both streams, so every strided range is final and carries its own report; the prober skips what a report already settled and spaces only rounds that settle nothing. The over-window alarm remains log-only (GAP-4) | — | retired | — |
 | GAP-3 | **Retired 2026-08-05.** On the execution-trace and state-diff paths an upstream error, a null result, a payload that is not the method's result type, an entry that fails to parse, a result labelled with another block's transaction, an entry carrying a frame of a different transaction, and a transaction left uncovered each mark the block incoherent, so WP-11.2 re-acquires it and WP-11.3 fails the session loud — the component is never emptied, thinned, or filled from another block | — | retired | — |
 | GAP-4 | Alarms are log-only: no OB-7 (or OB-6) condition is visible on the scrape surface as a level or counter. The terminal-divergence exit path landed 2026-08-02 (rebase below finality and divergent re-seed end the run, drain within `P-SHUTDOWN-GRACE`, and exit non-zero per ADR-12), but an orchestrator still cannot distinguish alarm states before the exit | INV-31, OB-6, OB-7, LIV-2 | P2 | CT-4: induce each alarm condition (stall, over-window, integrity violation, terminal); scrape must show a level/counter change |
 | GAP-5 | A fork signal with an empty ref list rebases to the current head and immediately reopens the stream: a malformed adapter can hot-spin the loop forever with no backoff or alarm | WP-10, LIV-8, FM-13 | P1 | CT-4: adapter emits empty-`prev` fork signal; assert session-error handling (ladder), not spin |
@@ -326,12 +327,14 @@ Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-3, 
    simulator + HC-2 ledger + HC-5 reference model + HC-6 validators; wire CT-1 smoke
    (happy-path history) and the spec checker (MG-7). *Exit met:* CT-1 green on the
    happy path; INV-23 flipped U→P; INV-1..3, 20, 22, 24, 25 strengthened.
-2. **Phase 1 — P0 gaps**: failing tests for GAP-2 and GAP-3, then fixes. *GAP-3 closed
-   2026-08-05*: HC-3's upstream stub (`harness::upstream`) plus the CT-4 corpus in
-   `crates/harness/tests/ct4_components.rs` — 24 cases, 22 of them failing before the
+2. **Phase 1 — P0 gaps** *(complete 2026-08-05)*: failing tests for GAP-2 and GAP-3,
+   then fixes. *GAP-3*: HC-3's upstream stub (`harness::upstream`) plus the CT-4 corpus
+   in `crates/harness/tests/ct4_components.rs` — 24 cases, 22 of them failing before the
    fix, two healthy controls that must keep passing; INV-28 and REQ-9 lost their `!`,
    GAP-17 retired with it (one trace method per selection), GAP-11/12/15 narrowed.
-   *Exit:* GAP-2 closed the same way; register updated.
+   *GAP-2*: `crates/harness/tests/ct7_catchup_finality.rs` over the same stub — two
+   cases, both failing before the fix, one on the reports the adapter carries and one
+   on the buffer the service commits; LIV-7 and LIV-11 flipped U→P, INV-4 U→P.
 3. **Phase 2 — correctness core**: full CT-1 generation (reorg/finality/duplicate
    histories), CT-2 kill-point matrix, CT-4 integrity corpus (GAP-5/6/11), CT-5
    golden + config-honesty (GAP-8), HC-8 differential (GAP-27, GAP-13). *Exit:* all

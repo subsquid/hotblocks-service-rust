@@ -35,9 +35,9 @@ committed numbers the corpus provides (compression benchmark and retry budgets �
 | SLI-3 | S1 / S4 | ≤ `P-SLO-QUERY-OVERHEAD` beyond data time ⚠ | — |
 | SLI-4 | S1 | ≥ `P-SLO-THROUGHPUT` ⚠ | stored-frame passthrough ≈ 0 re-encode cost; fallback encoding pays per-block re-encode (15 §compression) |
 | SLI-5 | S2 cold start | ≥ `P-SLO-CATCHUP-RATE` × head rate ⚠ | — |
-| SLI-6 | S1, S2 | ≤ `P-SLO-FINALITY-LAG` ⚠ | catch-up finality stall observed (GAP-2) — current behavior violates any finite target during S2 |
+| SLI-6 | S1, S2 | ≤ `P-SLO-FINALITY-LAG` ⚠ | tracks upstream during S2 since GAP-2's closure; unmeasured under load |
 | SLI-7 | S1 | ≥ `P-SLO-READY-AVAIL` ⚠ | — |
-| SLI-8 | all | ≤ `P-SLO-MEM-FACTOR` × window ⚠ | unbounded under S2 with autoAdjust off (GAP-2) |
+| SLI-8 | all | ≤ `P-SLO-MEM-FACTOR` × window ⚠ | bounded under S2 since GAP-2's closure; excess now tracks the upstream head-to-finality distance, which exceeds the window on chains whose finality lags it |
 
 ## Resource-bound requirements
 
@@ -78,7 +78,7 @@ Reference scenarios:
 - **S1 steady** — head-following at `W-BLOCK-INTERVAL`, `W-CLIENTS` pollers, no
   faults.
 - **S2 cold start / catch-up** — start `W-CATCHUP-GAP` behind; measures SLI-5/6/8
-  (GAP-2's scenario).
+  (the scenario GAP-2 broke).
 - **S3 conflict storm** — reorgs at elevated `W-REORG-RATE`/depth; clients recovering
   via RP-7 continuously.
 - **S4 backfill storm** — many clients starting below the window simultaneously

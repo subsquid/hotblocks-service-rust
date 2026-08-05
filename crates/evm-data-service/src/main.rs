@@ -217,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
         EvmRpcDataSourceOptions {
             rpc_options: RpcOptions {
                 finality_confirmation: args.finality_confirmation,
+                finalized_head_ttl: None,
                 verify_block_hash: args.verify_block_hash,
                 verify_tx_sender: args.verify_tx_sender,
                 verify_tx_root: args.verify_tx_root,

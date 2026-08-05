@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use evm_source::ingest::CadencePredictor;
+use rpc_client::{RpcClient, RpcClientConfig};
 
 // ─── Cadence predictor tests ──────────────────────────────────────────────────
 
@@ -606,14 +607,99 @@ async fn test_speculative_two_blocks_emitted_in_order() {
 /// - We assert that batches are yielded without waiting for the probe
 #[tokio::test]
 async fn test_finalizer_no_stall_on_slow_probe() {
-    // Build a mock server where:
-    // - eth_getBlockByNumber for block bodies returns immediately
-    // - eth_getBlockByNumber for "finalized" takes 300ms
-    // - eth_chainId returns quickly
-    // We use a custom handler for this test that handles slow finalized probes
+    let upstream = slow_finality_upstream().await;
+    let first = first_block(
+        RpcClientConfig {
+            url: upstream.url.clone(),
+            capacity: 5,
+            retry_attempts: 0,
+            ..Default::default()
+        },
+        &upstream,
+    )
+    .await;
+
+    // The first batch should arrive quickly — well under 400ms (the probe delay)
+    assert!(
+        first.elapsed < Duration::from_millis(300),
+        "first batch took {:?} — probe stall not fixed (probe takes 400ms)",
+        first.elapsed
+    );
+}
+
+/// ADR-6 against ADR-3's shared budget: not *awaiting* the finality read is not
+/// enough, since it still spends the budget the block fetch needs and that budget
+/// has no priority (HZ-1). Stated over the calls, so it holds at any budget.
+///
+/// Latency is pinned only in the single-permit case, where the two are strictly
+/// serial. At one call per second the budget alone puts the first block seconds
+/// out whatever precedes it — HZ-1's to answer, not this rule's.
+#[tokio::test]
+async fn a_finality_read_never_precedes_the_first_block() {
+    // One upstream per case: a finished run's prober outlives its stream by a
+    // round, and its calls would land in the next run's log.
+    let permit_upstream = slow_finality_upstream().await;
+    let single_permit = first_block(
+        RpcClientConfig {
+            url: permit_upstream.url.clone(),
+            capacity: 1,
+            retry_attempts: 0,
+            ..Default::default()
+        },
+        &permit_upstream,
+    )
+    .await;
+    single_permit.assert_no_finality_read("one permit");
+    assert!(
+        single_permit.elapsed < Duration::from_millis(300),
+        "first block took {:?} behind a 400 ms finality read holding the only permit",
+        single_permit.elapsed
+    );
+
+    let metered_upstream = slow_finality_upstream().await;
+    let metered = first_block(
+        RpcClientConfig {
+            url: metered_upstream.url.clone(),
+            capacity: usize::MAX,
+            rate_limit: Some(1.0),
+            retry_attempts: 0,
+            ..Default::default()
+        },
+        &metered_upstream,
+    )
+    .await;
+    metered.assert_no_finality_read("one call per second");
+}
+
+/// Answers block bodies at once and the `finalized` tag after 400 ms, logging
+/// every block tag it is asked for in arrival order.
+struct SlowFinalityUpstream {
+    url: String,
+    tags: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// What one head stream did up to its first delivered block.
+struct FirstBlock {
+    elapsed: Duration,
+    /// Block tags the upstream was asked for before that block came out.
+    tags_before: Vec<String>,
+}
+
+impl FirstBlock {
+    fn assert_no_finality_read(&self, budget: &str) {
+        assert!(
+            !self.tags_before.iter().any(|tag| tag == "finalized"),
+            "with {budget}, the finality read went out before the first block: {:?}",
+            self.tags_before
+        );
+    }
+}
+
+async fn slow_finality_upstream() -> SlowFinalityUpstream {
     #[derive(Clone)]
     struct SlowProbeState {
         _call_count: Arc<AtomicUsize>,
+        tags: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     async fn slow_probe_handler(
@@ -647,6 +733,9 @@ async fn test_finalizer_no_stall_on_slow_probe() {
                 "eth_chainId" => json!("0x1"),
                 "eth_getBlockByNumber" => {
                     let tag = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                    // On arrival, before the slow arm sleeps: the rule is about
+                    // which calls go out, not which return.
+                    state.tags.lock().expect("tag log").push(tag.to_string());
                     if tag == "finalized" {
                         // Simulate slow finalized probe
                         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -707,8 +796,10 @@ async fn test_finalizer_no_stall_on_slow_probe() {
         })
     }
 
+    let tags = Arc::new(std::sync::Mutex::new(Vec::new()));
     let probe_state = SlowProbeState {
         _call_count: Arc::new(AtomicUsize::new(0)),
+        tags: Arc::clone(&tags),
     };
     let app = Router::new()
         .route("/", post(slow_probe_handler))
@@ -719,23 +810,21 @@ async fn test_finalizer_no_stall_on_slow_probe() {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let url = format!("http://127.0.0.1:{}", addr.port());
+    SlowFinalityUpstream {
+        url: format!("http://127.0.0.1:{}", addr.port()),
+        tags,
+    }
+}
 
+/// Drive a head stream against `upstream` and report what it took to deliver its
+/// first block, and what the upstream had been asked for by then.
+async fn first_block(config: RpcClientConfig, upstream: &SlowFinalityUpstream) -> FirstBlock {
     use data_service_core::source::{DataSource, StreamRequest};
     use evm_source::source::{EvmRpcDataSource, EvmRpcDataSourceOptions};
     use futures::StreamExt;
-    use rpc_client::{RpcClient, RpcClientConfig};
 
-    let client = Arc::new(RpcClient::new(RpcClientConfig {
-        url: url.clone(),
-        capacity: 5,
-        retry_attempts: 0,
-        ..Default::default()
-    }));
-
-    // Use EvmRpcDataSource.get_stream which wraps finalize_stream
     let ds = EvmRpcDataSource::new(
-        client,
+        Arc::new(RpcClient::new(config)),
         EvmRpcDataSourceOptions {
             stride_size: 1,
             stride_concurrency: 1,
@@ -743,16 +832,16 @@ async fn test_finalizer_no_stall_on_slow_probe() {
         },
     );
 
-    let req = StreamRequest {
+    let mut stream = ds.get_stream(StreamRequest {
         from: 1,
         to: Some(2),
         parent_hash: None,
-    };
-    let mut stream = ds.get_stream(req);
+    });
 
     let t_start = Instant::now();
     let mut blocks_yielded = 0usize;
     let mut first_batch_elapsed = None;
+    let mut tags_before = None;
 
     // Collect until the stream terminates or 5 seconds pass
     tokio::select! {
@@ -763,6 +852,8 @@ async fn test_finalizer_no_stall_on_slow_probe() {
                         if !batch.blocks.is_empty() {
                             if first_batch_elapsed.is_none() {
                                 first_batch_elapsed = Some(t_start.elapsed());
+                                tags_before =
+                                    Some(upstream.tags.lock().expect("tag log").clone());
                             }
                             blocks_yielded += batch.blocks.len();
                         }
@@ -775,20 +866,15 @@ async fn test_finalizer_no_stall_on_slow_probe() {
                 }
             }
         } => {}
-        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        _ = tokio::time::sleep(Duration::from_secs(8)) => {}
     }
 
-    // We should have gotten at least the first batch
     assert!(
         blocks_yielded >= 1,
         "should have yielded at least 1 block, got {blocks_yielded}"
     );
-
-    // The first batch should arrive quickly — well under 400ms (the probe delay)
-    if let Some(elapsed) = first_batch_elapsed {
-        assert!(
-            elapsed < Duration::from_millis(300),
-            "first batch took {elapsed:?} — probe stall not fixed (probe takes 400ms)"
-        );
+    FirstBlock {
+        elapsed: first_batch_elapsed.expect("a delivered block is timed"),
+        tags_before: tags_before.expect("a delivered block has a tag log"),
     }
 }

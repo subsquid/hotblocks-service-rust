@@ -105,10 +105,13 @@ The finalized head is obtained from the network's finality signal or, where the 
 provides none, as a configured depth offset from the head. Within an epoch it advances
 monotonically (INV-12; a T1 re-INIT opens a new epoch and MAY seed lower, alarmed —
 ADR-14), never above the buffered head's height without validation, and contradictory
-or regressive finality reports are tolerated without state corruption.
+or regressive finality reports are tolerated without state corruption. An epoch's
+finality knowledge does not outlive it: whatever the adapter observed before a re-INIT
+is replaced by that re-INIT's own read, never carried across (ADR-18).
 *Acceptance:* under regressive/contradictory injected finality reports, the finalized
-watermark is monotone within each epoch and the process stays healthy.
-*Trace:* WP-12, WP-20, INV-12; ADR-6, ADR-14.
+watermark is monotone within each epoch and the process stays healthy; after a re-seed
+below the previous epoch, no report above the fresh seed is delivered.
+*Trace:* WP-12, WP-20, INV-12; ADR-6, ADR-14, ADR-18.
 
 **REQ-12 — Bounded window.** [MUST]
 The buffer holds at most `P-CACHE-SIZE` blocks plus transient batch overshoot
@@ -119,7 +122,7 @@ with a continuous alarm and (b) force-advancing finality to keep the bound
 *Acceptance:* with auto-adjust on, no committed state's buffer exceeds `P-CACHE-SIZE`
 (INV-4); with it off, every over-window state is accompanied by an active alarm
 observable (OB-6).
-*Trace:* DEF-24, WP-24, INV-4, LIV-11; GAP-2; ADR-9.
+*Trace:* DEF-24, WP-24, INV-4, LIV-11; ADR-9.
 
 **REQ-13 — Unattended restart.** [MUST]
 After any process exit, a fresh start reaches serving state from configuration and
