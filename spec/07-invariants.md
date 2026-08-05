@@ -198,13 +198,14 @@ behavior client-side.
 
 **INV-28 — Component completeness.** [response]
 Every served block satisfies component coherence (DEF-15) for the active data
-selection. No served block ever has a selected component absent, defaulted, or emptied
-because acquisition failed (GAP-3, GAP-12); absence of data is served only when
-emptiness is upstream-true and coherent.
+selection. No served block ever has a selected component absent, defaulted, emptied, or
+thinned because acquisition failed, and none is filled from another block's answer;
+absence of data is served only when emptiness is upstream-true and coherent.
 *Why:* silently empty components are the worst failure class in this system's history
 — undetectable downstream, unrecoverable once archived.
 *Check:* CT-4 — per-component fault matrix asserting invalid-then-retry, never
-empty-then-serve (GAP-3 first test); CT-5 golden corpus.
+empty-then-serve; on the trace and state-diff components today, the rest of the
+components still uninjected. CT-5 golden corpus.
 
 ## Reporting
 

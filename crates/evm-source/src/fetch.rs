@@ -16,6 +16,11 @@ use crate::rpc_data::{
 };
 use crate::types::{qty2_u64, to_qty};
 
+/// A component, or why the block is incoherent (DEF-15). The caller marks the
+/// block invalid: WP-11.2 re-acquires, WP-11.3 fails loud. Never emptied or
+/// thinned to keep a block servable (INV-28).
+type Component<T> = std::result::Result<T, String>;
+
 /// Options for the Rpc fetch layer.
 #[derive(Debug, Clone, Default)]
 pub struct RpcOptions {
@@ -829,13 +834,11 @@ impl Rpc {
             return Ok(());
         }
 
-        // Determine what replay tracers we need. Request the `trace` tracer
-        // whenever traces are wanted via the trace API — even if statediffs are
-        // also requested (both come from one trace_replayBlockTransactions call).
-        // The previous `&& !req.state_diffs` dropped traces on use_trace_api
-        // chains that also fetch statediffs (e.g. gnosis).
-        let need_replay_trace = req.traces && req.use_trace_api;
+        // One trace method per selection (GAP-17): the replay call carries
+        // traces only where it already runs for state diffs — dropping the
+        // `trace` tracer there emptied gnosis traces — else `trace_block` alone.
         let need_replay_statediff = req.state_diffs && !req.use_debug_api_for_state_diffs;
+        let need_replay_trace = req.traces && req.use_trace_api && need_replay_statediff;
         let need_replay = need_replay_trace || need_replay_statediff;
 
         // Debug frames (callTracer)
@@ -880,22 +883,34 @@ impl Rpc {
         // Now assign results (no more borrows of blocks elements)
         if let Some(debug_frames) = debug_frames_opt {
             for (i, frames) in traceable.iter().zip(debug_frames.into_iter()) {
-                blocks[*i].debug_frames = Some(frames);
+                match frames {
+                    Ok(f) => blocks[*i].debug_frames = Some(f),
+                    Err(reason) => blocks[*i].mark_invalid(reason),
+                }
             }
         }
         if let Some(debug_diffs) = debug_diffs_opt {
             for (i, diffs) in traceable.iter().zip(debug_diffs.into_iter()) {
-                blocks[*i].debug_state_diffs = Some(diffs);
+                match diffs {
+                    Ok(d) => blocks[*i].debug_state_diffs = Some(d),
+                    Err(reason) => blocks[*i].mark_invalid(reason),
+                }
             }
         }
         if let Some(replays) = trace_replay_opt {
             for (i, replay) in traceable.iter().zip(replays.into_iter()) {
-                blocks[*i].trace_replays = Some(replay);
+                match replay {
+                    Ok(r) => blocks[*i].trace_replays = Some(r),
+                    Err(reason) => blocks[*i].mark_invalid(reason),
+                }
             }
         }
         if let Some(replays) = trace_block_opt {
             for (i, replay) in traceable.iter().zip(replays.into_iter()) {
-                blocks[*i].trace_replays = Some(replay);
+                match replay {
+                    Ok(r) => blocks[*i].trace_replays = Some(r),
+                    Err(reason) => blocks[*i].mark_invalid(reason),
+                }
             }
         }
 
@@ -906,7 +921,7 @@ impl Rpc {
         &self,
         blocks: &[&RawRpcBlock],
         req: &crate::types::DataRequest,
-    ) -> Result<Vec<Vec<Option<DebugFrameResult>>>> {
+    ) -> Result<Vec<Component<Vec<Option<DebugFrameResult>>>>> {
         let timeout = req
             .debug_trace_timeout
             .as_deref()
@@ -967,58 +982,37 @@ impl Rpc {
 
         for (i, result) in results.into_iter().enumerate() {
             let block = blocks[i];
-            match result {
-                Err(_) | Ok(Value::Null) => {
-                    out.push(vec![]);
+            let mut arr = match unwrap_component(result, "execution traces", block) {
+                Ok(arr) => arr,
+                Err(reason) => {
+                    out.push(Err(reason));
+                    continue;
                 }
-                Ok(v) => {
-                    // Moonbeam quirk: may return frames without the `result` wrapper
-                    let arr = match v {
-                        Value::Array(mut arr) => {
-                            for item in arr.iter_mut() {
-                                if item.is_object() && item.get("result").is_none() {
-                                    let inner = item.take();
-                                    *item = json!({"result": inner});
-                                }
-                            }
-                            arr
-                        }
-                        _ => vec![],
-                    };
+            };
 
-                    let mut frames: Vec<Option<DebugFrameResult>> = Vec::new();
-                    if block.block.transactions.len() == arr.len() {
-                        for item in arr {
-                            frames.push(serde_json::from_value(item).ok());
-                        }
-                    } else {
-                        // Match by txHash
-                        let tx_hash_to_idx: std::collections::HashMap<String, usize> = block
-                            .block
-                            .transactions
-                            .iter()
-                            .enumerate()
-                            .map(|(i, tx)| (tx.hash.clone(), i))
-                            .collect();
-
-                        let mut mapped: Vec<Option<DebugFrameResult>> =
-                            vec![None; block.block.transactions.len()];
-                        for item in arr {
-                            let tx_hash = item
-                                .get("txHash")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            if let Some(hash) = tx_hash {
-                                if let Some(&idx) = tx_hash_to_idx.get(&hash) {
-                                    mapped[idx] = serde_json::from_value(item).ok();
-                                }
-                            }
-                        }
-                        frames = mapped;
-                    }
-                    out.push(frames);
+            // Moonbeam quirk: may return frames without the `result` wrapper
+            for item in arr.iter_mut() {
+                if item.is_object() && item.get("result").is_none() {
+                    let inner = item.take();
+                    *item = json!({"result": inner});
                 }
             }
+
+            let frames: Component<Vec<Option<DebugFrameResult>>> =
+                if block.block.transactions.len() == arr.len() {
+                    arr.into_iter()
+                        .enumerate()
+                        .map(|(j, item)| {
+                            let frame: DebugFrameResult = parse_entry(item, "trace frame", block)?;
+                            check_frame_label(frame.tx_hash.as_deref(), j, block)?;
+                            Ok(Some(frame))
+                        })
+                        .collect()
+                } else {
+                    match_by_tx_hash(arr, block, "execution traces", utils.is_polygon_based)
+                };
+
+            out.push(frames);
         }
 
         Ok(out)
@@ -1028,7 +1022,7 @@ impl Rpc {
         &self,
         blocks: &[&RawRpcBlock],
         req: &crate::types::DataRequest,
-    ) -> Result<Vec<Vec<Option<DebugStateDiffResult>>>> {
+    ) -> Result<Vec<Component<Vec<Option<DebugStateDiffResult>>>>> {
         let timeout = req
             .debug_trace_timeout
             .as_deref()
@@ -1084,49 +1078,35 @@ impl Rpc {
             .batch_call_reduce_on_retry(calls, &options)
             .await?;
 
+        let utils = self.get_chain_utils().await?;
         let mut out = Vec::with_capacity(results.len());
 
         for (i, result) in results.into_iter().enumerate() {
             let block = blocks[i];
-            match result {
-                Err(_) | Ok(Value::Null) => {
-                    out.push(vec![]);
+            let arr = match unwrap_component(result, "state diffs", block) {
+                Ok(arr) => arr,
+                Err(reason) => {
+                    out.push(Err(reason));
+                    continue;
                 }
-                Ok(v) => {
-                    let arr = v.as_array().cloned().unwrap_or_default();
-                    if block.block.transactions.len() == arr.len() {
-                        let frames: Vec<Option<DebugStateDiffResult>> = arr
-                            .into_iter()
-                            .map(|item| serde_json::from_value(item).ok())
-                            .collect();
-                        out.push(frames);
-                    } else {
-                        // Match by txHash
-                        let tx_hash_to_idx: std::collections::HashMap<String, usize> = block
-                            .block
-                            .transactions
-                            .iter()
-                            .enumerate()
-                            .map(|(i, tx)| (tx.hash.clone(), i))
-                            .collect();
+            };
 
-                        let mut mapped: Vec<Option<DebugStateDiffResult>> =
-                            vec![None; block.block.transactions.len()];
-                        for item in arr {
-                            let tx_hash = item
-                                .get("txHash")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            if let Some(hash) = tx_hash {
-                                if let Some(&idx) = tx_hash_to_idx.get(&hash) {
-                                    mapped[idx] = serde_json::from_value(item).ok();
-                                }
-                            }
-                        }
-                        out.push(mapped);
-                    }
-                }
-            }
+            let diffs: Component<Vec<Option<DebugStateDiffResult>>> =
+                if block.block.transactions.len() == arr.len() {
+                    arr.into_iter()
+                        .enumerate()
+                        .map(|(j, item)| {
+                            let diff: DebugStateDiffResult =
+                                parse_entry(item, "state diff", block)?;
+                            check_frame_label(diff.tx_hash.as_deref(), j, block)?;
+                            Ok(Some(diff))
+                        })
+                        .collect()
+                } else {
+                    match_by_tx_hash(arr, block, "state diffs", utils.is_polygon_based)
+                };
+
+            out.push(diffs);
         }
 
         Ok(out)
@@ -1136,7 +1116,7 @@ impl Rpc {
         &self,
         blocks: &[&RawRpcBlock],
         tracers: &[&str],
-    ) -> Result<Vec<Vec<TraceTransactionReplay>>> {
+    ) -> Result<Vec<Component<Vec<TraceTransactionReplay>>>> {
         let tracers_json: Vec<Value> = tracers.iter().map(|&t| json!(t)).collect();
 
         let calls: Vec<(String, Option<Value>)> = blocks
@@ -1158,51 +1138,7 @@ impl Rpc {
 
         for (i, result) in results.into_iter().enumerate() {
             let block = blocks[i];
-            match result {
-                Err(_) => out.push(vec![]),
-                Ok(v) => {
-                    let mut replays: Vec<TraceTransactionReplay> =
-                        serde_json::from_value(v).unwrap_or_default();
-
-                    // Resolve transactionHash from trace frames if not set
-                    for rep in replays.iter_mut() {
-                        if rep.transaction_hash.is_none() {
-                            if let Some(frames) = &rep.trace {
-                                for frame in frames {
-                                    if let Some(h) = &frame.transaction_hash {
-                                        rep.transaction_hash = Some(h.clone());
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Validate all replays belong to this block
-                    let tx_set: std::collections::HashSet<String> = block
-                        .block
-                        .transactions
-                        .iter()
-                        .map(|tx| tx.hash.clone())
-                        .collect();
-
-                    let mut invalid = false;
-                    for rep in &replays {
-                        if let Some(h) = &rep.transaction_hash {
-                            if !tx_set.contains(h) {
-                                invalid = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if invalid {
-                        out.push(vec![]);
-                    } else {
-                        out.push(replays);
-                    }
-                }
-            }
+            out.push(replays_of(result, block, tracers, "trace replays"));
         }
 
         Ok(out)
@@ -1211,7 +1147,7 @@ impl Rpc {
     async fn fetch_trace_block(
         &self,
         blocks: &[&RawRpcBlock],
-    ) -> Result<Vec<Vec<TraceTransactionReplay>>> {
+    ) -> Result<Vec<Component<Vec<TraceTransactionReplay>>>> {
         let calls: Vec<(String, Option<Value>)> = blocks
             .iter()
             .map(|b| ("trace_block".to_string(), Some(json!([b.hash]))))
@@ -1226,58 +1162,247 @@ impl Rpc {
 
         for (i, result) in results.into_iter().enumerate() {
             let block = blocks[i];
-            match result {
-                Err(_) => out.push(vec![]),
-                Ok(v) => {
-                    let frames: Vec<crate::rpc_data::TraceFrame> =
-                        serde_json::from_value(v).unwrap_or_default();
-
-                    if frames.is_empty() {
-                        if !block.block.transactions.is_empty() {
-                            // mark invalid? Not for trace_block at this point
-                        }
-                        out.push(vec![]);
-                        continue;
-                    }
-
-                    // Check all frames belong to this block
-                    let all_match = frames
-                        .iter()
-                        .all(|f| f.block_hash.as_deref() == Some(&block.hash));
-
-                    if !all_match {
-                        out.push(vec![]);
-                        continue;
-                    }
-
-                    // Group by transactionHash → TraceTransactionReplay
-                    let mut by_tx: std::collections::HashMap<
-                        String,
-                        Vec<crate::rpc_data::TraceFrame>,
-                    > = std::collections::HashMap::new();
-                    for frame in frames {
-                        if let Some(hash) = &frame.transaction_hash {
-                            by_tx.entry(hash.clone()).or_default().push(frame);
-                        }
-                    }
-
-                    let replays: Vec<TraceTransactionReplay> = by_tx
-                        .into_iter()
-                        .map(|(tx_hash, frames)| TraceTransactionReplay {
-                            transaction_hash: Some(tx_hash),
-                            trace: Some(frames),
-                            state_diff: None,
-                            output: None,
-                        })
-                        .collect();
-
-                    out.push(replays);
-                }
-            }
+            out.push(trace_block_replays(result, block));
         }
 
         Ok(out)
     }
+}
+
+// ─── Component coherence helpers (DEF-15 / IB-15) ─────────────────────────────
+
+/// An error, a null, or a non-result payload leaves the block incoherent.
+fn unwrap_component(
+    result: std::result::Result<Value, RpcError>,
+    what: &str,
+    block: &RawRpcBlock,
+) -> Component<Vec<Value>> {
+    let number = block.number;
+    match result {
+        Err(e) => Err(format!("block {number}: {what} unavailable: {e}")),
+        Ok(Value::Null) => Err(format!("block {number}: {what} not available yet")),
+        Ok(Value::Array(arr)) => Ok(arr),
+        Ok(_) => Err(format!("block {number}: {what} payload is not an array")),
+    }
+}
+
+fn parse_entry<T: serde::de::DeserializeOwned>(
+    item: Value,
+    what: &str,
+    block: &RawRpcBlock,
+) -> Component<T> {
+    serde_json::from_value(item)
+        .map_err(|e| format!("block {}: unparsable {what}: {e}", block.number))
+}
+
+/// A result labelled with another transaction belongs to another block,
+/// whatever its length says.
+fn check_frame_label(tx_hash: Option<&str>, position: usize, block: &RawRpcBlock) -> Component<()> {
+    let Some(labelled) = tx_hash else {
+        return Ok(());
+    };
+    let expected = block
+        .block
+        .transactions
+        .get(position)
+        .map(|tx| tx.hash.as_str())
+        .unwrap_or_default();
+    if labelled.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "block {}: trace result at position {position} is labelled with transaction \
+             {labelled}, expected {expected}",
+            block.number
+        ))
+    }
+}
+
+/// Length disagreement is recoverable only by label. Foreign entries are
+/// ignored; a transaction left without one is incoherence — except on
+/// polygon-based chains, which trace fewer than they list (REQ-15 quirk).
+fn match_by_tx_hash<T: serde::de::DeserializeOwned>(
+    arr: Vec<Value>,
+    block: &RawRpcBlock,
+    what: &str,
+    tolerate_gaps: bool,
+) -> Component<Vec<Option<T>>> {
+    let index: std::collections::HashMap<&str, usize> = block
+        .block
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| (tx.hash.as_str(), i))
+        .collect();
+
+    let mut mapped: Vec<Option<T>> = Vec::new();
+    mapped.resize_with(block.block.transactions.len(), || None);
+
+    for item in arr {
+        let position = item
+            .get("txHash")
+            .and_then(|v| v.as_str())
+            .and_then(|hash| index.get(hash).copied());
+        if let Some(position) = position {
+            mapped[position] = Some(parse_entry(item, what, block)?);
+        }
+    }
+
+    if !tolerate_gaps {
+        if let Some(missing) = mapped.iter().position(|e| e.is_none()) {
+            return Err(format!(
+                "block {}: no {what} for transaction {missing} of {}",
+                block.number,
+                mapped.len()
+            ));
+        }
+    }
+
+    Ok(mapped)
+}
+
+/// Exactly one replay per transaction, each carrying the tracers asked for. A
+/// replay reaches the payload only through its hash, so an unattributable entry
+/// is a missing component and a repeated one doubles its records.
+fn replays_of(
+    result: std::result::Result<Value, RpcError>,
+    block: &RawRpcBlock,
+    tracers: &[&str],
+    what: &str,
+) -> Component<Vec<TraceTransactionReplay>> {
+    let number = block.number;
+    let arr = unwrap_component(result, what, block)?;
+    let mut replays: Vec<TraceTransactionReplay> = arr
+        .into_iter()
+        .map(|item| parse_entry(item, "trace replay", block))
+        .collect::<Component<_>>()?;
+
+    for rep in replays.iter_mut() {
+        if rep.transaction_hash.is_none() {
+            rep.transaction_hash = rep
+                .trace
+                .iter()
+                .flatten()
+                .find_map(|frame| frame.transaction_hash.clone());
+        }
+    }
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for rep in &replays {
+        let Some(hash) = rep.transaction_hash.as_deref() else {
+            return Err(format!(
+                "block {number}: a {what} entry names no transaction"
+            ));
+        };
+        // Frames are attributed by the entry's hash, so one naming a different
+        // transaction gets filed under this one. Frames carrying no hash of
+        // their own are the norm — real captures label only the entry.
+        if let Some(foreign) = rep.trace.iter().flatten().find_map(|frame| {
+            frame
+                .transaction_hash
+                .as_deref()
+                .filter(|h| !h.eq_ignore_ascii_case(hash))
+        }) {
+            return Err(format!(
+                "block {number}: the {what} of transaction {hash} carries a frame of \
+                 transaction {foreign}"
+            ));
+        }
+        // Every transaction executes at least its root frame, so an empty list
+        // is as incomplete as an absent one. State diffs are only checked for
+        // presence: a system transaction can legitimately change nothing.
+        let traced = rep
+            .trace
+            .as_deref()
+            .is_some_and(|frames| !frames.is_empty());
+        if tracers.contains(&"trace") && !traced {
+            return Err(format!(
+                "block {number}: the {what} of transaction {hash} carries no trace"
+            ));
+        }
+        if tracers.contains(&"stateDiff") && rep.state_diff.is_none() {
+            return Err(format!(
+                "block {number}: the {what} of transaction {hash} carries no state diff"
+            ));
+        }
+        *counts.entry(hash).or_default() += 1;
+    }
+
+    for tx in &block.block.transactions {
+        match counts.remove(tx.hash.as_str()) {
+            None => {
+                return Err(format!(
+                    "block {number}: no {what} for transaction {}",
+                    tx.hash
+                ))
+            }
+            Some(1) => {}
+            Some(n) => {
+                return Err(format!(
+                    "block {number}: {n} {what} for transaction {}",
+                    tx.hash
+                ))
+            }
+        }
+    }
+    if let Some(foreign) = counts.keys().next() {
+        return Err(format!(
+            "block {number}: {what} name transaction {foreign}, which is not in this block"
+        ));
+    }
+
+    Ok(replays)
+}
+
+/// A flat frame list over the whole block, reward frames included: every frame
+/// carries this block's hash, every transaction appears.
+fn trace_block_replays(
+    result: std::result::Result<Value, RpcError>,
+    block: &RawRpcBlock,
+) -> Component<Vec<TraceTransactionReplay>> {
+    let arr = unwrap_component(result, "block traces", block)?;
+    let frames: Vec<crate::rpc_data::TraceFrame> = arr
+        .into_iter()
+        .map(|item| parse_entry(item, "trace frame", block))
+        .collect::<Component<_>>()?;
+
+    if let Some(foreign) = frames
+        .iter()
+        .find(|f| f.block_hash.as_deref() != Some(&block.hash))
+    {
+        return Err(format!(
+            "block {}: trace_block answered with a frame of block {:?}",
+            block.number, foreign.block_hash
+        ));
+    }
+
+    let mut by_tx: std::collections::HashMap<String, Vec<crate::rpc_data::TraceFrame>> =
+        std::collections::HashMap::new();
+    for frame in frames {
+        if let Some(hash) = &frame.transaction_hash {
+            by_tx.entry(hash.clone()).or_default().push(frame);
+        }
+    }
+
+    // Reward-only answers to a hash-addressed call land here (GAP-12).
+    for tx in &block.block.transactions {
+        if !by_tx.contains_key(&tx.hash) {
+            return Err(format!(
+                "block {}: trace_block returned no traces for transaction {}",
+                block.number, tx.hash
+            ));
+        }
+    }
+
+    Ok(by_tx
+        .into_iter()
+        .map(|(tx_hash, frames)| TraceTransactionReplay {
+            transaction_hash: Some(tx_hash),
+            trace: Some(frames),
+            state_diff: None,
+            output: None,
+        })
+        .collect())
 }
 
 /// Check if a logsBloom string is all zeros (no logs).
