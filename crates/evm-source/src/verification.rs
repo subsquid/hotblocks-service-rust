@@ -7,7 +7,8 @@ use sha3::{Digest, Keccak256};
 
 use crate::rpc_data::{
     AccessListItem, EIP7702AuthorizationItem, RpcBlock, RpcLog, RpcReceipt, RpcTransaction,
-    RpcWithdrawal,
+    RpcWithdrawal, TempoCall, TempoCallScope, TempoPrimitiveSignature, TempoSelectorRule,
+    TempoSignatureObject, TempoSignedAuthorization, TempoSignedKeyAuthorization, TempoTokenLimit,
 };
 
 // ─── Helper: decode 0x-hex to bytes ──────────────────────────────────────────
@@ -164,6 +165,15 @@ fn encode_uint_bytes(n: usize) -> Vec<u8> {
 fn parse_qty_u128(s: &str) -> u128 {
     let s = s.strip_prefix("0x").unwrap_or(s);
     u128::from_str_radix(s, 16).unwrap_or(0)
+}
+
+fn parse_qty_u128_checked(s: &str, field: &str) -> anyhow::Result<u128> {
+    let digits = s.strip_prefix("0x").unwrap_or(s);
+    if digits.is_empty() {
+        bail!("{field} is an empty hexadecimal quantity");
+    }
+    u128::from_str_radix(digits, 16)
+        .map_err(|e| anyhow!("{field} is not a valid u128 hexadecimal quantity: {e}"))
 }
 
 fn ethereum_header_fields(block: &RpcBlock) -> anyhow::Result<Vec<RlpField>> {
@@ -389,29 +399,29 @@ fn decode_access_list(access_list: &[AccessListItem]) -> Vec<u8> {
     out
 }
 
-fn decode_authorization_list(auth_list: &[EIP7702AuthorizationItem]) -> Vec<u8> {
+fn decode_authorization_list(auth_list: &[EIP7702AuthorizationItem]) -> anyhow::Result<Vec<u8>> {
     let mut items_encoded = Vec::new();
     for item in auth_list {
         let (chain_id, address, nonce, y_parity, r, s) = match item {
             EIP7702AuthorizationItem::Standard(a) => (
                 parse_qty_u128(&a.chain_id),
-                decode_hex_or_empty(&a.address),
+                decode_hex(&a.address)?,
                 parse_qty_u128(&a.nonce),
                 parse_qty_u128(&a.y_parity),
-                decode_hex_or_empty(&a.r),
-                decode_hex_or_empty(&a.s),
+                a.r.as_str(),
+                a.s.as_str(),
             ),
             EIP7702AuthorizationItem::Frontier(a) => (
                 a.chain_id as u128,
-                decode_hex_or_empty(&a.address),
+                decode_hex(&a.address)?,
                 parse_qty_u128(&a.nonce),
                 if a.signature.odd_y_parity {
                     1u128
                 } else {
                     0u128
                 },
-                decode_hex_or_empty(&a.signature.r),
-                decode_hex_or_empty(&a.signature.s),
+                a.signature.r.as_str(),
+                a.signature.s.as_str(),
             ),
         };
 
@@ -420,27 +430,8 @@ fn decode_authorization_list(auth_list: &[EIP7702AuthorizationItem]) -> Vec<u8> 
         item_payload.extend(encode_rlp_bytes(&address));
         item_payload.extend(encode_rlp_uint(nonce));
         item_payload.extend(encode_rlp_uint(y_parity));
-        // r and s are decoded as big integers
-        let r_int = if r.is_empty() {
-            0u128
-        } else {
-            let mut n = 0u128;
-            for b in &r {
-                n = n << 8 | *b as u128;
-            }
-            n
-        };
-        let s_int = if s.is_empty() {
-            0u128
-        } else {
-            let mut n = 0u128;
-            for b in &s {
-                n = n << 8 | *b as u128;
-            }
-            n
-        };
-        item_payload.extend(encode_rlp_uint(r_int));
-        item_payload.extend(encode_rlp_uint(s_int));
+        item_payload.extend(encode_rlp_big_uint(r)?);
+        item_payload.extend(encode_rlp_big_uint(s)?);
 
         let mut item_out = Vec::new();
         encode_rlp_length(item_payload.len(), 0xc0, &mut item_out);
@@ -450,7 +441,7 @@ fn decode_authorization_list(auth_list: &[EIP7702AuthorizationItem]) -> Vec<u8> 
     let mut out = Vec::new();
     encode_rlp_length(items_encoded.len(), 0xc0, &mut out);
     out.extend(items_encoded);
-    out
+    Ok(out)
 }
 
 /// Encode a transaction as per the Ethereum wire format (type-prefix + RLP).
@@ -462,12 +453,13 @@ pub fn encode_transaction(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
         "0x2" => encode_eip1559_tx(tx),
         "0x3" => encode_eip4844_tx(tx),
         "0x4" => encode_eip7702_tx(tx),
+        "0x3f" => encode_stable_tx(tx),
         // Arbitrum and others — unsupported for root verification (TS also skips sender recovery for these)
         "0x64" | "0x65" | "0x66" | "0x68" | "0x69" | "0x6a" => encode_arbitrum_tx(tx, tx_type),
         // Optimism deposit
         "0x7e" => encode_optimism_deposit_tx(tx),
-        // Tempo
-        "0x76" => bail!("Tempo 0x76 tx encoding not yet supported for root verification"),
+        // Tempo native account-abstraction transaction
+        "0x76" => encode_tempo_tx(tx),
         // Polygon state-sync 0x7f — not used in trie; caller should exclude
         "0x7f" => bail!("Polygon 0x7f state-sync tx should be excluded from tx root"),
         _ => bail!("unsupported tx type: {tx_type}"),
@@ -504,8 +496,8 @@ fn encode_legacy_tx(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
 
     let v_int = parse_qty_u128(v);
     payload.extend(encode_rlp_uint(v_int));
-    payload.extend(encode_rlp_bytes(&decode_hex_big_int(r)));
-    payload.extend(encode_rlp_bytes(&decode_hex_big_int(s)));
+    payload.extend(encode_rlp_big_uint(r)?);
+    payload.extend(encode_rlp_big_uint(s)?);
 
     let mut out = Vec::new();
     encode_rlp_length(payload.len(), 0xc0, &mut out);
@@ -548,8 +540,8 @@ fn encode_eip2930_tx(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
     payload.extend(encode_rlp_bytes(&decode_hex(input)?));
     payload.extend(decode_access_list(access_list));
     payload.extend(encode_rlp_uint(parse_qty_u128(v)));
-    payload.extend(encode_rlp_bytes(&decode_hex_big_int(r)));
-    payload.extend(encode_rlp_bytes(&decode_hex_big_int(s)));
+    payload.extend(encode_rlp_big_uint(r)?);
+    payload.extend(encode_rlp_big_uint(s)?);
 
     let mut list = Vec::new();
     encode_rlp_length(payload.len(), 0xc0, &mut list);
@@ -600,8 +592,8 @@ fn encode_eip1559_tx(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
     payload.extend(encode_rlp_bytes(&decode_hex(input)?));
     payload.extend(decode_access_list(access_list));
     payload.extend(encode_rlp_uint(parse_qty_u128(v)));
-    payload.extend(encode_rlp_bytes(&decode_hex_big_int(r)));
-    payload.extend(encode_rlp_bytes(&decode_hex_big_int(s)));
+    payload.extend(encode_rlp_big_uint(r)?);
+    payload.extend(encode_rlp_big_uint(s)?);
 
     let mut list = Vec::new();
     encode_rlp_length(payload.len(), 0xc0, &mut list);
@@ -676,8 +668,8 @@ fn encode_eip4844_tx(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
     payload.extend(encode_rlp_uint(parse_qty_u128(max_fee_blob)));
     payload.extend(blob_list);
     payload.extend(encode_rlp_uint(y_parity));
-    payload.extend(encode_rlp_bytes(&decode_hex_big_int(r)));
-    payload.extend(encode_rlp_bytes(&decode_hex_big_int(s)));
+    payload.extend(encode_rlp_big_uint(r)?);
+    payload.extend(encode_rlp_big_uint(s)?);
 
     let mut list = Vec::new();
     encode_rlp_length(payload.len(), 0xc0, &mut list);
@@ -733,10 +725,10 @@ fn encode_eip7702_tx(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
     payload.extend(encode_rlp_uint(parse_qty_u128(value)));
     payload.extend(encode_rlp_bytes(&decode_hex(input)?));
     payload.extend(decode_access_list(access_list));
-    payload.extend(decode_authorization_list(auth_list));
+    payload.extend(decode_authorization_list(auth_list)?);
     payload.extend(encode_rlp_uint(y_parity));
-    payload.extend(encode_rlp_bytes(&decode_hex_big_int(r)));
-    payload.extend(encode_rlp_bytes(&decode_hex_big_int(s)));
+    payload.extend(encode_rlp_big_uint(r)?);
+    payload.extend(encode_rlp_big_uint(s)?);
 
     let mut list = Vec::new();
     encode_rlp_length(payload.len(), 0xc0, &mut list);
@@ -744,6 +736,458 @@ fn encode_eip7702_tx(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
 
     let mut out = vec![0x04];
     out.extend(list);
+    Ok(out)
+}
+
+fn encode_stable_tx(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
+    let chain_id = tx
+        .chain_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("tx.chainId is missing"))?;
+    let max_prio = tx
+        .max_priority_fee_per_gas
+        .as_deref()
+        .ok_or_else(|| anyhow!("tx.maxPriorityFeePerGas is missing"))?;
+    let max_fee = tx
+        .max_fee_per_gas
+        .as_deref()
+        .ok_or_else(|| anyhow!("tx.maxFeePerGas is missing"))?;
+    let value = tx
+        .value
+        .as_deref()
+        .ok_or_else(|| anyhow!("tx.value is missing"))?;
+    let nonce_key = tx
+        .nonce_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("tx.nonceKey is missing"))?;
+    let y_parity = tx
+        .y_parity
+        .as_deref()
+        .or(tx.v.as_deref())
+        .ok_or_else(|| anyhow!("tx.yParity and tx.v are missing"))?;
+    let r = tx.r.as_deref().ok_or_else(|| anyhow!("tx.r is missing"))?;
+    let s = tx.s.as_deref().ok_or_else(|| anyhow!("tx.s is missing"))?;
+    let to = tx
+        .to
+        .as_deref()
+        .map(decode_hex)
+        .transpose()?
+        .unwrap_or_default();
+
+    let mut payload = stable_tx_base_payload(tx, chain_id, max_prio, max_fee, value, &to)?;
+    payload.extend(encode_rlp_uint(parse_qty_u128(y_parity)));
+    payload.extend(encode_rlp_big_uint(r)?);
+    payload.extend(encode_rlp_big_uint(s)?);
+    payload.extend(encode_rlp_uint(parse_qty_u128(nonce_key)));
+    payload.extend(encode_rlp_uint(parse_qty_u128(
+        tx.timeout_timestamp.as_deref().unwrap_or("0x0"),
+    )));
+
+    let mut list = Vec::new();
+    encode_rlp_length(payload.len(), 0xc0, &mut list);
+    list.extend(payload);
+    let mut out = vec![0x3f];
+    out.extend(list);
+    Ok(out)
+}
+
+fn stable_tx_base_payload(
+    tx: &RpcTransaction,
+    chain_id: &str,
+    max_prio: &str,
+    max_fee: &str,
+    value: &str,
+    to: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    payload.extend(encode_rlp_uint(parse_qty_u128(chain_id)));
+    payload.extend(encode_rlp_uint(parse_qty_u128(&tx.nonce)));
+    payload.extend(encode_rlp_uint(parse_qty_u128(max_prio)));
+    payload.extend(encode_rlp_uint(parse_qty_u128(max_fee)));
+    payload.extend(encode_rlp_uint(parse_qty_u128(&tx.gas)));
+    payload.extend(encode_rlp_bytes(to));
+    payload.extend(encode_rlp_uint(parse_qty_u128(value)));
+    payload.extend(encode_rlp_bytes(&decode_hex(
+        tx.input.as_deref().unwrap_or("0x"),
+    )?));
+    payload.extend(decode_access_list(tx.access_list.as_deref().unwrap_or(&[])));
+    Ok(payload)
+}
+
+fn encode_rlp_items(items: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
+    let payload: Vec<u8> = items.into_iter().flatten().collect();
+    let mut out = Vec::new();
+    encode_rlp_length(payload.len(), 0xc0, &mut out);
+    out.extend(payload);
+    out
+}
+
+fn decode_hex_with_len(s: &str, expected: usize, field: &str) -> anyhow::Result<Vec<u8>> {
+    let bytes = decode_hex(s).map_err(|e| anyhow!("{field}: {e}"))?;
+    if bytes.len() != expected {
+        bail!("{field} must be {expected} bytes, got {}", bytes.len());
+    }
+    Ok(bytes)
+}
+
+fn decode_signature_scalar(s: &str, field: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = decode_hex_big_int(s).map_err(|e| anyhow!("{field}: {e}"))?;
+    let mut out = [0u8; 32];
+    let start = out
+        .len()
+        .checked_sub(bytes.len())
+        .ok_or_else(|| anyhow!("{field} exceeds 256 bits"))?;
+    out[start..].copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn encode_tempo_call(call: &TempoCall) -> anyhow::Result<Vec<u8>> {
+    let to = call
+        .to
+        .as_deref()
+        .map(decode_hex)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(encode_rlp_items([
+        encode_rlp_bytes(&to),
+        encode_rlp_big_uint(&call.value)?,
+        encode_rlp_bytes(&decode_hex(&call.input)?),
+    ]))
+}
+
+fn encode_tempo_calls(calls: &[TempoCall]) -> anyhow::Result<Vec<u8>> {
+    let items = calls
+        .iter()
+        .map(encode_tempo_call)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(encode_rlp_items(items))
+}
+
+fn encode_tempo_primitive_signature_bytes(
+    signature: &TempoPrimitiveSignature,
+) -> anyhow::Result<Vec<u8>> {
+    match signature {
+        TempoPrimitiveSignature::Secp256k1 { r, s, y_parity, v } => {
+            let parity = y_parity
+                .as_deref()
+                .or(v.as_deref())
+                .ok_or_else(|| anyhow!("Tempo secp256k1 signature is missing yParity/v"))?;
+            let parity = parse_qty_u128_checked(parity, "Tempo signature yParity/v")?;
+            if parity > 1 {
+                bail!("Tempo signature yParity/v must be 0 or 1");
+            }
+
+            let mut out = Vec::with_capacity(65);
+            out.extend_from_slice(&decode_signature_scalar(r, "Tempo signature r")?);
+            out.extend_from_slice(&decode_signature_scalar(s, "Tempo signature s")?);
+            out.push(u8::try_from(parity)? + 27);
+            Ok(out)
+        }
+        TempoPrimitiveSignature::P256 {
+            r,
+            s,
+            pub_key_x,
+            pub_key_y,
+            pre_hash,
+        } => {
+            let mut out = Vec::with_capacity(130);
+            out.push(0x01);
+            out.extend_from_slice(&decode_signature_scalar(r, "Tempo P256 signature r")?);
+            out.extend_from_slice(&decode_signature_scalar(s, "Tempo P256 signature s")?);
+            out.extend(decode_hex_with_len(pub_key_x, 32, "Tempo P256 pubKeyX")?);
+            out.extend(decode_hex_with_len(pub_key_y, 32, "Tempo P256 pubKeyY")?);
+            out.push(u8::from(*pre_hash));
+            Ok(out)
+        }
+        TempoPrimitiveSignature::WebAuthn {
+            r,
+            s,
+            pub_key_x,
+            pub_key_y,
+            webauthn_data,
+        } => {
+            let data = decode_hex(webauthn_data)?;
+            let mut out = Vec::with_capacity(129 + data.len());
+            out.push(0x02);
+            out.extend(data);
+            out.extend_from_slice(&decode_signature_scalar(r, "Tempo WebAuthn signature r")?);
+            out.extend_from_slice(&decode_signature_scalar(s, "Tempo WebAuthn signature s")?);
+            out.extend(decode_hex_with_len(
+                pub_key_x,
+                32,
+                "Tempo WebAuthn pubKeyX",
+            )?);
+            out.extend(decode_hex_with_len(
+                pub_key_y,
+                32,
+                "Tempo WebAuthn pubKeyY",
+            )?);
+            Ok(out)
+        }
+    }
+}
+
+fn encode_tempo_signature_bytes(signature: &TempoSignatureObject) -> anyhow::Result<Vec<u8>> {
+    match signature {
+        TempoSignatureObject::Primitive(signature) => {
+            encode_tempo_primitive_signature_bytes(signature)
+        }
+        TempoSignatureObject::Keychain(signature) => {
+            let mut out = Vec::new();
+            out.push(if signature.version.as_deref() == Some("v2") {
+                0x04
+            } else {
+                0x03
+            });
+            out.extend(decode_hex_with_len(
+                &signature.user_address,
+                20,
+                "Tempo keychain userAddress",
+            )?);
+            out.extend(encode_tempo_primitive_signature_bytes(
+                &signature.signature,
+            )?);
+            Ok(out)
+        }
+    }
+}
+
+fn encode_tempo_authorization(authorization: &TempoSignedAuthorization) -> anyhow::Result<Vec<u8>> {
+    Ok(encode_rlp_items([
+        encode_rlp_big_uint(&authorization.chain_id)?,
+        encode_rlp_bytes(&decode_hex(&authorization.address)?),
+        encode_rlp_big_uint(&authorization.nonce)?,
+        encode_rlp_bytes(&encode_tempo_signature_bytes(&authorization.signature)?),
+    ]))
+}
+
+fn encode_tempo_authorizations(
+    authorizations: &[TempoSignedAuthorization],
+) -> anyhow::Result<Vec<u8>> {
+    let items = authorizations
+        .iter()
+        .map(encode_tempo_authorization)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(encode_rlp_items(items))
+}
+
+fn tempo_signature_type(key_type: &str) -> anyhow::Result<u128> {
+    match key_type {
+        "secp256k1" => Ok(0),
+        "p256" => Ok(1),
+        "webAuthn" => Ok(2),
+        _ => bail!("unsupported Tempo key type: {key_type}"),
+    }
+}
+
+fn encode_tempo_selector_rule(rule: &TempoSelectorRule) -> anyhow::Result<Vec<u8>> {
+    let recipients = rule
+        .recipients
+        .iter()
+        .map(|recipient| Ok(encode_rlp_bytes(&decode_hex(recipient)?)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(encode_rlp_items([
+        encode_rlp_bytes(&decode_hex(&rule.selector)?),
+        encode_rlp_items(recipients),
+    ]))
+}
+
+fn encode_tempo_call_scope(scope: &TempoCallScope) -> anyhow::Result<Vec<u8>> {
+    let rules = scope
+        .selector_rules
+        .iter()
+        .map(encode_tempo_selector_rule)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(encode_rlp_items([
+        encode_rlp_bytes(&decode_hex(&scope.target)?),
+        encode_rlp_items(rules),
+    ]))
+}
+
+fn encode_tempo_token_limit(limit: &TempoTokenLimit) -> anyhow::Result<Vec<u8>> {
+    let mut fields = vec![
+        encode_rlp_bytes(&decode_hex(&limit.token)?),
+        encode_rlp_big_uint(&limit.limit)?,
+    ];
+    if let Some(period) = &limit.period {
+        if parse_qty_u128_checked(period, "Tempo token-limit period")? != 0 {
+            fields.push(encode_rlp_big_uint(period)?);
+        }
+    }
+    Ok(encode_rlp_items(fields))
+}
+
+fn encode_trailing_optional(fields: Vec<Option<Vec<u8>>>) -> Vec<Vec<u8>> {
+    let len = fields
+        .iter()
+        .rposition(Option::is_some)
+        .map_or(0, |index| index + 1);
+    fields
+        .into_iter()
+        .take(len)
+        .map(|field| field.unwrap_or_else(|| encode_rlp_bytes(&[])))
+        .collect()
+}
+
+fn encode_tempo_key_authorization(
+    authorization: &TempoSignedKeyAuthorization,
+) -> anyhow::Result<Vec<u8>> {
+    let limits = authorization
+        .limits
+        .as_ref()
+        .map(|limits| {
+            limits
+                .iter()
+                .map(encode_tempo_token_limit)
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map(encode_rlp_items)
+        })
+        .transpose()?;
+    let allowed_calls = authorization
+        .allowed_calls
+        .as_ref()
+        .map(|scopes| {
+            scopes
+                .iter()
+                .map(encode_tempo_call_scope)
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map(encode_rlp_items)
+        })
+        .transpose()?;
+
+    let mut fields = vec![
+        encode_rlp_big_uint(&authorization.chain_id)?,
+        encode_rlp_uint(tempo_signature_type(&authorization.key_type)?),
+        encode_rlp_bytes(&decode_hex(&authorization.key_id)?),
+    ];
+    fields.extend(encode_trailing_optional(vec![
+        authorization
+            .expiry
+            .as_deref()
+            .map(encode_rlp_big_uint)
+            .transpose()?,
+        limits,
+        allowed_calls,
+        authorization
+            .witness
+            .as_deref()
+            .map(|witness| decode_hex(witness).map(|bytes| encode_rlp_bytes(&bytes)))
+            .transpose()?,
+        authorization
+            .is_admin
+            .is_some_and(|is_admin| is_admin)
+            .then(|| encode_rlp_uint(1)),
+        authorization
+            .account
+            .as_deref()
+            .map(|account| decode_hex(account).map(|bytes| encode_rlp_bytes(&bytes)))
+            .transpose()?,
+    ]));
+
+    Ok(encode_rlp_items([
+        encode_rlp_items(fields),
+        encode_rlp_bytes(&encode_tempo_primitive_signature_bytes(
+            &authorization.signature,
+        )?),
+    ]))
+}
+
+fn encode_tempo_transaction_fields(
+    tx: &RpcTransaction,
+    for_signing: bool,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let chain_id = tx
+        .chain_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("tx.chainId is missing"))?;
+    let max_prio = tx
+        .max_priority_fee_per_gas
+        .as_deref()
+        .ok_or_else(|| anyhow!("tx.maxPriorityFeePerGas is missing"))?;
+    let max_fee = tx
+        .max_fee_per_gas
+        .as_deref()
+        .ok_or_else(|| anyhow!("tx.maxFeePerGas is missing"))?;
+    let calls = tx
+        .calls
+        .as_deref()
+        .ok_or_else(|| anyhow!("tx.calls is missing for 0x76 tx"))?;
+    let nonce_key = tx
+        .nonce_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("tx.nonceKey is missing for 0x76 tx"))?;
+    let has_fee_payer = tx.fee_payer_signature.is_some();
+
+    let fee_token = if for_signing && has_fee_payer {
+        encode_rlp_bytes(&[])
+    } else {
+        tx.fee_token
+            .as_deref()
+            .map(|token| decode_hex(token).map(|bytes| encode_rlp_bytes(&bytes)))
+            .transpose()?
+            .unwrap_or_else(|| encode_rlp_bytes(&[]))
+    };
+    let fee_payer = if for_signing {
+        if has_fee_payer {
+            encode_rlp_bytes(&[0])
+        } else {
+            encode_rlp_bytes(&[])
+        }
+    } else if let Some(signature) = &tx.fee_payer_signature {
+        encode_rlp_items([
+            encode_rlp_big_uint(&signature.v)?,
+            encode_rlp_big_uint(&signature.r)?,
+            encode_rlp_big_uint(&signature.s)?,
+        ])
+    } else {
+        encode_rlp_bytes(&[])
+    };
+
+    let mut fields = vec![
+        encode_rlp_big_uint(chain_id)?,
+        encode_rlp_big_uint(max_prio)?,
+        encode_rlp_big_uint(max_fee)?,
+        encode_rlp_big_uint(&tx.gas)?,
+        encode_tempo_calls(calls)?,
+        decode_access_list(tx.access_list.as_deref().unwrap_or(&[])),
+        encode_rlp_big_uint(nonce_key)?,
+        encode_rlp_big_uint(&tx.nonce)?,
+        tx.valid_before
+            .as_deref()
+            .map(encode_rlp_big_uint)
+            .transpose()?
+            .unwrap_or_else(|| encode_rlp_bytes(&[])),
+        tx.valid_after
+            .as_deref()
+            .map(encode_rlp_big_uint)
+            .transpose()?
+            .unwrap_or_else(|| encode_rlp_bytes(&[])),
+        fee_token,
+        fee_payer,
+        encode_tempo_authorizations(tx.aa_authorization_list.as_deref().unwrap_or(&[]))?,
+    ];
+    if let Some(authorization) = &tx.key_authorization {
+        fields.push(encode_tempo_key_authorization(authorization)?);
+    }
+    Ok(fields)
+}
+
+fn encode_tempo_tx(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
+    let signature = tx
+        .signature
+        .as_ref()
+        .ok_or_else(|| anyhow!("tx.signature is missing for 0x76 tx"))?;
+    let mut fields = encode_tempo_transaction_fields(tx, false)?;
+    fields.push(encode_rlp_bytes(&encode_tempo_signature_bytes(signature)?));
+
+    let mut out = vec![0x76];
+    out.extend(encode_rlp_items(fields));
+    Ok(out)
+}
+
+fn encode_tempo_tx_for_signing(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
+    let mut out = vec![0x76];
+    out.extend(encode_rlp_items(encode_tempo_transaction_fields(tx, true)?));
     Ok(out)
 }
 
@@ -880,20 +1324,28 @@ fn encode_optimism_deposit_tx(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
 /// RPC quantities are minimal-length, so an odd digit count is ordinary —
 /// `hex::decode` rejects it, and signatures whose r or s starts with a zero
 /// nibble would decode to nothing.
-fn decode_hex_big_int(s: &str) -> Vec<u8> {
+fn decode_hex_big_int(s: &str) -> anyhow::Result<Vec<u8>> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if s.is_empty() || s == "0" {
-        return vec![];
+        return Ok(vec![]);
     }
     let bytes = if s.len() % 2 == 1 {
         hex::decode(format!("0{s}"))
     } else {
         hex::decode(s)
     }
-    .unwrap_or_default();
+    .map_err(|e| anyhow!("invalid hexadecimal integer: {e}"))?;
     // strip leading zeros
-    let start = bytes.iter().position(|&b| b != 0).unwrap_or(0);
-    bytes[start..].to_vec()
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let bytes = bytes[start..].to_vec();
+    if bytes.len() > 32 {
+        bail!("integer exceeds 256 bits");
+    }
+    Ok(bytes)
+}
+
+fn encode_rlp_big_uint(s: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(encode_rlp_bytes(&decode_hex_big_int(s)?))
 }
 
 // ─── Receipt encoding ─────────────────────────────────────────────────────────
@@ -1016,36 +1468,38 @@ pub fn recover_tx_sender(tx: &RpcTransaction) -> anyhow::Result<Option<String>> 
     hasher.update(&msg);
     let msg_hash: [u8; 32] = hasher.finalize().into();
 
-    // For Tempo 0x76, use tx.signature object — not supported here, skip
     let tx_type = tx.tx_type.as_deref().unwrap_or("0x0");
     if tx_type == "0x76" {
-        return Ok(None);
+        let signature = tx
+            .signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("tx.signature is missing for 0x76 tx"))?;
+        return recover_tempo_sender(signature, &msg_hash).map(Some);
     }
 
     let r = tx.r.as_deref().ok_or_else(|| anyhow!("tx.r is missing"))?;
     let s = tx.s.as_deref().ok_or_else(|| anyhow!("tx.s is missing"))?;
 
-    let r_bytes = decode_hex_big_int(r);
-    let s_bytes = decode_hex_big_int(s);
+    let r = decode_signature_scalar(r, "tx.r")?;
+    let s = decode_signature_scalar(s, "tx.s")?;
+    let recovery_id = u8::try_from(calculate_sig_recovery(tx)?)?;
+    recover_secp256k1_sender(&msg_hash, &r, &s, recovery_id).map(Some)
+}
 
-    let mut r32 = [0u8; 32];
-    let mut s32 = [0u8; 32];
-    let r_start = 32usize.saturating_sub(r_bytes.len());
-    let s_start = 32usize.saturating_sub(s_bytes.len());
-    r32[r_start..].copy_from_slice(&r_bytes);
-    s32[s_start..].copy_from_slice(&s_bytes);
-
+fn recover_secp256k1_sender(
+    msg_hash: &[u8; 32],
+    r: &[u8; 32],
+    s: &[u8; 32],
+    recovery_id: u8,
+) -> anyhow::Result<String> {
     let mut sig = [0u8; 64];
-    sig[..32].copy_from_slice(&r32);
-    sig[32..].copy_from_slice(&s32);
-
-    let recovery_id = calculate_sig_recovery(tx)?;
+    sig[..32].copy_from_slice(r);
+    sig[32..].copy_from_slice(s);
 
     use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
     let sig_obj = Signature::from_bytes((&sig).into()).map_err(|e| anyhow!("sig parse: {e}"))?;
-    let rec_id =
-        RecoveryId::try_from(recovery_id as u8).map_err(|e| anyhow!("recovery_id: {e}"))?;
-    let vk = VerifyingKey::recover_from_prehash(&msg_hash, &sig_obj, rec_id)
+    let rec_id = RecoveryId::try_from(recovery_id).map_err(|e| anyhow!("recovery_id: {e}"))?;
+    let vk = VerifyingKey::recover_from_prehash(msg_hash, &sig_obj, rec_id)
         .map_err(|e| anyhow!("recovery failed: {e}"))?;
 
     let encoded_point = vk.to_encoded_point(false);
@@ -1057,18 +1511,73 @@ pub fn recover_tx_sender(tx: &RpcTransaction) -> anyhow::Result<Option<String>> 
     hasher.update(pub_key_bytes);
     let hash = hasher.finalize();
     let addr = &hash[12..];
-    Ok(Some(format!("0x{}", hex::encode(addr))))
+    Ok(format!("0x{}", hex::encode(addr)))
+}
+
+fn recover_tempo_sender(
+    signature: &TempoSignatureObject,
+    msg_hash: &[u8; 32],
+) -> anyhow::Result<String> {
+    match signature {
+        TempoSignatureObject::Keychain(signature) => Ok(to_hex(&decode_hex_with_len(
+            &signature.user_address,
+            20,
+            "Tempo keychain userAddress",
+        )?)),
+        TempoSignatureObject::Primitive(signature) => {
+            recover_tempo_primitive_sender(signature, msg_hash)
+        }
+    }
+}
+
+fn recover_tempo_primitive_sender(
+    signature: &TempoPrimitiveSignature,
+    msg_hash: &[u8; 32],
+) -> anyhow::Result<String> {
+    match signature {
+        TempoPrimitiveSignature::Secp256k1 { r, s, y_parity, v } => {
+            let parity = y_parity
+                .as_deref()
+                .or(v.as_deref())
+                .ok_or_else(|| anyhow!("Tempo secp256k1 signature is missing yParity/v"))?;
+            let parity = parse_qty_u128_checked(parity, "Tempo signature yParity/v")?;
+            if parity > 1 {
+                bail!("Tempo signature yParity/v must be 0 or 1");
+            }
+            recover_secp256k1_sender(
+                msg_hash,
+                &decode_signature_scalar(r, "Tempo signature r")?,
+                &decode_signature_scalar(s, "Tempo signature s")?,
+                u8::try_from(parity)?,
+            )
+        }
+        TempoPrimitiveSignature::P256 {
+            pub_key_x,
+            pub_key_y,
+            ..
+        }
+        | TempoPrimitiveSignature::WebAuthn {
+            pub_key_x,
+            pub_key_y,
+            ..
+        } => {
+            let mut public_key = decode_hex_with_len(pub_key_x, 32, "Tempo pubKeyX")?;
+            public_key.extend(decode_hex_with_len(pub_key_y, 32, "Tempo pubKeyY")?);
+            let hash = keccak256(&public_key);
+            Ok(to_hex(&hash[12..]))
+        }
+    }
 }
 
 fn calculate_sig_recovery(tx: &RpcTransaction) -> anyhow::Result<u64> {
     let v = tx.v.as_deref().unwrap_or("0x0");
-    let v_int = parse_qty_u128(v);
+    let v_int = parse_qty_u128_checked(v, "tx.v")?;
 
     if v_int == 0 || v_int == 1 {
-        return Ok(v_int as u64);
+        return u64::try_from(v_int).map_err(|_| anyhow!("tx.v exceeds u64"));
     }
     if v_int == 27 || v_int == 28 {
-        return Ok(v_int as u64 - 27);
+        return Ok(u64::try_from(v_int).map_err(|_| anyhow!("tx.v exceeds u64"))? - 27);
     }
 
     // Legacy with EIP-155 replay protection
@@ -1076,8 +1585,19 @@ fn calculate_sig_recovery(tx: &RpcTransaction) -> anyhow::Result<u64> {
         .chain_id
         .as_deref()
         .ok_or_else(|| anyhow!("tx.chainId is missing for EIP-155 recovery"))?;
-    let chain_id_int = parse_qty_u128(chain_id);
-    let recovery = v_int as u64 - (chain_id_int as u64 * 2 + 35);
+    let chain_id_int = parse_qty_u128_checked(chain_id, "tx.chainId")?;
+    let chain_id = u64::try_from(chain_id_int).map_err(|_| anyhow!("tx.chainId exceeds u64"))?;
+    let v = u64::try_from(v_int).map_err(|_| anyhow!("tx.v exceeds u64"))?;
+    let eip155_base = chain_id
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(35))
+        .ok_or_else(|| anyhow!("EIP-155 recovery value overflows u64"))?;
+    let recovery = v
+        .checked_sub(eip155_base)
+        .ok_or_else(|| anyhow!("tx.v is invalid for chainId"))?;
+    if recovery > 1 {
+        bail!("tx.v yields invalid recovery id {recovery}");
+    }
     Ok(recovery)
 }
 
@@ -1303,7 +1823,7 @@ fn serialize_transaction_for_signing(tx: &RpcTransaction) -> anyhow::Result<Opti
             payload.extend(encode_rlp_uint(parse_qty_u128(value)));
             payload.extend(encode_rlp_bytes(&decode_hex(input)?));
             payload.extend(decode_access_list(access_list));
-            payload.extend(decode_authorization_list(auth_list));
+            payload.extend(decode_authorization_list(auth_list)?);
 
             let mut list = Vec::new();
             encode_rlp_length(payload.len(), 0xc0, &mut list);
@@ -1313,8 +1833,50 @@ fn serialize_transaction_for_signing(tx: &RpcTransaction) -> anyhow::Result<Opti
             out.extend(list);
             Ok(Some(out))
         }
-        // Arbitrum, Optimism deposit, Polygon state-sync: no sender recovery
-        "0x64" | "0x65" | "0x66" | "0x68" | "0x69" | "0x6a" | "0x7e" | "0x7f" | "0x76" => Ok(None),
-        _ => Ok(None),
+        "0x3f" => {
+            let chain_id = tx
+                .chain_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("chainId missing"))?;
+            let max_prio = tx
+                .max_priority_fee_per_gas
+                .as_deref()
+                .ok_or_else(|| anyhow!("maxPriorityFeePerGas missing"))?;
+            let max_fee = tx
+                .max_fee_per_gas
+                .as_deref()
+                .ok_or_else(|| anyhow!("maxFeePerGas missing"))?;
+            let value = tx
+                .value
+                .as_deref()
+                .ok_or_else(|| anyhow!("value missing"))?;
+            let nonce_key = tx
+                .nonce_key
+                .as_deref()
+                .ok_or_else(|| anyhow!("nonceKey missing"))?;
+            let to = tx
+                .to
+                .as_deref()
+                .map(decode_hex)
+                .transpose()?
+                .unwrap_or_default();
+            let mut payload = stable_tx_base_payload(tx, chain_id, max_prio, max_fee, value, &to)?;
+            payload.extend(encode_rlp_uint(parse_qty_u128(nonce_key)));
+            payload.extend(encode_rlp_uint(parse_qty_u128(
+                tx.timeout_timestamp.as_deref().unwrap_or("0x0"),
+            )));
+
+            let mut list = Vec::new();
+            encode_rlp_length(payload.len(), 0xc0, &mut list);
+            list.extend(payload);
+            let mut out = vec![0x3f];
+            out.extend(list);
+            Ok(Some(out))
+        }
+        // These transaction families carry no ECDSA sender signature.
+        "0x64" | "0x65" | "0x66" | "0x68" | "0x69" | "0x6a" | "0x7e" | "0x7f" => Ok(None),
+        // Tempo recovery uses the signature object after hashing this payload.
+        "0x76" => encode_tempo_tx_for_signing(tx).map(Some),
+        _ => bail!("unsupported tx type for sender recovery: {tx_type}"),
     }
 }

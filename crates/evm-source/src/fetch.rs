@@ -43,6 +43,18 @@ pub struct RpcOptions {
     pub use_gas_used_for_receipts_root: bool,
 }
 
+impl RpcOptions {
+    fn validate_request(&self, req: &crate::types::DataRequest) -> Result<()> {
+        if self.verify_receipts_root && !req.receipts {
+            bail!("verify_receipts_root requires receipt acquisition");
+        }
+        if self.use_gas_used_for_receipts_root && !self.verify_receipts_root {
+            bail!("use_gas_used_for_receipts_root requires verify_receipts_root");
+        }
+        Ok(())
+    }
+}
+
 /// `P-FINALITY-VIEW-TTL`. The head moves at the chain's finality rate, so asking
 /// per use buys no freshness.
 const FINALIZED_HEAD_TTL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -337,7 +349,7 @@ impl Rpc {
                 Some(b) => {
                     if i > 0 {
                         let prev_hash = &chain[i - 1].hash;
-                        if prev_hash != &b.block.parent_hash {
+                        if !prev_hash.eq_ignore_ascii_case(&b.block.parent_hash) {
                             break;
                         }
                     }
@@ -545,7 +557,7 @@ impl Rpc {
             let computed = utils
                 .calculate_block_hash(block)
                 .map_err(|e| format!("block hash verification failed: {e}"))?;
-            if computed != raw.hash {
+            if !computed.eq_ignore_ascii_case(&raw.hash) {
                 return Err(format!(
                     "block hash mismatch: expected {} got {computed}",
                     raw.hash
@@ -559,7 +571,7 @@ impl Rpc {
                 .map_err(|e| format!("transactions root verification failed: {e}"))?;
             // `None` — the block carries a transaction the RPC cannot express.
             if let Some(computed) = computed {
-                if computed != block.transactions_root {
+                if !computed.eq_ignore_ascii_case(&block.transactions_root) {
                     return Err(format!(
                         "transactions root mismatch: expected {} got {computed}",
                         block.transactions_root
@@ -584,18 +596,27 @@ impl Rpc {
         }
 
         if self.options.verify_withdrawals_root {
-            if let (Some(claimed), Some(withdrawals)) = (
+            match (
                 block.withdrawals_root.as_deref(),
                 block.withdrawals.as_ref(),
             ) {
-                let refs: Vec<&RpcWithdrawal> = withdrawals.iter().collect();
-                let computed = utils
-                    .calculate_withdrawals_root(&refs)
-                    .map_err(|e| format!("withdrawals root verification failed: {e}"))?;
-                if computed != claimed {
-                    return Err(format!(
-                        "withdrawals root mismatch: expected {claimed} got {computed}"
-                    ));
+                (Some(claimed), Some(withdrawals)) => {
+                    let refs: Vec<&RpcWithdrawal> = withdrawals.iter().collect();
+                    let computed = utils
+                        .calculate_withdrawals_root(&refs)
+                        .map_err(|e| format!("withdrawals root verification failed: {e}"))?;
+                    if !computed.eq_ignore_ascii_case(claimed) {
+                        return Err(format!(
+                            "withdrawals root mismatch: expected {claimed} got {computed}"
+                        ));
+                    }
+                }
+                (None, None) => {}
+                (Some(_), None) => {
+                    return Err("withdrawals are missing while withdrawalsRoot is present".into())
+                }
+                (None, Some(_)) => {
+                    return Err("withdrawalsRoot is missing while withdrawals are present".into())
                 }
             }
         }
@@ -622,7 +643,7 @@ impl Rpc {
 
         if self.options.verify_logs_bloom {
             let computed = utils.calculate_logs_bloom(&block.block, logs);
-            if computed != block.block.logs_bloom {
+            if !computed.eq_ignore_ascii_case(&block.block.logs_bloom) {
                 return Err(format!(
                     "logs bloom mismatch: expected {} got {computed}",
                     block.block.logs_bloom
@@ -642,10 +663,19 @@ impl Rpc {
     ) -> VerificationResult {
         if self.options.check_cumulative_gas_used {
             let mut prev = 0u128;
-            for receipt in receipts {
-                let cumulative = parse_qty_u128(&receipt.cumulative_gas_used);
-                let used = parse_qty_u128(&receipt.gas_used);
-                if cumulative != prev + used {
+            for receipt in utils.committed_receipts(&block.block, receipts.iter()) {
+                let cumulative =
+                    parse_qty_u128(&receipt.cumulative_gas_used, "receipt.cumulativeGasUsed")
+                        .map_err(|error| format!("{error} at tx {}", receipt.transaction_hash))?;
+                let used = parse_qty_u128(&receipt.gas_used, "receipt.gasUsed")
+                    .map_err(|error| format!("{error} at tx {}", receipt.transaction_hash))?;
+                let expected = prev.checked_add(used).ok_or_else(|| {
+                    format!(
+                        "cumulative gas used overflow at tx {}",
+                        receipt.transaction_hash
+                    )
+                })?;
+                if cumulative != expected {
                     return Err(format!(
                         "cumulative gas used check failed at tx {}",
                         receipt.transaction_hash
@@ -660,7 +690,7 @@ impl Rpc {
             let computed = utils
                 .calculate_receipts_root(&block.block, &refs)
                 .map_err(|e| format!("receipts root verification failed: {e}"))?;
-            if computed != block.block.receipts_root {
+            if !computed.eq_ignore_ascii_case(&block.block.receipts_root) {
                 return Err(format!(
                     "receipts root mismatch: expected {} got {computed}",
                     block.block.receipts_root
@@ -676,6 +706,8 @@ impl Rpc {
         blocks: &mut Vec<RawRpcBlock>,
         req: &crate::types::DataRequest,
     ) -> Result<()> {
+        self.options.validate_request(req)?;
+
         let _tasks: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>> =
             Vec::new();
 
@@ -865,7 +897,10 @@ impl Rpc {
                         raw_receipts.into_iter().flatten().collect();
 
                     // Check all receipts belong to this block (hash consistency)
-                    if let Some(bad) = receipts.iter().find(|r| r.block_hash != block.hash) {
+                    if let Some(bad) = receipts
+                        .iter()
+                        .find(|r| !r.block_hash.eq_ignore_ascii_case(&block.hash))
+                    {
                         let msg = format!(
                             "eth_getBlockReceipts returned receipts for a different block \
                              (header {}, receipt block_hash {}) — reorg / load-balanced \
@@ -947,7 +982,10 @@ impl Rpc {
             }
 
             // Hash consistency check
-            if let Some(bad) = receipts.iter().find(|r| r.block_hash != block.hash) {
+            if let Some(bad) = receipts
+                .iter()
+                .find(|r| !r.block_hash.eq_ignore_ascii_case(&block.hash))
+            {
                 let msg = format!(
                     "eth_getTransactionReceipt returned receipts for a different block \
                      (header {}, receipt block_hash {}) — reorg / load-balanced \
@@ -1536,10 +1574,12 @@ fn trace_block_replays(
         .map(|item| parse_entry(item, "trace frame", block))
         .collect::<Component<_>>()?;
 
-    if let Some(foreign) = frames
-        .iter()
-        .find(|f| f.block_hash.as_deref() != Some(&block.hash))
-    {
+    if let Some(foreign) = frames.iter().find(|frame| {
+        frame
+            .block_hash
+            .as_deref()
+            .is_none_or(|hash| !hash.eq_ignore_ascii_case(&block.hash))
+    }) {
         return Err(format!(
             "block {}: trace_block answered with a frame of block {:?}",
             block.number, foreign.block_hash
@@ -1599,7 +1639,11 @@ fn renumber_logs(receipts: &mut [RpcReceipt]) {
     }
 }
 
-fn parse_qty_u128(s: &str) -> u128 {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    u128::from_str_radix(s, 16).unwrap_or(0)
+fn parse_qty_u128(s: &str, field: &str) -> Component<u128> {
+    let digits = s.strip_prefix("0x").unwrap_or(s);
+    if digits.is_empty() {
+        return Err(format!("{field} is an empty hexadecimal quantity"));
+    }
+    u128::from_str_radix(digits, 16)
+        .map_err(|error| format!("{field} is not a valid u128 hexadecimal quantity: {error}"))
 }

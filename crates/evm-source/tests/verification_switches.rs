@@ -33,6 +33,7 @@ fn fixture(file: &str) -> Value {
 /// The recorded block and receipts, with whatever the case forged.
 #[derive(Clone)]
 struct Upstream {
+    chain_id: Value,
     block: Value,
     receipts: Value,
 }
@@ -40,9 +41,15 @@ struct Upstream {
 impl Upstream {
     fn recorded() -> Self {
         Upstream {
+            chain_id: json!("0x1"),
             block: fixture("block.json"),
             receipts: fixture("receipts.json"),
         }
+    }
+
+    fn on_chain(mut self, chain_id: &str) -> Self {
+        self.chain_id = json!(chain_id);
+        self
     }
 
     fn forge_block(mut self, f: impl FnOnce(&mut Value)) -> Self {
@@ -83,7 +90,7 @@ async fn answer(State(up): State<Arc<Upstream>>, body: axum::body::Bytes) -> imp
         let params = call.get("params").cloned().unwrap_or(json!([]));
         let p0 = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
         let result = match method {
-            "eth_chainId" => json!("0x1"),
+            "eth_chainId" => up.chain_id.clone(),
             "eth_getBlockByNumber" => up.block.clone(),
             // The probe that picks the receipts method.
             "eth_getBlockReceipts" if p0 == "latest" => json!([]),
@@ -108,7 +115,11 @@ async fn answer(State(up): State<Arc<Upstream>>, body: axum::body::Bytes) -> imp
 }
 
 /// One acquisition under the given policy.
-async fn acquire(up: Upstream, options: RpcOptions, req: DataRequest) -> Vec<RawRpcBlock> {
+async fn try_acquire(
+    up: Upstream,
+    options: RpcOptions,
+    req: DataRequest,
+) -> anyhow::Result<Vec<RawRpcBlock>> {
     let app = Router::new()
         .route("/", post(answer))
         .with_state(Arc::new(up));
@@ -128,7 +139,12 @@ async fn acquire(up: Upstream, options: RpcOptions, req: DataRequest) -> Vec<Raw
     Rpc::new(client, options)
         .get_block_batch(&[NUMBER], &req)
         .await
-        .expect("acquisition reports incoherence through the block, never as an error (GAP-32)")
+}
+
+async fn acquire(up: Upstream, options: RpcOptions, req: DataRequest) -> Vec<RawRpcBlock> {
+    try_acquire(up, options, req)
+        .await
+        .expect("acquisition reports block incoherence through the block (GAP-32)")
 }
 
 fn headers_only() -> DataRequest {
@@ -185,8 +201,54 @@ async fn the_recorded_block_passes_every_switch() {
     let blocks = acquire(Upstream::recorded(), all_switches_on(), with_receipts()).await;
     assert_accepted(&blocks, "all switches on");
 
-    let blocks = acquire(Upstream::recorded(), all_switches_on(), with_logs()).await;
-    assert_accepted(&blocks, "all switches on, logs path");
+    let blocks = acquire(
+        Upstream::recorded(),
+        RpcOptions {
+            verify_receipts_root: false,
+            ..all_switches_on()
+        },
+        with_logs(),
+    )
+    .await;
+    assert_accepted(&blocks, "all applicable switches on, logs path");
+}
+
+#[tokio::test]
+async fn receipts_root_verification_rejects_the_logs_only_path() {
+    let forged = Upstream::recorded().forge_receipts(|r| {
+        r[0]["cumulativeGasUsed"] = json!("0xdead");
+    });
+
+    let error = try_acquire(
+        forged,
+        RpcOptions {
+            verify_receipts_root: true,
+            ..RpcOptions::default()
+        },
+        with_logs(),
+    )
+    .await
+    .expect_err("a receipt-root check without receipts is an invalid request");
+    assert!(error
+        .to_string()
+        .contains("verify_receipts_root requires receipt acquisition"));
+}
+
+#[tokio::test]
+async fn receipt_root_encoding_override_requires_root_verification() {
+    let error = try_acquire(
+        Upstream::recorded(),
+        RpcOptions {
+            use_gas_used_for_receipts_root: true,
+            ..RpcOptions::default()
+        },
+        with_receipts(),
+    )
+    .await
+    .expect_err("a receipt encoding override without its root check is invalid");
+    assert!(error
+        .to_string()
+        .contains("use_gas_used_for_receipts_root requires verify_receipts_root"));
 }
 
 #[tokio::test]
@@ -253,6 +315,64 @@ async fn a_forged_withdrawal_is_caught_only_by_the_withdrawals_root_switch() {
 }
 
 #[tokio::test]
+async fn withdrawals_root_verification_rejects_asymmetric_presence() {
+    for (what, forged) in [
+        (
+            "missing withdrawals",
+            Upstream::recorded().forge_block(|b| b["withdrawals"] = Value::Null),
+        ),
+        (
+            "missing withdrawals root",
+            Upstream::recorded().forge_block(|b| b["withdrawalsRoot"] = Value::Null),
+        ),
+    ] {
+        let blocks = acquire(
+            forged,
+            RpcOptions {
+                verify_withdrawals_root: true,
+                ..RpcOptions::default()
+            },
+            headers_only(),
+        )
+        .await;
+        assert_rejected(&blocks, what);
+    }
+}
+
+#[tokio::test]
+async fn verification_accepts_uppercase_hex_commitments() {
+    let upper = Upstream::recorded().forge_block(|block| {
+        for field in [
+            "transactionsRoot",
+            "receiptsRoot",
+            "withdrawalsRoot",
+            "logsBloom",
+        ] {
+            let value = block[field].as_str().expect("hex field");
+            block[field] = json!(format!("0x{}", value[2..].to_ascii_uppercase()));
+        }
+    });
+
+    let blocks = acquire(upper, all_switches_on(), with_receipts()).await;
+    assert_accepted(&blocks, "uppercase hex commitments");
+
+    let upper_hash = Upstream::recorded().forge_block(|block| {
+        let value = block["hash"].as_str().expect("block hash");
+        block["hash"] = json!(format!("0x{}", value[2..].to_ascii_uppercase()));
+    });
+    let blocks = acquire(
+        upper_hash,
+        RpcOptions {
+            verify_block_hash: true,
+            ..RpcOptions::default()
+        },
+        headers_only(),
+    )
+    .await;
+    assert_accepted(&blocks, "uppercase block hash");
+}
+
+#[tokio::test]
 async fn a_forged_header_field_is_caught_only_by_the_block_hash_switch() {
     let forged = Upstream::recorded().forge_block(|b| {
         b["stateRoot"] =
@@ -294,6 +414,106 @@ async fn a_forged_receipt_is_caught_only_by_the_receipts_root_switch() {
     )
     .await;
     assert_rejected(&blocks, "verify_receipts_root");
+}
+
+#[tokio::test]
+async fn hyperliquid_system_receipt_is_excluded_from_cumulative_gas_check() {
+    let system_receipt = Upstream::recorded()
+        .forge_block(|block| {
+            let tx = block["transactions"]
+                .as_array_mut()
+                .expect("transactions array")
+                .last_mut()
+                .expect("a transaction");
+            tx["gasPrice"] = json!("0x0");
+        })
+        .forge_receipts(|receipts| {
+            let receipt = receipts
+                .as_array_mut()
+                .expect("receipts array")
+                .last_mut()
+                .expect("a receipt");
+            receipt["cumulativeGasUsed"] = json!("0x0");
+        });
+
+    let blocks = acquire(
+        system_receipt.clone(),
+        RpcOptions {
+            check_cumulative_gas_used: true,
+            ..RpcOptions::default()
+        },
+        with_receipts(),
+    )
+    .await;
+    assert_rejected(&blocks, "baseline cumulative-gas policy");
+
+    let blocks = acquire(
+        system_receipt.on_chain("0x3e7"),
+        RpcOptions {
+            check_cumulative_gas_used: true,
+            ..RpcOptions::default()
+        },
+        with_receipts(),
+    )
+    .await;
+    assert_accepted(&blocks, "Hyperliquid cumulative-gas exemption");
+}
+
+#[tokio::test]
+async fn cumulative_gas_overflow_marks_the_block_incoherent() {
+    let forged = Upstream::recorded().forge_receipts(|receipts| {
+        let receipts = receipts.as_array_mut().expect("receipts array");
+        assert!(receipts.len() >= 2, "fixture needs two receipts");
+        receipts[0]["gasUsed"] = json!("0xffffffffffffffffffffffffffffffff");
+        receipts[0]["cumulativeGasUsed"] = json!("0xffffffffffffffffffffffffffffffff");
+        receipts[1]["gasUsed"] = json!("0x1");
+    });
+
+    let blocks = acquire(
+        forged,
+        RpcOptions {
+            check_cumulative_gas_used: true,
+            ..RpcOptions::default()
+        },
+        with_receipts(),
+    )
+    .await;
+    assert_rejected(&blocks, "cumulative-gas overflow");
+    assert!(blocks[0]
+        .error_message
+        .as_deref()
+        .is_some_and(|reason| reason.contains("cumulative gas used overflow")));
+}
+
+#[tokio::test]
+async fn malformed_cumulative_gas_quantities_mark_the_block_incoherent() {
+    for value in ["0xzz", "0x100000000000000000000000000000000"] {
+        let forged = Upstream::recorded().forge_receipts(|receipts| {
+            for receipt in receipts.as_array_mut().expect("receipts array") {
+                receipt["gasUsed"] = json!(value);
+                receipt["cumulativeGasUsed"] = json!(value);
+            }
+        });
+
+        let blocks = acquire(
+            forged,
+            RpcOptions {
+                check_cumulative_gas_used: true,
+                ..RpcOptions::default()
+            },
+            with_receipts(),
+        )
+        .await;
+        assert_rejected(&blocks, "malformed cumulative-gas quantity");
+        assert!(
+            blocks[0]
+                .error_message
+                .as_deref()
+                .is_some_and(|reason| reason.contains("receipt.cumulativeGasUsed")),
+            "unexpected error for {value}: {:?}",
+            blocks[0].error_message
+        );
+    }
 }
 
 #[tokio::test]

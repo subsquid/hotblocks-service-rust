@@ -598,6 +598,249 @@ async fn test_speculative_two_blocks_emitted_in_order() {
     );
 }
 
+// ─── Speculative-head incoherence budget tests ──────────────────────────────
+
+#[derive(Clone)]
+struct AlternatingHeadState {
+    block_calls: Arc<AtomicUsize>,
+    block_hash: &'static str,
+    parent_hash: &'static str,
+}
+
+async fn alternating_head_handler(
+    State(state): State<AlternatingHeadState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let request: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+    let batched = request.is_array();
+    let calls = request.as_array().cloned().unwrap_or_else(|| vec![request]);
+
+    let responses: Vec<Value> = calls
+        .iter()
+        .map(|call| {
+            let id = call.get("id").cloned().unwrap_or(json!(1));
+            let method = call.get("method").and_then(Value::as_str).unwrap_or("");
+            let tag = call
+                .get("params")
+                .and_then(|params| params.get(0))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let result = match method {
+                "eth_chainId" => json!("0x1"),
+                "eth_getBlockByNumber" if tag == "0x64" => {
+                    let call = state.block_calls.fetch_add(1, Ordering::SeqCst);
+                    if call % 2 == 0 {
+                        make_rpc_block(100, state.block_hash, state.parent_hash)
+                    } else {
+                        Value::Null
+                    }
+                }
+                _ => Value::Null,
+            };
+            json!({"jsonrpc": "2.0", "id": id, "result": result})
+        })
+        .collect();
+
+    let response = if batched {
+        serde_json::to_vec(&responses)
+    } else {
+        serde_json::to_vec(&responses[0])
+    }
+    .expect("serialize response");
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        response,
+    )
+}
+
+#[tokio::test]
+async fn absent_head_answers_do_not_reset_the_incoherence_budget() {
+    use evm_source::fetch::{Rpc, RpcOptions, P_ENRICH_RETRIES};
+    use evm_source::ingest::ingest_range;
+    use evm_source::normalization::MappingOptions;
+    use evm_source::types::DataRequest;
+    use futures::StreamExt;
+
+    let state = AlternatingHeadState {
+        block_calls: Arc::new(AtomicUsize::new(0)),
+        block_hash: "0xaaaa000000000000000000000000000000000000000000000000000000000100",
+        parent_hash: "0xbbbb000000000000000000000000000000000000000000000000000000000099",
+    };
+    let app = Router::new()
+        .route("/", post(alternating_head_handler))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let rpc = Arc::new(Rpc::new(
+        make_client(&format!("http://127.0.0.1:{}", addr.port())),
+        RpcOptions {
+            verify_block_hash: true,
+            ..RpcOptions::default()
+        },
+    ));
+    let mut stream = Box::pin(
+        ingest_range(
+            rpc,
+            Arc::new(DataRequest::default()),
+            Arc::new(MappingOptions {
+                with_traces: false,
+                with_state_diffs: false,
+            }),
+            100,
+            Some(100),
+            5,
+            5,
+            "latest",
+            false,
+        )
+        .await,
+    );
+
+    let item = tokio::time::timeout(Duration::from_secs(4), stream.next())
+        .await
+        .expect("per-block retry budget must terminate the stream")
+        .expect("stream must report the acquisition failure");
+    let error = item.expect_err("alternating incoherent/null answers must fail loud");
+    assert!(
+        error.to_string().contains(&format!(
+            "failed to acquire block 100 after {P_ENRICH_RETRIES} retries"
+        )),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[derive(Clone)]
+struct DrainFailureState {
+    hash_100: &'static str,
+    hash_101: &'static str,
+    hash_99: &'static str,
+}
+
+async fn drain_failure_handler(
+    State(state): State<DrainFailureState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let request: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+    let batched = request.is_array();
+    let calls = request.as_array().cloned().unwrap_or_else(|| vec![request]);
+
+    let responses: Vec<Value> = calls
+        .iter()
+        .map(|call| {
+            let id = call.get("id").cloned().unwrap_or(json!(1));
+            let method = call.get("method").and_then(Value::as_str).unwrap_or("");
+            let tag = call
+                .get("params")
+                .and_then(|params| params.get(0))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let result = match method {
+                "eth_chainId" => json!("0x1"),
+                "eth_getBlockByNumber" if tag == "0x64" => {
+                    let mut block = make_rpc_block(100, state.hash_100, state.hash_99);
+                    block
+                        .as_object_mut()
+                        .expect("block object")
+                        .remove("withdrawals");
+                    block
+                }
+                "eth_getBlockByNumber" if tag == "0x65" => {
+                    make_rpc_block(101, state.hash_101, state.hash_100)
+                }
+                "eth_getBlockReceipts" if tag == "latest" => json!([]),
+                "eth_getBlockReceipts" => Value::Null,
+                _ => Value::Null,
+            };
+            json!({"jsonrpc": "2.0", "id": id, "result": result})
+        })
+        .collect();
+
+    let response = if batched {
+        serde_json::to_vec(&responses)
+    } else {
+        serde_json::to_vec(&responses[0])
+    }
+    .expect("serialize response");
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        response,
+    )
+}
+
+#[tokio::test]
+async fn head_incoherence_remains_the_primary_error_when_pending_enrichment_fails() {
+    use evm_source::fetch::{Rpc, RpcOptions, P_ENRICH_RETRIES};
+    use evm_source::ingest::ingest_range;
+    use evm_source::normalization::MappingOptions;
+    use evm_source::types::DataRequest;
+    use futures::StreamExt;
+
+    let state = DrainFailureState {
+        hash_100: "0xaaaa000000000000000000000000000000000000000000000000000000000100",
+        hash_101: "0xbbbb000000000000000000000000000000000000000000000000000000000101",
+        hash_99: "0xcccc000000000000000000000000000000000000000000000000000000000099",
+    };
+    let app = Router::new()
+        .route("/", post(drain_failure_handler))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let rpc = Arc::new(Rpc::new(
+        make_client(&format!("http://127.0.0.1:{}", addr.port())),
+        RpcOptions {
+            verify_withdrawals_root: true,
+            ..RpcOptions::default()
+        },
+    ));
+    let mut stream = Box::pin(
+        ingest_range(
+            rpc,
+            Arc::new(DataRequest {
+                receipts: true,
+                ..DataRequest::default()
+            }),
+            Arc::new(MappingOptions {
+                with_traces: false,
+                with_state_diffs: false,
+            }),
+            100,
+            Some(101),
+            5,
+            5,
+            "latest",
+            false,
+        )
+        .await,
+    );
+
+    let item = tokio::time::timeout(Duration::from_secs(4), stream.next())
+        .await
+        .expect("retry budgets must terminate the stream")
+        .expect("stream must report the acquisition failure");
+    let error = item.expect_err("the incoherent head must fail loud");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!(
+            "failed to acquire block 101 after {P_ENRICH_RETRIES} retries"
+        )),
+        "head failure was replaced: {error:#}"
+    );
+    assert!(
+        message.contains("while draining earlier blocks: block 100 enrichment failed"),
+        "secondary enrichment failure was lost: {error:#}"
+    );
+}
+
 // ─── Finalizer stall fix test ─────────────────────────────────────────────────
 
 /// Test that a slow probe does not prevent fresh batch passthrough.

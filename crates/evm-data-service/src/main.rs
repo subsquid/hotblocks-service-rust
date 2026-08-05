@@ -131,7 +131,7 @@ struct Args {
     verify_tx_root: bool,
 
     /// Verify block receipts against receipts root
-    #[arg(long)]
+    #[arg(long, requires = "with_receipts")]
     verify_receipts_root: bool,
 
     /// Verify block withdrawals against withdrawals root
@@ -147,11 +147,14 @@ struct Args {
     skip_log_index_check: bool,
 
     /// Do not check cumulativeGasUsed consistency across transactions
-    #[arg(long)]
+    #[arg(long, requires = "with_receipts")]
     skip_cumulative_gas_used_check: bool,
 
     /// Use gasUsed instead of cumulativeGasUsed for receipts root calculation
-    #[arg(long)]
+    #[arg(
+        long,
+        requires_all = ["with_receipts", "verify_receipts_root"]
+    )]
     use_gas_used_for_receipts_root: bool,
 
     /// Automatically adjust finalized head when block cache is full
@@ -329,6 +332,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    fn parse_with(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut args = vec!["evm-data-service", "--http-rpc", "http://localhost:8545"];
+        args.extend_from_slice(extra);
+        Args::try_parse_from(args)
+    }
+
     #[test]
     fn zero_block_cache_size_is_rejected_by_the_cli() {
         let args = [
@@ -339,6 +348,43 @@ mod tests {
             "0",
         ];
         assert!(Args::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn receipts_root_verification_requires_receipt_acquisition() {
+        assert!(parse_with(&[]).is_ok());
+        assert!(parse_with(&["--with-receipts"]).is_ok());
+        assert!(parse_with(&["--verify-receipts-root"]).is_err());
+        assert!(parse_with(&["--with-receipts", "--verify-receipts-root"]).is_ok());
+    }
+
+    #[test]
+    fn receipt_root_encoding_override_requires_the_root_check() {
+        assert!(parse_with(&["--use-gas-used-for-receipts-root"]).is_err());
+        assert!(parse_with(&["--with-receipts", "--use-gas-used-for-receipts-root"]).is_err());
+        assert!(parse_with(&[
+            "--with-receipts",
+            "--verify-receipts-root",
+            "--use-gas-used-for-receipts-root",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn only_receipt_dependent_checks_require_receipt_acquisition() {
+        for flag in [
+            "--verify-block-hash",
+            "--verify-tx-sender",
+            "--verify-tx-root",
+            "--verify-withdrawals-root",
+            "--verify-logs-bloom",
+            "--skip-log-index-check",
+        ] {
+            assert!(parse_with(&[flag]).is_ok(), "{flag}");
+        }
+
+        assert!(parse_with(&["--skip-cumulative-gas-used-check"]).is_err());
+        assert!(parse_with(&["--with-receipts", "--skip-cumulative-gas-used-check",]).is_ok());
     }
 
     #[tokio::test]

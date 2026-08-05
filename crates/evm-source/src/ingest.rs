@@ -239,8 +239,10 @@ pub async fn ingest_range(
                 // Consecutive non-null polls; if the chain is far ahead of us,
                 // fall back to stride backfill.
                 let mut hot_streak: u64 = 0;
-                // Consecutive incoherent answers for `next_num`.
-                let mut incoherent: u32 = 0;
+                // Incoherent answers for `next_num`. A null answer does not
+                // reset this per-block budget: mixed-version upstreams may
+                // alternate a contradictory block with "not produced yet".
+                let mut incoherent_attempts: u32 = 0;
 
                 let spawn_enrich = |body: RawRpcBlock, body_received: Option<Instant>| -> EnrichTask {
                     let rpc2 = rpc.clone();
@@ -285,7 +287,7 @@ pub async fn ingest_range(
                             let now = Instant::now();
                             cadence.record_block(now);
                             hot_streak += 1;
-                            incoherent = 0;
+                            incoherent_attempts = 0;
                             let body_received = if profile_block_timings { Some(now) } else { None };
                             pending.push_back((next_num, spawn_enrich(body, body_received)));
                             next_num += 1;
@@ -300,23 +302,45 @@ pub async fn ingest_range(
                             let reason = body
                                 .error_message
                                 .unwrap_or_else(|| "incoherent block".to_string());
-                            if incoherent >= P_ENRICH_RETRIES {
+                            if incoherent_attempts >= P_ENRICH_RETRIES {
                                 // Deliver what is already in flight first: those
                                 // blocks are complete and sit below the failure
                                 // (WP-11.5).
-                                while let Some((_, task)) = pending.pop_front() {
-                                    let mapped = task.await.map_err(anyhow::Error::from)??;
-                                    yield IngestBatch { blocks: mapped, finalized: None };
+                                let mut drain_failure = None;
+                                while let Some((pending_num, task)) = pending.pop_front() {
+                                    match task.await {
+                                        Ok(Ok(mapped)) => {
+                                            yield IngestBatch { blocks: mapped, finalized: None };
+                                        }
+                                        Ok(Err(error)) => {
+                                            drain_failure = Some(format!(
+                                                "block {pending_num} enrichment failed: {error:#}"
+                                            ));
+                                            break;
+                                        }
+                                        Err(error) => {
+                                            drain_failure = Some(format!(
+                                                "block {pending_num} enrichment task failed: {error}"
+                                            ));
+                                            break;
+                                        }
+                                    }
                                 }
+                                for (_, task) in pending.drain(..) {
+                                    task.abort();
+                                }
+                                let drain_context = drain_failure.map_or_else(String::new, |error| {
+                                    format!("; while draining earlier blocks: {error}")
+                                });
                                 Err(anyhow!(
                                     "failed to acquire block {next_num} after \
-                                     {P_ENRICH_RETRIES} retries: {reason}"
+                                     {P_ENRICH_RETRIES} retries: {reason}{drain_context}"
                                 ))?;
                             }
-                            incoherent += 1;
+                            incoherent_attempts += 1;
                             warn!(
                                 block = next_num,
-                                attempt = incoherent,
+                                attempt = incoherent_attempts,
                                 max_retries = P_ENRICH_RETRIES,
                                 reason = %reason,
                                 "incoherent block at the head, re-acquiring"
@@ -327,7 +351,6 @@ pub async fn ingest_range(
                             // Not produced yet. While waiting, opportunistically
                             // drain a completed front task.
                             hot_streak = 0;
-                            incoherent = 0;
                             let delay = cadence.next_poll_delay(Instant::now());
                             if let Some((_, task)) = pending.front_mut() {
                                 match tokio::time::timeout(delay, task).await {
