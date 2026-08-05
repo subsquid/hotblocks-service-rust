@@ -235,8 +235,7 @@ cost only itself.
 
 **INV-36 — Configuration honesty.** [state]
 Every accepted configuration option observably takes effect; an option the build
-cannot honor fails startup (REQ-14, REQ-32). No silent no-op switches (GAP-8,
-GAP-20).
+cannot honor fails startup (REQ-14, REQ-32). No silent no-op switches (GAP-20).
 *Why:* an operator who enables verification and gets none is running with false
 assurance.
 *Check:* CT-5 — per-option effect probe: each flag flips at least one observable

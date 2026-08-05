@@ -9,10 +9,10 @@ use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
-use crate::chain_utils::ChainUtils;
+use crate::chain_utils::{ChainUtils, Quirk};
 use crate::rpc_data::{
     DebugFrameResult, DebugStateDiffResult, RawRpcBlock, RpcBlock, RpcLog, RpcReceipt,
-    TraceTransactionReplay,
+    RpcWithdrawal, TraceTransactionReplay,
 };
 use crate::types::{qty2_u64, to_qty};
 
@@ -20,6 +20,10 @@ use crate::types::{qty2_u64, to_qty};
 /// block invalid: WP-11.2 re-acquires, WP-11.3 fails loud. Never emptied or
 /// thinned to keep a block servable (INV-28).
 type Component<T> = std::result::Result<T, String>;
+
+/// Why an enabled verification check rejected the block — incoherence on the
+/// same path, never an immediate session error (WP-11.4).
+type VerificationResult = std::result::Result<(), String>;
 
 /// Options for the Rpc fetch layer.
 #[derive(Debug, Clone, Default)]
@@ -42,6 +46,11 @@ pub struct RpcOptions {
 /// `P-FINALITY-VIEW-TTL`. The head moves at the chain's finality rate, so asking
 /// per use buys no freshness.
 const FINALIZED_HEAD_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `P-ENRICH-RETRIES` / `P-ENRICH-DELAY` (spec/15): the whole re-acquisition
+/// budget an incoherent block gets before WP-11.3 fails the session.
+pub const P_ENRICH_RETRIES: u32 = 10;
+pub const P_ENRICH_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Fetch state for the Rpc layer.
 pub struct Rpc {
@@ -386,9 +395,6 @@ impl Rpc {
         // chain *head* (speculative path), where receipts/logs legitimately lag
         // the header, so the window must comfortably exceed that lag for normal
         // head-following not to trip the (now fatal) bound.
-        const MAX_RETRIES: u32 = 10;
-        const DELAY_MS: u64 = 50;
-
         let number = body.number;
         let mut retries: u32 = 0;
 
@@ -411,20 +417,22 @@ impl Rpc {
                 .and_then(|b| b.error_message.clone())
                 .unwrap_or_else(|| "block not available".to_string());
 
-            if retries >= MAX_RETRIES {
-                bail!("failed to enrich block {number} after {MAX_RETRIES} retries: {err_msg}");
+            if retries >= P_ENRICH_RETRIES {
+                bail!(
+                    "failed to enrich block {number} after {P_ENRICH_RETRIES} retries: {err_msg}"
+                );
             }
             retries += 1;
 
             debug!(
                 block = number,
                 attempt = retries,
-                max_retries = MAX_RETRIES,
+                max_retries = P_ENRICH_RETRIES,
                 reason = %err_msg,
                 "block enrichment not ready, retrying whole-block fetch"
             );
 
-            tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+            tokio::time::sleep(P_ENRICH_DELAY).await;
 
             // Re-fetch the whole block (header + data) as one unit — TS
             // getBlockBatch semantics. An empty result (not produced yet / chain
@@ -515,24 +523,8 @@ impl Rpc {
 
                     let mut raw = RawRpcBlock::new(number, hash.clone(), rpc_block);
 
-                    // Verify block hash
-                    if self.options.verify_block_hash {
-                        let computed = if utils.is_tempo {
-                            crate::verification::tempo_block_hash(&raw.block)
-                        } else {
-                            crate::verification::block_hash(&raw.block)
-                        };
-                        match computed {
-                            Ok(h) if h == hash => {}
-                            Ok(h) => {
-                                raw.mark_invalid(format!(
-                                    "block hash mismatch: expected {hash} got {h}"
-                                ));
-                            }
-                            Err(e) => {
-                                warn!("block hash verification error: {e}");
-                            }
-                        }
+                    if let Err(reason) = self.verify_header(&raw, utils) {
+                        raw.mark_invalid(reason);
                     }
 
                     blocks.push(Some(raw));
@@ -541,6 +533,142 @@ impl Rpc {
         }
 
         Ok(blocks)
+    }
+
+    /// The enabled header checks (DEF-25), as coherence gates: the caller marks
+    /// the block, so WP-11.2 re-acquires it and WP-11.3 fails loud rather than
+    /// the session ending on the first answer (REQ-14, WP-11.4).
+    fn verify_header(&self, raw: &RawRpcBlock, utils: &ChainUtils) -> VerificationResult {
+        let block = &raw.block;
+
+        if self.options.verify_block_hash {
+            let computed = utils
+                .calculate_block_hash(block)
+                .map_err(|e| format!("block hash verification failed: {e}"))?;
+            if computed != raw.hash {
+                return Err(format!(
+                    "block hash mismatch: expected {} got {computed}",
+                    raw.hash
+                ));
+            }
+        }
+
+        if self.options.verify_tx_root {
+            let computed = utils
+                .calculate_transactions_root(block)
+                .map_err(|e| format!("transactions root verification failed: {e}"))?;
+            // `None` — the block carries a transaction the RPC cannot express.
+            if let Some(computed) = computed {
+                if computed != block.transactions_root {
+                    return Err(format!(
+                        "transactions root mismatch: expected {} got {computed}",
+                        block.transactions_root
+                    ));
+                }
+            }
+        }
+
+        if self.options.verify_tx_sender {
+            for tx in &block.transactions {
+                let recovered = utils
+                    .recover_tx_sender(tx)
+                    .map_err(|e| format!("sender recovery failed for tx {}: {e}", tx.hash))?;
+                let Some(sender) = recovered else { continue };
+                if !sender.eq_ignore_ascii_case(&tx.from) {
+                    return Err(format!(
+                        "sender mismatch for tx {}: claimed {} recovered {sender}",
+                        tx.hash, tx.from
+                    ));
+                }
+            }
+        }
+
+        if self.options.verify_withdrawals_root {
+            if let (Some(claimed), Some(withdrawals)) = (
+                block.withdrawals_root.as_deref(),
+                block.withdrawals.as_ref(),
+            ) {
+                let refs: Vec<&RpcWithdrawal> = withdrawals.iter().collect();
+                let computed = utils
+                    .calculate_withdrawals_root(&refs)
+                    .map_err(|e| format!("withdrawals root verification failed: {e}"))?;
+                if computed != claimed {
+                    return Err(format!(
+                        "withdrawals root mismatch: expected {claimed} got {computed}"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The enabled checks over a block's logs, and the log-index coherence
+    /// check. Same gate as `verify_header`.
+    fn verify_logs(
+        &self,
+        block: &RawRpcBlock,
+        logs: &[&RpcLog],
+        utils: &ChainUtils,
+    ) -> VerificationResult {
+        if self.options.check_log_index {
+            for (i, log) in logs.iter().enumerate() {
+                let actual = qty2_u64(&log.log_index);
+                if actual != i as u64 {
+                    return Err(format!("log index check failed: expected {i} got {actual}"));
+                }
+            }
+        }
+
+        if self.options.verify_logs_bloom {
+            let computed = utils.calculate_logs_bloom(&block.block, logs);
+            if computed != block.block.logs_bloom {
+                return Err(format!(
+                    "logs bloom mismatch: expected {} got {computed}",
+                    block.block.logs_bloom
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The enabled receipt checks, plus cumulative-gas coherence.
+    fn verify_receipts(
+        &self,
+        block: &RawRpcBlock,
+        receipts: &[RpcReceipt],
+        utils: &ChainUtils,
+    ) -> VerificationResult {
+        if self.options.check_cumulative_gas_used {
+            let mut prev = 0u128;
+            for receipt in receipts {
+                let cumulative = parse_qty_u128(&receipt.cumulative_gas_used);
+                let used = parse_qty_u128(&receipt.gas_used);
+                if cumulative != prev + used {
+                    return Err(format!(
+                        "cumulative gas used check failed at tx {}",
+                        receipt.transaction_hash
+                    ));
+                }
+                prev = cumulative;
+            }
+        }
+
+        if self.options.verify_receipts_root {
+            let refs: Vec<&RpcReceipt> = receipts.iter().collect();
+            let computed = utils
+                .calculate_receipts_root(&block.block, &refs)
+                .map_err(|e| format!("receipts root verification failed: {e}"))?;
+            if computed != block.block.receipts_root {
+                return Err(format!(
+                    "receipts root mismatch: expected {} got {computed}",
+                    block.block.receipts_root
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     async fn add_requested_data(
@@ -628,27 +756,14 @@ impl Rpc {
                 continue;
             }
 
-            if utils.is_stable {
+            if utils.has(Quirk::NonSequentialLogIndexes) {
                 fix_log_indexes(&mut block_logs);
             }
 
-            if self.options.check_log_index {
-                for (i, log) in block_logs.iter().enumerate() {
-                    let actual = qty2_u64(&log.log_index);
-                    if actual != i as u64 {
-                        bail!(
-                            "log index check failed at block {}: expected {i} got {actual}",
-                            block.number
-                        );
-                    }
-                }
-            }
-
-            if self.options.verify_logs_bloom {
-                let log_refs: Vec<&RpcLog> = block_logs.iter().collect();
-                if let Err(e) = crate::verification::verify_logs_bloom(&block.block, &log_refs) {
-                    bail!("block {}: {e}", block.number);
-                }
+            let log_refs: Vec<&RpcLog> = block_logs.iter().collect();
+            if let Err(reason) = self.verify_logs(block, &log_refs, utils) {
+                block.mark_invalid(reason);
+                continue;
             }
 
             block.logs = Some(block_logs);
@@ -761,67 +876,20 @@ impl Rpc {
                         continue;
                     }
 
-                    // Collect logs
-                    let mut logs: Vec<&RpcLog> = Vec::new();
-                    for receipt in &receipts {
-                        for log in &receipt.logs {
-                            logs.push(log);
-                        }
+                    if utils.has(Quirk::NonSequentialLogIndexes) {
+                        renumber_logs(&mut receipts);
                     }
 
-                    if utils.is_stable {
-                        let mut all_logs: Vec<RpcLog> =
-                            receipts.iter().flat_map(|r| r.logs.clone()).collect();
-                        fix_log_indexes(&mut all_logs);
-                        let mut idx = 0;
-                        for receipt in receipts.iter_mut() {
-                            for log in receipt.logs.iter_mut() {
-                                log.log_index = to_qty(idx as u64);
-                                idx += 1;
-                            }
-                        }
-                    }
+                    // After the renumbering: the checks judge what will be served.
+                    let log_refs: Vec<&RpcLog> =
+                        receipts.iter().flat_map(|r| r.logs.iter()).collect();
 
-                    let all_logs: Vec<RpcLog> =
-                        receipts.iter().flat_map(|r| r.logs.clone()).collect();
-
-                    if self.options.check_log_index {
-                        for (j, log) in all_logs.iter().enumerate() {
-                            let actual = qty2_u64(&log.log_index);
-                            if actual != j as u64 {
-                                bail!("log index check failed at block {}", block.number);
-                            }
-                        }
-                    }
-
-                    if self.options.check_cumulative_gas_used {
-                        let mut prev = 0u128;
-                        for receipt in &receipts {
-                            let cumulative = parse_qty_u128(&receipt.cumulative_gas_used);
-                            let used = parse_qty_u128(&receipt.gas_used);
-                            if cumulative != prev + used {
-                                bail!("cumulative gas used check failed at block {}", block.number);
-                            }
-                            prev = cumulative;
-                        }
-                    }
-
-                    if self.options.verify_logs_bloom {
-                        let log_refs: Vec<&RpcLog> = all_logs.iter().collect();
-                        crate::verification::verify_logs_bloom(&block.block, &log_refs)
-                            .map_err(|e| anyhow!("block {}: {e}", block.number))?;
-                    }
-
-                    if self.options.verify_receipts_root {
-                        let receipt_refs: Vec<&RpcReceipt> = receipts.iter().collect();
-                        let computed = crate::verification::receipts_root(
-                            &receipt_refs,
-                            self.options.use_gas_used_for_receipts_root,
-                        )
-                        .map_err(|e| anyhow!("block {}: {e}", block.number))?;
-                        if computed != block.block.receipts_root {
-                            bail!("block {}: receipts root mismatch", block.number);
-                        }
+                    if let Err(reason) = self
+                        .verify_logs(block, &log_refs, utils)
+                        .and_then(|()| self.verify_receipts(block, &receipts, utils))
+                    {
+                        block.mark_invalid(reason);
+                        continue;
                     }
 
                     if block.block.transactions.len() != receipts.len() {
@@ -890,55 +958,17 @@ impl Rpc {
                 continue;
             }
 
-            let all_logs: Vec<RpcLog> = receipts.iter().flat_map(|r| r.logs.clone()).collect();
-
-            if utils.is_stable {
-                // fix log indexes
-                let mut idx = 0;
-                for receipt in receipts.iter_mut() {
-                    for log in receipt.logs.iter_mut() {
-                        log.log_index = to_qty(idx as u64);
-                        idx += 1;
-                    }
-                }
+            if utils.has(Quirk::NonSequentialLogIndexes) {
+                renumber_logs(&mut receipts);
             }
 
-            if self.options.check_log_index {
-                for (j, log) in all_logs.iter().enumerate() {
-                    let actual = qty2_u64(&log.log_index);
-                    if actual != j as u64 {
-                        bail!("log index check failed at block {}", block.number);
-                    }
-                }
-            }
-
-            if self.options.check_cumulative_gas_used {
-                let mut prev = 0u128;
-                for receipt in &receipts {
-                    let cumulative = parse_qty_u128(&receipt.cumulative_gas_used);
-                    let used = parse_qty_u128(&receipt.gas_used);
-                    if cumulative != prev + used {
-                        bail!("cumulative gas used check failed at block {}", block.number);
-                    }
-                    prev = cumulative;
-                }
-            }
-
-            if self.options.verify_logs_bloom {
-                let log_refs: Vec<&RpcLog> = all_logs.iter().collect();
-                crate::verification::verify_logs_bloom(&block.block, &log_refs)
-                    .map_err(|e| anyhow!("block {}: {e}", block.block.number))?;
-            }
-
-            if self.options.verify_receipts_root {
-                let receipt_refs: Vec<&RpcReceipt> = receipts.iter().collect();
-                let computed = crate::verification::receipts_root(
-                    &receipt_refs,
-                    self.options.use_gas_used_for_receipts_root,
-                )?;
-                if computed != block.block.receipts_root {
-                    bail!("block {}: receipts root mismatch", block.number);
-                }
+            let log_refs: Vec<&RpcLog> = receipts.iter().flat_map(|r| r.logs.iter()).collect();
+            if let Err(reason) = self
+                .verify_logs(block, &log_refs, utils)
+                .and_then(|()| self.verify_receipts(block, &receipts, utils))
+            {
+                block.mark_invalid(reason);
+                continue;
             }
 
             block.receipts = Some(receipts);
@@ -1139,7 +1169,12 @@ impl Rpc {
                         })
                         .collect()
                 } else {
-                    match_by_tx_hash(arr, block, "execution traces", utils.is_polygon_based)
+                    match_by_tx_hash(
+                        arr,
+                        block,
+                        "execution traces",
+                        utils.has(Quirk::PartialTraceCoverage),
+                    )
                 };
 
             out.push(frames);
@@ -1233,7 +1268,12 @@ impl Rpc {
                         })
                         .collect()
                 } else {
-                    match_by_tx_hash(arr, block, "state diffs", utils.is_polygon_based)
+                    match_by_tx_hash(
+                        arr,
+                        block,
+                        "state diffs",
+                        utils.has(Quirk::PartialTraceCoverage),
+                    )
                 };
 
             out.push(diffs);
@@ -1545,6 +1585,17 @@ pub fn is_zero_bloom(bloom: &str) -> bool {
 fn fix_log_indexes(logs: &mut Vec<RpcLog>) {
     for (i, log) in logs.iter_mut().enumerate() {
         log.log_index = to_qty(i as u64);
+    }
+}
+
+/// The same renumbering across a block's receipts.
+fn renumber_logs(receipts: &mut [RpcReceipt]) {
+    let mut index = 0u64;
+    for receipt in receipts.iter_mut() {
+        for log in receipt.logs.iter_mut() {
+            log.log_index = to_qty(index);
+            index += 1;
+        }
     }
 }
 

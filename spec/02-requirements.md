@@ -140,7 +140,8 @@ switch. An enabled check that fails makes the block incoherent (REQ-9 path).
 is rejected at startup (INV-36).
 *Acceptance:* for each switch: a corpus block with a forged field is rejected when the
 switch is on and accepted when off; enabling an unimplemented switch fails startup.
-*Trace:* INV-36; GAP-8, GAP-9.
+*Trace:* INV-36; GAP-16 (the transaction types no encoder here expresses are exempt
+from the transaction-commitment check on the networks that emit them).
 
 **REQ-15 — Supported-network quirks.** [MUST]
 For every network in the supported set (an operational decision, ADR-8), known
@@ -237,7 +238,7 @@ invalid values, unsupported combinations, and malformed endpoints are rejected a
 startup with a diagnostic, not at first use.
 *Acceptance:* startup matrix over invalid configs exits non-zero with a diagnostic
 naming the option; INV-36 checks pass for every accepted option.
-*Trace:* INV-36, 14 §configuration; GAP-8, GAP-20.
+*Trace:* INV-36, 14 §configuration; GAP-20.
 
 ## Explicitly unspecified
 

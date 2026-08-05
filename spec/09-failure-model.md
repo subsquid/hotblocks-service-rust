@@ -74,7 +74,7 @@ acquisition, one probe) is contained to that activity plus declared shared budge
 | FM | Fault | Required response |
 |---|---|---|
 | FM-50 | Invalid option value / combination | FM-31 (reject at startup, REQ-32) |
-| FM-51 | Option the build cannot honor | FM-31 (INV-36; GAP-8) |
+| FM-51 | Option the build cannot honor | FM-31 (INV-36) |
 | FM-52 | Wrong network endpoint (chain mismatch mid-run) | manifests as FM-10/FM-19 → containment + FM-30 path; SHOULD be detected at startup by a network-identity check (14 §upstream) |
 | FM-53 | Undersized window for the chain's finality lag | over-window alarm (OB-6) or autoAdjust per WP-24; never OOM-by-design without alarm |
 

@@ -279,16 +279,18 @@ pub fn verify_logs_bloom(block: &RpcBlock, logs: &[&RpcLog]) -> anyhow::Result<(
 // ─── Transactions root ────────────────────────────────────────────────────────
 
 pub fn transactions_root(txs: &[&RpcTransaction]) -> anyhow::Result<String> {
-    let trie = alloy_trie::HashBuilder::default();
     let mut keys_values: Vec<(Vec<u8>, Vec<u8>)> = txs
         .iter()
         .enumerate()
         .map(|(idx, tx)| {
-            let key = rlp_index(idx);
-            let value = encode_transaction(tx).unwrap_or_default();
-            (key, value)
+            // A transaction that will not encode makes the root unknowable; an
+            // empty leaf in its place would compute a root that verifies
+            // against nothing and read as a forgery.
+            let value = encode_transaction(tx)
+                .map_err(|e| anyhow!("transaction {} ({idx}): {e}", tx.hash))?;
+            Ok((rlp_index(idx), value))
         })
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
     keys_values.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut trie = alloy_trie::HashBuilder::default();
@@ -306,11 +308,11 @@ pub fn receipts_root(receipts: &[&RpcReceipt], use_gas_used: bool) -> anyhow::Re
         .iter()
         .enumerate()
         .map(|(idx, r)| {
-            let key = rlp_index(idx);
-            let value = encode_receipt(r, use_gas_used).unwrap_or_default();
-            (key, value)
+            let value = encode_receipt(r, use_gas_used)
+                .map_err(|e| anyhow!("receipt {} ({idx}): {e}", r.transaction_hash))?;
+            Ok((rlp_index(idx), value))
         })
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
     keys_values.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut trie = alloy_trie::HashBuilder::default();
@@ -804,6 +806,22 @@ fn encode_arbitrum_tx(tx: &RpcTransaction, tx_type: &str) -> anyhow::Result<Vec<
             p.extend(encode_rlp_bytes(&decode_hex(input)?));
             p
         }
+        // Submit-retryable: https://github.com/OffchainLabs/go-ethereum/blob/7503143/core/types/arb_types.go#L387
+        "0x6a" => {
+            let chain_id = tx
+                .chain_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("chainId missing"))?;
+            let input = tx
+                .input
+                .as_deref()
+                .ok_or_else(|| anyhow!("input missing"))?;
+
+            let mut p = Vec::new();
+            p.extend(encode_rlp_uint(parse_qty_u128(chain_id)));
+            p.extend(encode_rlp_bytes(&decode_hex(input)?));
+            p
+        }
         _ => bail!("unsupported Arbitrum tx type: {tx_type}"),
     };
 
@@ -858,12 +876,21 @@ fn encode_optimism_deposit_tx(tx: &RpcTransaction) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Decode a hex big integer to minimal bytes (strips leading zeros).
+///
+/// RPC quantities are minimal-length, so an odd digit count is ordinary —
+/// `hex::decode` rejects it, and signatures whose r or s starts with a zero
+/// nibble would decode to nothing.
 fn decode_hex_big_int(s: &str) -> Vec<u8> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if s.is_empty() || s == "0" {
         return vec![];
     }
-    let bytes = hex::decode(s).unwrap_or_default();
+    let bytes = if s.len() % 2 == 1 {
+        hex::decode(format!("0{s}"))
+    } else {
+        hex::decode(s)
+    }
+    .unwrap_or_default();
     // strip leading zeros
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(0);
     bytes[start..].to_vec()
