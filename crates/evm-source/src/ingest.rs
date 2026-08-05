@@ -3,12 +3,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures::stream::{self, StreamExt};
 use tokio::time::sleep;
 use tracing::warn;
 
-use crate::fetch::Rpc;
+use crate::fetch::{Rpc, P_ENRICH_DELAY, P_ENRICH_RETRIES};
 use crate::mapping::map_raw_block;
 use crate::normalization::MappingOptions as NormOptions;
 use crate::rpc_data::RawRpcBlock;
@@ -239,6 +239,8 @@ pub async fn ingest_range(
                 // Consecutive non-null polls; if the chain is far ahead of us,
                 // fall back to stride backfill.
                 let mut hot_streak: u64 = 0;
+                // Consecutive incoherent answers for `next_num`.
+                let mut incoherent: u32 = 0;
 
                 let spawn_enrich = |body: RawRpcBlock, body_received: Option<Instant>| -> EnrichTask {
                     let rpc2 = rpc.clone();
@@ -283,15 +285,49 @@ pub async fn ingest_range(
                             let now = Instant::now();
                             cadence.record_block(now);
                             hot_streak += 1;
+                            incoherent = 0;
                             let body_received = if profile_block_timings { Some(now) } else { None };
                             pending.push_back((next_num, spawn_enrich(body, body_received)));
                             next_num += 1;
                         }
-                        _ => {
-                            // Not produced yet (or an inconsistent LB response,
-                            // which we retry the same way). While waiting,
-                            // opportunistically drain a completed front task.
+                        Some(body) => {
+                            // The block exists and contradicts itself, so waiting
+                            // cannot heal it: WP-11.2 bounds the re-acquisition
+                            // and WP-11.3 ends the session (the ladder takes
+                            // over). A missing block is the arm below, and stays
+                            // unbounded — that one is ordinary head-following.
                             hot_streak = 0;
+                            let reason = body
+                                .error_message
+                                .unwrap_or_else(|| "incoherent block".to_string());
+                            if incoherent >= P_ENRICH_RETRIES {
+                                // Deliver what is already in flight first: those
+                                // blocks are complete and sit below the failure
+                                // (WP-11.5).
+                                while let Some((_, task)) = pending.pop_front() {
+                                    let mapped = task.await.map_err(anyhow::Error::from)??;
+                                    yield IngestBatch { blocks: mapped, finalized: None };
+                                }
+                                Err(anyhow!(
+                                    "failed to acquire block {next_num} after \
+                                     {P_ENRICH_RETRIES} retries: {reason}"
+                                ))?;
+                            }
+                            incoherent += 1;
+                            warn!(
+                                block = next_num,
+                                attempt = incoherent,
+                                max_retries = P_ENRICH_RETRIES,
+                                reason = %reason,
+                                "incoherent block at the head, re-acquiring"
+                            );
+                            sleep(P_ENRICH_DELAY).await;
+                        }
+                        None => {
+                            // Not produced yet. While waiting, opportunistically
+                            // drain a completed front task.
+                            hot_streak = 0;
+                            incoherent = 0;
                             let delay = cadence.next_poll_delay(Instant::now());
                             if let Some((_, task)) = pending.front_mut() {
                                 match tokio::time::timeout(delay, task).await {

@@ -111,7 +111,11 @@ livelock of GAP-5).
    partial components (GAP-3);
 4. [MUST] apply the enabled verification checks (DEF-25) as coherence gates — their
    failures take the same bounded retry-then-fail-loud path as any other incoherence,
-   never an immediate session error (GAP-32);
+   never an immediate session error. A check the build cannot compute for a block —
+   a transaction type it cannot re-encode — leaves the block unverified rather than
+   rejected, and only on the networks REQ-15 knows emit that type: elsewhere it is a
+   malformed answer, and accepting it would let the upstream disable a check by
+   choosing its input;
 5. [MUST] deliver batches in ascending order, pairwise linked, splitting at any
    discontinuity: blocks before an upstream-reported divergence are delivered, then the
    fork signal (a client of the adapter never receives an unlinked sequence);

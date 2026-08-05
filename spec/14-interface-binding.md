@@ -111,7 +111,7 @@ symbols in 15.
 | `--auto-adjust-finalized-head` | off | DEF-24, WP-24 |
 | `--with-receipts` / `--with-traces` / `--with-statediffs` | off | data selection (DEF-22); receipts and logs are mutually exclusive acquisitions — receipts off ⇒ logs on |
 | `--use-trace-api`, `--use-debug-api-for-statediffs`, `--use-debug-trace-block-by-number` | off | EVM acquisition method choices |
-| `--verify-block-hash`, `--verify-tx-sender`, `--verify-tx-root`, `--verify-receipts-root`, `--verify-withdrawals-root`, `--verify-logs-bloom` | off | verification policy (DEF-25; GAP-8 marks the inert three) |
+| `--verify-block-hash`, `--verify-tx-sender`, `--verify-tx-root`, `--verify-receipts-root`, `--verify-withdrawals-root`, `--verify-logs-bloom` | off | verification policy (DEF-25); each is applied per block, and its failure is incoherence (WP-11.4) |
 | `--skip-log-index-check`, `--skip-cumulative-gas-used-check`, `--use-gas-used-for-receipts-root` | off | coherence-check tuning (DEF-15 instantiation) |
 | `--profile-block-timings` | off | opt-in per-block timing telemetry (ADR-5 family; not in the predecessor) |
 

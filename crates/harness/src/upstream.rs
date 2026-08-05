@@ -43,6 +43,20 @@ fn addr(n: u64) -> String {
     format!("0x{n:040x}")
 }
 
+/// What an empty transaction or receipt list commits to.
+pub const EMPTY_TRIE_ROOT: &str =
+    "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
+
+/// Honest where the script leaves the block empty; an opaque digest otherwise,
+/// since the stub builds no tries.
+fn commitment(b: &ChainBlock, salt: u64) -> String {
+    if b.txs.is_empty() {
+        EMPTY_TRIE_ROOT.to_string()
+    } else {
+        digest(7, b.number, salt)
+    }
+}
+
 // ─── Scripted chain ───────────────────────────────────────────────────────────
 
 /// Identity plus the transaction hashes every component payload derives from.
@@ -134,6 +148,9 @@ pub enum Fault {
     /// One entry stripped of its own label and given another transaction's
     /// frames: the misattribution that survives per-transaction counting.
     MixedFrames,
+    /// One header field replaced by a value the block's own contents do not
+    /// commit to — the forged input REQ-14's switches exist to catch.
+    ForgedField { key: String, value: Value },
 }
 
 impl Fault {
@@ -340,7 +357,7 @@ impl Inner {
             *self.calls.entry(key).or_insert(0) += 1;
 
             if let Some(fault) = self.take_fault(method, tracer.as_deref(), number) {
-                return self.faulted(method, tracer.as_deref(), number, &fault);
+                return self.faulted(method, params, tracer.as_deref(), number, &fault);
             }
         }
 
@@ -393,6 +410,7 @@ impl Inner {
     fn faulted(
         &self,
         method: &str,
+        params: &Value,
         tracer: Option<&str>,
         block: u64,
         fault: &Fault,
@@ -472,6 +490,17 @@ impl Inner {
                     own.extend(extra);
                 }
                 Ok(value)
+            }
+            Fault::ForgedField { key, value } => {
+                let full = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+                let mut answer = match self.visible(Some(block)) {
+                    Some(b) => header(b, full),
+                    None => return Ok(Value::Null),
+                };
+                if let Some(object) = answer.as_object_mut() {
+                    object.insert(key.clone(), value.clone());
+                }
+                Ok(answer)
             }
         }
     }
@@ -602,8 +631,8 @@ fn header(b: &ChainBlock, full_txs: bool) -> Value {
         "gasUsed": qty(21000 * b.txs.len() as u64),
         "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
         "logsBloom": zero_bloom(),
-        "transactionsRoot": digest(7, b.number, 2),
-        "receiptsRoot": digest(7, b.number, 3),
+        "transactionsRoot": commitment(b, 2),
+        "receiptsRoot": commitment(b, 3),
         "stateRoot": digest(7, b.number, 4),
         "miner": addr(0),
         "mixHash": digest(7, b.number, 5),
