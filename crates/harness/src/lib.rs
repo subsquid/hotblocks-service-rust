@@ -8,8 +8,11 @@
 //!   recorded with its complete model-relevant linkage tuple, so tests can
 //!   replay supported one-session ingestion histories into the model
 //!   (`Ledger::replay`) and check served bytes against produced bytes.
-//! - [`script`] — a scripted upstream (HC-3) for the pathological histories
-//!   the simulator does not generate, driven through SUT and model alike.
+//! - [`script`] — a scripted adapter-level source (HC-3) for the pathological
+//!   histories the simulator does not generate, driven through SUT and model
+//!   alike.
+//! - [`upstream`] — the fault-injecting JSON-RPC upstream (HC-3) the real
+//!   acquisition adapter is driven against.
 //! - [`validators`] — kind-agnostic structural validators (HC-6) applied to
 //!   every response.
 //! - [`client`] — a minimal HTTP driver for the service's wire surface.
@@ -18,4 +21,5 @@ pub mod client;
 pub mod model;
 pub mod script;
 pub mod sim;
+pub mod upstream;
 pub mod validators;

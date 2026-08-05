@@ -86,7 +86,7 @@ retry budget is an ingestion error (WP-11), never a served block with silently e
 or partial components.
 *Acceptance:* under every injected component fault of FM §input, no served block ever
 lacks a selected component or fails DEF-15; the fault surfaces as retry-then-alarm.
-*Trace:* INV-28, WP-11, FM-10..; GAP-3.
+*Trace:* INV-28, WP-11, IB-15, FM-10...
 
 ## Ingestion & data management
 

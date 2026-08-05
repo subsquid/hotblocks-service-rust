@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use tokio::time::sleep;
+use tracing::warn;
 
 use crate::fetch::Rpc;
 use crate::mapping::map_raw_block;
@@ -190,6 +191,13 @@ pub async fn ingest_range(
                 while let Some((s, block_result)) = strides.next().await {
                     let mut raw_blocks = block_result?;
                     if let Some(inv_pos) = raw_blocks.iter().position(|b| b.is_invalid) {
+                        // The range path re-requests instead of retrying (GAP-11);
+                        // without this line the loop leaves no trace.
+                        warn!(
+                            block = raw_blocks[inv_pos].number,
+                            reason = raw_blocks[inv_pos].error_message.as_deref().unwrap_or("unknown"),
+                            "incoherent block in range acquisition; re-requesting the stride"
+                        );
                         raw_blocks.truncate(inv_pos);
                     }
                     if raw_blocks.is_empty() {
@@ -330,6 +338,11 @@ pub async fn ingest_range(
 
                 // Strip invalid blocks
                 if let Some(inv_pos) = raw_blocks.iter().position(|b| b.is_invalid) {
+                    warn!(
+                        block = raw_blocks[inv_pos].number,
+                        reason = raw_blocks[inv_pos].error_message.as_deref().unwrap_or("unknown"),
+                        "incoherent block in polled acquisition; re-requesting"
+                    );
                     raw_blocks.truncate(inv_pos);
                 }
 

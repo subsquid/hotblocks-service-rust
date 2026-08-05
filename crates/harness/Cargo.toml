@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 data-service-core = { path = "../data-service-core" }
+axum = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
@@ -16,3 +17,9 @@ zstd = { workspace = true }
 flate2 = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
+
+# The CT-4 component-fault corpus drives the real EVM acquisition adapter
+# against `upstream`; nothing in the harness library depends on it.
+[dev-dependencies]
+evm-source = { path = "../evm-source" }
+rpc-client = { path = "../rpc-client" }
