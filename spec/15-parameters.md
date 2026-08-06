@@ -1,7 +1,7 @@
 # 15 — Parameter registry
 
 **Mutable doc #2.** Every `P-*`/`W-*` symbol used anywhere in the suite has a row.
-"Observed" is the current implementation's value (or behavior) as of 2026-08-04;
+"Observed" is the current implementation's value (or behavior) as of 2026-08-06;
 "Target" is the intended value — ⚠ marks a proposal awaiting ratification (ADR-13
 covers the batch; individual ratifications link their ADR). `—` = no distinct target
 (observed is intended). ⊥ = not implemented/measured.
@@ -20,8 +20,8 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 
 | Parameter | Role | Observed | Target |
 |---|---|---|---|
-| P-ENRICH-RETRIES | component re-acquisition attempts (WP-11.2) | 10 (head path); **violated: 0 on backfill path** (GAP-11) | 10 ⚠, both paths |
-| P-ENRICH-DELAY | delay between re-acquisitions | 50 ms | — |
+| P-ENRICH-RETRIES | whole-block/component re-acquisition attempts (WP-11.2, ADR-5/19) | 10 on the speculative head, strided backfill, and short/tail finalized-poll paths | 10 ⚠, all acquisition paths |
+| P-ENRICH-DELAY | delay between re-acquisitions | 50 ms; the first individual fetch after a short batch is immediate | — |
 | P-STALL-FREE-RETRIES | stalled-session restarts before backoff (WP-9) | 1 | — |
 | P-SESSION-BACKOFF | delay between stalled sessions | 30 s | — |
 | P-STALL-REINIT | stalled sessions before T1 re-seed | 6 (code gate `stalled > 5`) | — |
@@ -72,7 +72,7 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 |---|---|---|---|
 | P-SLO-HEAD-LATENCY | SLI-1 bound | ⊥ unmeasured; worst conforming acquisition retry ≈ P-ENRICH-RETRIES × P-ENRICH-DELAY = 500 ms | ⚠ |
 | P-SLO-COMMIT-LATENCY | SLI-2 bound | ⊥ | ⚠ |
-| P-SLO-QUERY-OVERHEAD | SLI-3 overhead bound | ⊥ | ⚠ |
+| P-SLO-QUERY-OVERHEAD | SLI-3 overhead bound | ⊥ unmeasured; a missing/incoherent historic block below the polled finalized head now spends up to ≈ 500 ms of adapter retry delay plus RPC-client retries before the first-byte error or mid-response truncation (ADR-19) | ⚠ |
 | P-SLO-THROUGHPUT | SLI-4 floor | ⊥ | ⚠ |
 | P-SLO-CATCHUP-RATE | SLI-5 multiple of head rate | ⊥ | ⚠ |
 | P-SLO-FINALITY-LAG | SLI-6 bound | ⊥ | ⚠ |
@@ -112,7 +112,9 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
   serve. Basis of ADR-7 and the SLI-2/SLI-4 baselines.
 - **Acquisition retry budget**: P-ENRICH-RETRIES × P-ENRICH-DELAY = 500 ms — chosen
   to match the predecessor's backfill retry wall-clock (5 × 100 ms) at finer
-  granularity (ADR-5).
+  granularity (ADR-5). ADR-19 provisionally reuses it as the finalized historic-read
+  tolerance; the RPC client's own per-call retries add to the client-visible wall-clock,
+  and the query SLO remains unratified under ADR-13.
 - **Historical stall**: an unbounded silent retry once froze head ingestion for ~2
   days on a public testnet — the incident behind ADR-5's fail-loud bound and OB-7's
   alarm requirements.

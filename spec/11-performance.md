@@ -32,7 +32,7 @@ committed numbers the corpus provides (compression benchmark and retry budgets �
 |---|---|---|---|
 | SLI-1 | S1 steady | ≤ `P-SLO-HEAD-LATENCY` ⚠ | component acquisition retry budget `P-ENRICH-RETRIES × P-ENRICH-DELAY` bounds the worst conforming case |
 | SLI-2 | S1 | ≤ `P-SLO-COMMIT-LATENCY` ⚠ | per-block encode cost baseline (15 §compression) |
-| SLI-3 | S1 / S4 | ≤ `P-SLO-QUERY-OVERHEAD` beyond data time ⚠ | — |
+| SLI-3 | S1 / S4 | ≤ `P-SLO-QUERY-OVERHEAD` beyond data time ⚠ | a missing/incoherent historic block below the polled finalized head now terminates after ≤ ≈ 500 ms adapter delay plus RPC-client retries (ADR-19); unmeasured end-to-end |
 | SLI-4 | S1 | ≥ `P-SLO-THROUGHPUT` ⚠ | stored-frame passthrough ≈ 0 re-encode cost; fallback encoding pays per-block re-encode (15 §compression) |
 | SLI-5 | S2 cold start | ≥ `P-SLO-CATCHUP-RATE` × head rate ⚠ | — |
 | SLI-6 | S1, S2 | ≤ `P-SLO-FINALITY-LAG` ⚠ | tracks upstream during S2 since GAP-2's closure; unmeasured under load |

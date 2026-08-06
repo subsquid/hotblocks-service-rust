@@ -105,7 +105,8 @@ livelock of GAP-5).
 2. [MUST] on incoherence or a missing/not-yet-available component, retry acquisition —
    re-fetching *all* components including the header (so a superseded block heals to
    its replacement) — at most `P-ENRICH-RETRIES` times with `P-ENRICH-DELAY` between
-   attempts, in every acquisition mode (head-following *and* range backfill — GAP-11);
+   attempts, in every acquisition mode (head-following, strided range, and finalized
+   poll — GAP-11/ADR-19);
 3. [MUST] on retry exhaustion, emit a stream error naming the block (fail-loud; the
    loop's WP-9 ladder takes over) — never emit the block with defaulted, emptied, or
    partial components (GAP-3);

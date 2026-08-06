@@ -198,19 +198,21 @@ Every record inside the eligible range is matched on hash *and* parentRef — th
 record has no predecessor for pairwise linkage to check, so a forged parent there is
 otherwise invisible.
 
-## Traceability matrix (2026-08-05)
+## Traceability matrix (2026-08-06)
 
 Status: **C** covered (black-box, automated) / **P** partial / **U** unchecked.
 `!` = known-violated today (see gap register). Current inventory: unit tests on the
 buffer state machine; integration tests for a handful of endpoint shapes, one
-fork-recovery scenario, backfill-error 500, shutdown; acquisition retry + finality
-no-stall timing tests; payload golden fixtures (one network); upstream-client retry
-classification and socket-transport suites. The Phase-0 harness (`crates/harness`)
-adds an executable reference model, a seeded adapter-level simulator with a
-linkage-tuple provenance ledger, a validator library, the CT-1 smoke run, and a set of
-CT-1/CT-4 SUT-vs-model differentials over hand-written pathological histories. Phase 1
-adds a fault-injecting JSON-RPC upstream, the CT-4 component-fault corpus that drives
-the real acquisition adapter against it, and CT-7's deterministic catch-up entry point.
+fork-recovery scenario, malformed-fork ladder handling, empty/error/empty-fork
+backfill 500s, shutdown; acquisition retry + finality no-stall timing tests; payload
+golden fixtures (one network); upstream-client retry classification and
+socket-transport suites. The Phase-0 harness (`crates/harness`) adds an executable
+reference model, a seeded adapter-level simulator with a linkage-tuple provenance
+ledger, a validator library, the CT-1 smoke run, and a set of CT-1/CT-4 SUT-vs-model
+differentials over hand-written pathological histories.
+Phase 1 adds a fault-injecting JSON-RPC upstream, the CT-4 component-fault corpus that
+drives the real acquisition adapter against it, and CT-7's deterministic catch-up
+entry point.
 The fault matrix covers the trace and state-diff components only; no generated
 differential corpus, no soak, no benchmarks yet.
 
@@ -228,12 +230,12 @@ differential corpus, no soak, no benchmarks yet.
 | INV-16 | CT-1/3 | P | model asserts one committed state per applied batch (CT-1 smoke); no swarm |
 | INV-20 | CT-5/3/4 | P | structural validator on live responses + dual-encoding equality (CT-1 smoke) |
 | INV-21 | CT-3 | U | |
-| INV-22 | CT-1/5 | P ! | conflict shape, `P-FORK-REFS-MAX` bound, and ref membership validated live (CT-1 smoke); GAP-6: empty-`prev` conflict emitted on empty backfill |
+| INV-22 | CT-1/5 | P | conflict shape, `P-FORK-REFS-MAX` bound, and ref membership validated live (CT-1 smoke); an empty backfill is pinned to INTERNAL and never manufactures an empty conflict |
 | INV-23 | CT-1 | P | progress guarantee + empty-form distinction checked (CT-1 smoke) |
 | INV-24 | CT-1/3 | P ! | watermarks compared against the reference model (CT-1 smoke); GAP-30: post-wait empty form can lack them |
 | INV-25 | CT-5 | P | golden fixtures (one network) + ledger byte-fidelity and dual-encoding compare (CT-1 smoke) |
 | INV-26 | CT-5 | U ! | GAP-13: iteration-order nondeterminism on one trace path |
-| INV-27 | CT-4/9 | U ! | GAP-6, GAP-22 |
+| INV-27 | CT-4/9 | U ! | the empty-backfill boundary is covered; GAP-22 remains on mid-response continuity or bounded-acquisition failure after a prefix |
 | INV-28 | CT-4 | P | CT-4 component-fault corpus over the real adapter: error, null, wrong-block, partial-coverage and unparsable payloads on both trace-API methods, the debug frames path and the debug state-diff path, each asserting bounded re-acquisition then fail-loud, plus the happy-path cassette. The receipts and logs components have no injected faults yet, and the per-network quirk corpora are absent (GAP-14, GAP-16) |
 | INV-29 | CT-3 | U | scoping is stated; no per-client sequential-read assertion exists |
 | INV-30 | CT-5 | U ! | GAP-24: dead gauge exposed |
@@ -249,7 +251,7 @@ differential corpus, no soak, no benchmarks yet.
 | LIV-5 | CT-2 | U | |
 | LIV-6 | CT-6 | U | |
 | LIV-7 | CT-6/7 | P | CT-7 asserts the bound at two altitudes — the reports the adapter carries mid-catch-up, and the watermark the service commits — against a stub whose finalized head sits far above the buffer. No benchmark measures the lag under load, and `P-SLO-FINALITY-LAG` is still ⚠ |
-| LIV-8 | CT-1/4 | P | single two-block reorg e2e test |
+| LIV-8 | CT-1/4 | P | single two-block reorg e2e test; a lifecycle regression drives repeated empty fork signals and pins entry into the stalled-session ladder rather than a rebase hot-spin |
 | LIV-9 | CT-2 | P | one prompt-shutdown test |
 | LIV-10 | CT-8 | U | |
 | LIV-11 | CT-7 | P ! | CT-7 asserts convergence — a buffer that outgrew its window while finality lagged is back inside it once the reports land. That the alarm clears with the excess is unasserted while it is log-only (GAP-4) |
@@ -257,7 +259,7 @@ differential corpus, no soak, no benchmarks yet.
 | REQ-1..6 | CT-1/5 | P | endpoint smoke + one fork recovery; REQ-6 framing (one frame per record, every boundary a safe cut) validated on both encodings (CT-1 smoke) |
 | REQ-7 | CT-5 | P | one-network golden corpus |
 | REQ-8 | CT-5 | P | selection combinations exercised only via recorded-corpus configs |
-| REQ-9 | CT-4 | P | the retry half of retry-then-alarm is asserted on the trace and state-diff components, bound included (`P-ENRICH-RETRIES` re-acquisitions, then a session error naming the block); the alarm half stays log-only (GAP-4) and the remaining components are uninjected |
+| REQ-9 | CT-4 | P | the retry half of retry-then-alarm is asserted on the trace and state-diff components, bound included (`P-ENRICH-RETRIES` re-acquisitions, then a session error naming the block); two cases prime the local finality view and pin the same contract on the real strided range and short finalized-poll paths, including delivery of the complete prefix below the fault. The alarm half stays log-only (GAP-4) and the remaining components are uninjected |
 | REQ-10..13 | CT-1/2/6 | P | |
 | REQ-14 | CT-5/CT-4 | P | CT-5 runs all six checks over a corpus of recorded blocks from seven networks — honest ones accepted, one forged field per switch rejected, the baseline's system-transaction exemptions honored; CT-4 pins the failure path (bounded re-acquisition, then a session error). The startup half of INV-36 is untested because no accepted switch is unimplemented |
 | REQ-15 | CT-4/CT-5 | P ! | the verification exemptions are covered by the CT-5 corpus; the quirk corpora of GAP-16 are absent (scope: OQ-6) |
@@ -271,7 +273,7 @@ differential corpus, no soak, no benchmarks yet.
 
 Priorities: P0 active production risk · P1 correctness hole with plausible trigger ·
 P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry point.
-Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, GAP-3, GAP-7, GAP-8, GAP-9, GAP-17, GAP-29, GAP-32, GAP-33, GAP-35, GAP-36.
+Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, GAP-3, GAP-5, GAP-6, GAP-7, GAP-8, GAP-9, GAP-11, GAP-17, GAP-29, GAP-32, GAP-33, GAP-35, GAP-36.
 
 | GAP | Statement | Violates | Prio | First test |
 |---|---|---|---|---|
@@ -279,13 +281,13 @@ Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, 
 | GAP-2 | **Retired 2026-08-05.** Stride acquisition is bounded by the finalized head on both streams, so every strided range is final and carries its own report; the prober skips what a report already settled and spaces only rounds that settle nothing. The over-window alarm remains log-only (GAP-4) | — | retired | — |
 | GAP-3 | **Retired 2026-08-05.** On the execution-trace and state-diff paths an upstream error, a null result, a payload that is not the method's result type, an entry that fails to parse, a result labelled with another block's transaction, an entry carrying a frame of a different transaction, and a transaction left uncovered each mark the block incoherent, so WP-11.2 re-acquires it and WP-11.3 fails the session loud — the component is never emptied, thinned, or filled from another block | — | retired | — |
 | GAP-4 | Alarms are log-only: no OB-7 (or OB-6) condition is visible on the scrape surface as a level or counter. The terminal-divergence exit path landed 2026-08-02 (rebase below finality and divergent re-seed end the run, drain within `P-SHUTDOWN-GRACE`, and exit non-zero per ADR-12), but an orchestrator still cannot distinguish alarm states before the exit | INV-31, OB-6, OB-7, LIV-2 | P2 | CT-4: induce each alarm condition (stall, over-window, integrity violation, terminal); scrape must show a level/counter change |
-| GAP-5 | A fork signal with an empty ref list rebases to the current head and immediately reopens the stream: a malformed adapter can hot-spin the loop forever with no backoff or alarm | WP-10, LIV-8, FM-13 | P1 | CT-4: adapter emits empty-`prev` fork signal; assert session-error handling (ladder), not spin |
-| GAP-6 | A window-underflow query whose upstream acquisition yields nothing returns a conflict with an **empty** ref list — a response that crashes the reference client and violates the conflict contract | INV-22, INV-27, RP-7 | P1 | CT-5: backfill against an empty simulator range; assert INTERNAL, never CONFLICT with empty refs |
+| GAP-5 | **Retired 2026-08-06.** A fork signal with an empty ref list is rejected inside the concrete ingestion session as malformed adapter input, so after any block has been ingested the ordinary stalled-session ladder supplies retry and backoff instead of rebasing to the current head. Before the first-ever block, this and every other session error remains an explicit startup failure (WP-9/FM-31). The lifecycle regression pins one progressed session plus the single free stalled retry, then observes no further stream open during backoff | — | retired | — |
+| GAP-6 | **Retired 2026-08-06.** A window-underflow acquisition that ends before its first batch returns INTERNAL (HTTP 500), never a conflict without recovery refs; an explicitly signalled empty fork on the same read path is guarded identically. Live-route HTTP regressions exercise both forms | — | retired | — |
 | GAP-7 | **Retired 2026-08-04.** The per-session finality maximum is retained across fork rebase; lower reports are ignored and an above-head obligation settles when its block arrives | — | retired | — |
 | GAP-8 | **Retired 2026-08-05.** All six switches are applied on the acquisition path: sender recovery, the transaction and withdrawal commitments join the block-hash, receipts-root and logs-bloom checks, and a forged field is rejected when its switch is on and ignored when off. Closing it exposed two defects the inert code had hidden — quantities whose hex digit count is odd (an r or s with a leading zero nibble) decoded to nothing, and an unencodable transaction was substituted by an empty trie leaf instead of failing | — | retired | — |
 | GAP-9 | **Retired 2026-08-05.** Every check runs through the per-network registry, so a system or state-sync transaction is excluded from the commitment that never covered it and from sender recovery: bor's state-sync transaction, Hyperliquid's zero-gas transactions and receipts, Stable's and Tempo's fake-signature transactions. A transaction type this build cannot re-encode (PIP-74 and Arbitrum's retryable family in GAP-16) makes the block unverifiable rather than forged, scoped to the networks that emit it | — | retired | — |
 | GAP-10 | Upstream error-classification hooks are dropped for single-call batches — precisely the head path — so not-ready/absent-block conditions lose their mapping and surface as raw errors | REQ-16, FM-23, FM-25 | P1 | CT-4: single-block acquisition against a "not ready" upstream response; assert classified retry, not session error |
-| GAP-11 | Range (backfill) acquisition has no bounded per-block retry: a persistently incoherent block causes a spurious-fork/restart hot loop instead of retry-then-alarm. The re-request is logged since 2026-08-05, and GAP-3's and GAP-32's closures widened the trigger — component faults that used to be served as empty components, and verification failures that used to end the session outright, now land here | WP-11.2, LIV-2, FM-15 | P1 | CT-4: one block persistently incoherent in a backfill range; assert bounded retries then alarmed session error (`range_acquisition_never_serves_an_emptied_component` asserts only the non-serving half today) |
+| GAP-11 | **Retired 2026-08-06.** Every finalized range batch — concurrent strided backfill and the short/tail finalized poll path — retains its initial batch for throughput, but re-fetches a missing or incoherent block, including its header and every selected component, up to `P-ENRICH-RETRIES` times. Exhaustion delivers the complete prefix below the fault, then ends the session naming the block before another batch can cross the gap. Two CT-4 regressions prime the local finalized view, force each path, and count the initial acquisition plus every retry. ADR-19 records the resulting historic-read latency/termination policy; when a query has already emitted that prefix, bounded failure reaches GAP-22 as a truncated 200 where the old path hung indefinitely | — | retired | — |
 | GAP-12 | Both trace-API acquisition methods (`trace_block` and `trace_replayBlockTransactions`) address blocks by hash, which some providers silently answer with incomplete data; the predecessor deliberately switched to by-number — regressed. Since GAP-3's closure the incomplete answer is *detected* (CT-4 covers reward-only frames), so what remains is cost and liveness: such a provider burns the retry budget and ends the session every block instead of being asked in the form it answers | REQ-9, LIV-2 | P1 | CT-4: reward-only answer to a hash-addressed trace call; assert the by-number form is used (detection is covered) |
 | GAP-13 | Trace ordering on one acquisition path flows through an unordered map: payload bytes vary between runs of the same input — nondeterministic canonical records | INV-26, REQ-7, REQ-24 | P1 | CT-5: acquire the same recorded block twice in separate processes; byte-diff |
 | GAP-14 | The upstream schema is stricter than the baseline tolerances: fields the predecessor treats as optional (log-removal marker, receipt status on pre-status-era blocks) are required, so affected networks fail to parse entire blocks | FM-25, REQ-15 | P2 | CT-4: corpus block lacking the optional fields; assert acceptance |
@@ -296,7 +298,7 @@ Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, 
 | GAP-19 | Oversized request bodies return the generic invalid-request status instead of the payload-too-large status the predecessor uses | REQ-24, IB | P3 (OQ-4) | CT-5: oversized body; assert status per 14 |
 | GAP-20 | The upstream batch-size cap option is accepted but bypassed by the dominant call path | INV-36, REQ-16 | P2 | CT-5: metered upstream; assert max observed batch ≤ configured cap |
 | GAP-21 | The upstream rate limiter admits concurrent callers past the budget (check-then-act race) | REQ-16, HZ-7 | P2 | CT-8: concurrent acquisition against a metered upstream; assert rate ≤ limit + tolerance |
-| GAP-22 | A backfill continuity-check failure surfaces as a panic inside the streaming task: silent truncation with no server-side alarm | INV-27, INV-31, FM-32 | P2 | CT-4: adapter violates backfill continuity mid-response; assert truncation **and** OB-7 event |
+| GAP-22 | A backfill failure after HTTP has emitted a prefix — either the original continuity-check panic or a bounded acquisition error now reachable after GAP-11/ADR-19 — only logs and stops the producer. The client receives a truncated 200 with no server-side alarm/counter. GAP-11 widened this trigger: the short finalized path previously hung before it could terminate the response | INV-27, INV-31, FM-32 | P2 | CT-4: inject both continuity failure and acquisition exhaustion after a prefix; assert frame-boundary truncation **and** an OB-7 event/counter |
 | GAP-23 | Steady-state status logs are unthrottled (per-block head lines, per-batch over-window errors) — log flood regression against the predecessor's throttling | REQ-31, OB-8 | P3 | CT-7: S1 soak; assert log/block ratio |
 | GAP-24 | A worker gauge that can never move is exposed, and runtime/process default metrics are absent | INV-30, REQ-30 | P3 | CT-5: metrics-vs-ledger sweep |
 | GAP-25 | No upstream-interaction observability (request/error/retry counters, upstream head view) exists | OB-4, REQ-30 | P2 | CT-5: scrape after scripted upstream faults; assert counters moved |
@@ -337,14 +339,24 @@ Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, 
    cases, both failing before the fix, one on the reports the adapter carries and one
    on the buffer the service commits; LIV-7 and LIV-11 flipped U→P, INV-4 U→P.
 3. **Phase 2 — correctness core**: full CT-1 generation (reorg/finality/duplicate
-   histories), CT-2 kill-point matrix, CT-4 integrity corpus (GAP-5/6/11), CT-5
-   golden + config-honesty, HC-8 differential (GAP-27, GAP-13). *Exit:* all
+   histories), CT-2 kill-point matrix, remaining CT-4 integrity corpus, CT-5 golden +
+   config-honesty, HC-8 differential (GAP-27, GAP-13). *Exit:* all
    INV rows ≥ P, INV-11/12/13/22/27/28 = C.
    *Started 2026-08-05* with the verification family: GAP-8, GAP-9 and GAP-32 closed
    together by `crates/evm-source/tests/verification_corpus.rs` (17 cases over the
    predecessor's recorded blocks), `verification_switches.rs` (7, the real fetch layer)
    and `crates/harness/tests/ct4_verification.rs` (5, the failure path) — 29 in all,
    written before the fix. INV-36 U→P, REQ-14 U→P, REQ-15 U→P, HC-4 C→P.
+   The GAP-5/6/11 slice closed next: one lifecycle regression pins malformed-fork
+   backoff, two live-route regressions pin empty and empty-fork backfills to HTTP 500,
+   and CT-4 drives a persistently incoherent block through both the true strided range
+   path and the short finalized-poll path, counting their bounded whole-block
+   re-acquisitions. ADR-19 records that the shared retry budget is now also the
+   historic-read tolerance below a polled finalized head. Closing the hang deliberately
+   widens GAP-22: after a prefix, exhaustion now reaches HTTP as a logged truncated 200
+   where the request previously remained open forever. INV-22 lost its `!`; LIV-8 and
+   REQ-9 gained the missing pathological cases, while INV-27 stays `!` for that
+   alarm-less truncation.
 4. **Phase 3 — robustness**: CT-4 upstream-fault matrix (GAP-10/12/14/15), CT-9 fuzz
    both surfaces, CT-8 isolation, quirk corpora per OQ-6 (GAP-16), observability
    conformance (GAP-4/22/24/25). *Exit:* FM cross-reference fully exercised.

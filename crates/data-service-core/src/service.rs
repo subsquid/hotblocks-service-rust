@@ -583,7 +583,18 @@ impl<S: DataSource> DataService<S> {
                     Some(r) => r,
                 },
             };
-            let batch: BlockBatch = batch_result?;
+            let batch: BlockBatch = match batch_result {
+                Err(StreamError::Fork { previous_blocks }) if previous_blocks.is_empty() => {
+                    // FM-13/WP-10: an empty fork signal names no rebase target.
+                    // Treat it like every other malformed adapter response so
+                    // the stalled-session ladder supplies retry/backoff instead
+                    // of rebasing to the current head in a hot loop.
+                    return Err(StreamError::Other(anyhow::anyhow!(
+                        "fork signal contains no previous blocks"
+                    )));
+                }
+                result => result?,
+            };
 
             if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
                 return Ok(());
@@ -895,9 +906,14 @@ impl<S: DataSource> DataService<S> {
         // Eagerly await the first batch.
         let first_batch = match stream.next().await {
             None => {
-                return Err(QueryError::InvalidBaseBlock(InvalidBaseBlock {
-                    prev: vec![],
-                }));
+                return Err(QueryError::Internal(anyhow::anyhow!(
+                    "below-query stream yielded no blocks for requested range {from}..={to}"
+                )));
+            }
+            Some(Err(StreamError::Fork { previous_blocks })) if previous_blocks.is_empty() => {
+                return Err(QueryError::Internal(anyhow::anyhow!(
+                    "below-query stream reported a fork without previous blocks"
+                )));
             }
             Some(Err(StreamError::Fork { previous_blocks })) => {
                 return Err(QueryError::InvalidBaseBlock(InvalidBaseBlock {
