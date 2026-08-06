@@ -115,6 +115,159 @@ async fn map_blocks_cpu(
     .await?
 }
 
+/// Map the complete prefix below a range-acquisition fault without hiding the
+/// more actionable, block-naming acquisition error if mapping also fails.
+async fn map_range_prefix(
+    raw_blocks: Vec<RawRpcBlock>,
+    options: Arc<NormOptions>,
+    acquisition_failure: Option<&anyhow::Error>,
+) -> Result<Vec<Block>> {
+    match map_blocks_cpu(raw_blocks, options, None).await {
+        Ok(blocks) => Ok(blocks),
+        Err(mapping_error) => match acquisition_failure {
+            Some(acquisition_error) => Err(anyhow!(
+                "{acquisition_error:#}; failed to map the complete prefix below that fault: \
+                 {mapping_error:#}"
+            )),
+            None => Err(mapping_error),
+        },
+    }
+}
+
+/// One finalized range acquisition, including the complete prefix that remains
+/// safe to emit when a later block exhausts its coherence budget.
+struct RangeAcquisition {
+    blocks: Vec<RawRpcBlock>,
+    failure: Option<anyhow::Error>,
+}
+
+/// Describe why `candidate` cannot be emitted at `number` after `parent_hash`.
+/// `None` means the block is coherent with the prefix acquired so far.
+fn range_candidate_issue(
+    candidate: Option<&RawRpcBlock>,
+    number: u64,
+    parent_hash: Option<&str>,
+) -> Option<String> {
+    let Some(candidate) = candidate else {
+        return Some("block not available".to_string());
+    };
+    if candidate.number != number {
+        return Some(format!(
+            "requested block {number}, upstream returned {}",
+            candidate.number
+        ));
+    }
+    if candidate.is_invalid {
+        return Some(
+            candidate
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "incoherent block".to_string()),
+        );
+    }
+    if let Some(parent_hash) = parent_hash {
+        if !parent_hash.eq_ignore_ascii_case(&candidate.block.parent_hash) {
+            return Some(format!(
+                "parent hash mismatch: expected {parent_hash}, got {}",
+                candidate.block.parent_hash
+            ));
+        }
+    }
+    None
+}
+
+/// Acquire one finalized range batch with the same per-block whole-acquisition
+/// budget as the speculative head path (WP-11.2). The initial batched answer
+/// is retained for throughput; only a missing or incoherent block is fetched
+/// again, including its header and every selected component.
+///
+/// # Panics
+///
+/// Panics if `numbers` is empty. Callers must establish that the requested
+/// finalized range has begun before delegating its acquisition.
+async fn acquire_range_stride(
+    rpc: &Arc<Rpc>,
+    req: &DataRequest,
+    numbers: &[u64],
+) -> RangeAcquisition {
+    assert!(
+        !numbers.is_empty(),
+        "range acquisition requires at least one block number"
+    );
+
+    let initial = match rpc.get_block_batch(numbers, req).await {
+        Ok(blocks) => blocks,
+        Err(error) => {
+            return RangeAcquisition {
+                blocks: Vec::new(),
+                failure: Some(error.context("failed to acquire range stride")),
+            };
+        }
+    };
+
+    let mut initial = initial.into_iter();
+    let mut complete = Vec::with_capacity(numbers.len());
+
+    for &number in numbers {
+        let mut candidate = initial.next();
+        let initial_batch_was_short = candidate.is_none();
+        let mut retries = 0u32;
+
+        loop {
+            let parent_hash = complete
+                .last()
+                .map(|block: &RawRpcBlock| block.hash.as_str());
+            let Some(reason) = range_candidate_issue(candidate.as_ref(), number, parent_hash)
+            else {
+                complete.push(candidate.expect("a coherent candidate exists"));
+                break;
+            };
+
+            if retries >= P_ENRICH_RETRIES {
+                return RangeAcquisition {
+                    blocks: complete,
+                    failure: Some(anyhow!(
+                        "failed to acquire block {number} after {P_ENRICH_RETRIES} retries: {reason}"
+                    )),
+                };
+            }
+            let first_fetch_after_short_batch = retries == 0 && initial_batch_was_short;
+            retries += 1;
+
+            warn!(
+                block = number,
+                attempt = retries,
+                max_retries = P_ENRICH_RETRIES,
+                reason = %reason,
+                "incoherent block in range acquisition, re-acquiring"
+            );
+            if !first_fetch_after_short_batch {
+                sleep(P_ENRICH_DELAY).await;
+            }
+
+            candidate = match rpc
+                .get_block_batch(std::slice::from_ref(&number), req)
+                .await
+            {
+                Ok(blocks) => blocks.into_iter().next(),
+                Err(error) => {
+                    return RangeAcquisition {
+                        blocks: complete,
+                        failure: Some(error.context(format!(
+                            "failed to re-acquire block {number} in range acquisition"
+                        ))),
+                    };
+                }
+            };
+        }
+    }
+
+    RangeAcquisition {
+        blocks: complete,
+        failure: None,
+    }
+}
+
 // ─── Main ingest_range ────────────────────────────────────────────────────────
 
 /// Ingest all blocks from [from, to] with stride concurrency.
@@ -186,35 +339,46 @@ pub async fn ingest_range(
                     let req2 = req.clone();
                     async move {
                         let numbers: Vec<u64> = (s..=e).collect();
-                        let blocks = rpc2.get_block_batch(&numbers, &req2).await;
-                        (s, blocks)
+                        let acquisition = acquire_range_stride(&rpc2, &req2, &numbers).await;
+                        (s, acquisition)
                     }
                 }))
                 .buffered(stride_concurrency);
 
-                while let Some((s, block_result)) = strides.next().await {
-                    let mut raw_blocks = block_result?;
-                    if let Some(inv_pos) = raw_blocks.iter().position(|b| b.is_invalid) {
-                        // The range path re-requests instead of retrying (GAP-11);
-                        // without this line the loop leaves no trace.
-                        warn!(
-                            block = raw_blocks[inv_pos].number,
-                            reason = raw_blocks[inv_pos].error_message.as_deref().unwrap_or("unknown"),
-                            "incoherent block in range acquisition; re-requesting the stride"
-                        );
-                        raw_blocks.truncate(inv_pos);
-                    }
+                while let Some((s, acquisition)) = strides.next().await {
+                    let RangeAcquisition {
+                        blocks: raw_blocks,
+                        mut failure,
+                    } = acquisition;
                     if raw_blocks.is_empty() {
-                        // Block not available yet (or invalid) — restart from here
-                        beg = s;
-                        break;
+                        debug_assert!(
+                            failure.is_some(),
+                            "non-empty requested stride at {s} returned neither blocks nor failure"
+                        );
+                        Err(failure.take().unwrap_or_else(|| anyhow!(
+                            "range acquisition at block {s} returned neither blocks nor failure"
+                        )))?;
                     }
 
-                    let last_num = raw_blocks.last().map(|b| b.number).unwrap_or(s);
+                    let last_num = raw_blocks
+                        .last()
+                        .expect("the empty acquisition returned above")
+                        .number;
                     beg = last_num + 1;
 
-                    let mapped = map_blocks_cpu(raw_blocks, mapping_options.clone(), None).await?;
+                    let mapped = map_range_prefix(
+                        raw_blocks,
+                        mapping_options.clone(),
+                        failure.as_ref(),
+                    )
+                    .await?;
                     yield IngestBatch { blocks: mapped, finalized: finalized_ref.clone() };
+
+                    // Complete blocks below the fault have now been delivered;
+                    // fail the session before any later stride can cross the gap.
+                    if let Some(error) = failure {
+                        Err(error)?;
+                    }
                 }
 
             } else if commitment == "latest" {
@@ -375,7 +539,8 @@ pub async fn ingest_range(
 
             } else {
                 // ── Poll mode for finalized commitment ───────────────────────
-                // Keep existing behavior: poll the finalized head, then fetch bodies.
+                // Poll the finalized head, then apply the same bounded
+                // whole-block acquisition contract as strided backfill.
 
                 let poll_start = poll_last_read.map(|l| l + 1).unwrap_or(beg);
                 if poll_start != beg {
@@ -394,40 +559,77 @@ pub async fn ingest_range(
                 }
 
                 let head = poll_head.unwrap_or(beg);
-                let stride_end = (beg + stride_size as u64).min(head);
-                let numbers: Vec<u64> = (beg..=stride_end).collect();
-
-                let mut raw_blocks = rpc.get_block_batch(&numbers, &req).await?;
-
-                // Strip invalid blocks
-                if let Some(inv_pos) = raw_blocks.iter().position(|b| b.is_invalid) {
-                    warn!(
-                        block = raw_blocks[inv_pos].number,
-                        reason = raw_blocks[inv_pos].error_message.as_deref().unwrap_or("unknown"),
-                        "incoherent block in polled acquisition; re-requesting"
-                    );
-                    raw_blocks.truncate(inv_pos);
-                }
-
-                if raw_blocks.is_empty() {
+                if head < beg {
+                    // No finalized acquisition obligation exists yet. Keep the
+                    // range helper's non-empty input contract local and wait
+                    // until the polled commitment reaches `beg`.
                     sleep(Duration::from_millis(100)).await;
                     continue;
                 }
+                let stride_end = beg
+                    .saturating_add(stride_size as u64)
+                    .min(head)
+                    .min(end);
+                let numbers: Vec<u64> = (beg..=stride_end).collect();
 
-                let last_num = raw_blocks.last().unwrap().number;
-                // Filter to not exceed end
-                if last_num > end {
-                    raw_blocks.retain(|b| b.number <= end);
+                let RangeAcquisition {
+                    blocks: raw_blocks,
+                    mut failure,
+                } = acquire_range_stride(&rpc, &req, &numbers).await;
+
+                if raw_blocks.is_empty() {
+                    debug_assert!(
+                        failure.is_some(),
+                        "non-empty finalized poll range returned neither blocks nor failure"
+                    );
+                    Err(failure.take().unwrap_or_else(|| anyhow!(
+                        "finalized poll acquisition at block {beg} returned neither blocks nor \
+                         failure"
+                    )))?;
                 }
 
-                poll_last_read = raw_blocks.last().map(|b| b.number);
-                beg = poll_last_read.unwrap_or(beg) + 1;
+                let last = raw_blocks
+                    .last()
+                    .expect("the empty acquisition returned above");
+                let last_num = last.number;
+                let finalized = Some(BlockRef {
+                    number: last.number,
+                    hash: last.hash.clone(),
+                });
 
-                let finalized = raw_blocks.last().map(|b| BlockRef { number: b.number, hash: b.hash.clone() });
+                poll_last_read = Some(last_num);
+                beg = last_num + 1;
 
-                let mapped = map_blocks_cpu(raw_blocks, mapping_options.clone(), None).await?;
+                let mapped =
+                    map_range_prefix(raw_blocks, mapping_options.clone(), failure.as_ref()).await?;
                 yield IngestBatch { blocks: mapped, finalized };
+
+                // Complete blocks below the fault have now been delivered;
+                // terminate instead of polling the same bad block forever.
+                if let Some(error) = failure {
+                    Err(error)?;
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fetch::RpcOptions;
+    use rpc_client::{RpcClient, RpcClientConfig};
+
+    #[tokio::test]
+    #[should_panic(expected = "range acquisition requires at least one block number")]
+    async fn range_acquisition_rejects_an_empty_number_set() {
+        let client = Arc::new(RpcClient::new(RpcClientConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            retry_attempts: 0,
+            ..Default::default()
+        }));
+        let rpc = Arc::new(Rpc::new(client, RpcOptions::default()));
+
+        let _ = acquire_range_stride(&rpc, &DataRequest::default(), &[]).await;
     }
 }

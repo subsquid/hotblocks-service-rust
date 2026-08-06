@@ -136,6 +136,71 @@ async fn drive(upstream: &Upstream, req: DataRequest, from: u64, want: usize) ->
     run
 }
 
+#[derive(Clone, Copy)]
+enum PrimedStream {
+    Head,
+    Finalized,
+}
+
+/// Drive an adapter path after priming its local finality view.
+async fn drive_primed(
+    upstream: &Upstream,
+    req: DataRequest,
+    from: u64,
+    to: Option<u64>,
+    expected_finalized: u64,
+    budget: Duration,
+    stream_kind: PrimedStream,
+) -> Run {
+    let client = Arc::new(RpcClient::new(RpcClientConfig {
+        url: upstream.url().to_string(),
+        capacity: 5,
+        retry_attempts: 0,
+        ..Default::default()
+    }));
+    let source = EvmRpcDataSource::new(
+        client,
+        EvmRpcDataSourceOptions {
+            data_request: req,
+            ..Default::default()
+        },
+    );
+    let finalized = source
+        .get_finalized_head()
+        .await
+        .expect("prime the adapter's local finalized-head view");
+    assert_eq!(finalized.number, expected_finalized);
+
+    let request = StreamRequest {
+        from,
+        to,
+        parent_hash: None,
+    };
+    let mut stream = match stream_kind {
+        PrimedStream::Head => source.get_stream(request),
+        PrimedStream::Finalized => source.get_finalized_stream(request),
+    };
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut run = Run::default();
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Err(_) | Ok(None) => break,
+            Ok(Some(Err(error))) => {
+                run.error = Some(error.to_string());
+                break;
+            }
+            Ok(Some(Ok(batch))) => {
+                for block in batch.blocks {
+                    let line = zstd::decode_all(block.json_line_zstd.as_ref()).expect("zstd");
+                    run.served
+                        .push(serde_json::from_slice(&line).expect("payload is one JSON line"));
+                }
+            }
+        }
+    }
+    run
+}
+
 async fn head_chain() -> Upstream {
     // A head four above `FIRST` keeps ingestion on the speculative head path;
     // the range path needs a wider gap.
@@ -514,52 +579,66 @@ async fn transient_trace_fault_heals_inside_the_retry_budget() {
 // ─── The range path ───────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn range_acquisition_never_serves_an_emptied_component() {
-    // A distant head puts ingestion on the range path, which has no per-block
-    // retry (GAP-11) — so this asserts only that nothing incoherent is served.
+async fn range_incoherence_retries_then_fails_loud() {
+    // A distant finalized head puts ingestion on the strided range path.
     let upstream = Upstream::start(Chain::linear(FIRST, 20, TXS)).await;
+    upstream.set_finalized(FIRST + 19);
     upstream.inject(DEBUG_METHOD, FAULTED, Fault::Null);
 
-    let client = Arc::new(RpcClient::new(RpcClientConfig {
-        url: upstream.url().to_string(),
-        capacity: 5,
-        retry_attempts: 0,
-        ..Default::default()
-    }));
-    let source = EvmRpcDataSource::new(
-        client,
-        EvmRpcDataSourceOptions {
-            data_request: debug_traces(),
-            ..Default::default()
-        },
-    );
-    let mut stream = source.get_stream(StreamRequest {
-        from: FIRST,
-        to: None,
-        parent_hash: None,
-    });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let mut run = Run::default();
-    while let Ok(Some(item)) = tokio::time::timeout_at(deadline, stream.next()).await {
-        match item {
-            Err(e) => {
-                run.error = Some(e.to_string());
-                break;
-            }
-            Ok(batch) => {
-                for block in batch.blocks {
-                    let line = zstd::decode_all(block.json_line_zstd.as_ref()).expect("zstd");
-                    run.served
-                        .push(serde_json::from_slice(&line).expect("payload is one JSON line"));
-                }
-            }
-        }
-    }
+    let run = drive_primed(
+        &upstream,
+        debug_traces(),
+        FIRST,
+        None,
+        FIRST + 19,
+        BUDGET,
+        PrimedStream::Head,
+    )
+    .await;
 
     run.assert_components_complete("traces");
-    assert!(
-        !run.numbers().contains(&FAULTED),
-        "block {FAULTED} was served on the range path despite its trace fault"
+    run.assert_failed_loud(FAULTED);
+    assert_eq!(
+        run.numbers(),
+        vec![FIRST, FIRST + 1],
+        "complete blocks below the fault must be delivered before it fails"
+    );
+    assert_eq!(
+        upstream.calls(DEBUG_METHOD, FAULTED),
+        ACQUISITIONS,
+        "the range path owes the same per-block retry budget as the head path"
+    );
+}
+
+#[tokio::test]
+async fn short_finalized_range_incoherence_retries_then_fails_loud() {
+    // A bounded request no wider than one stride takes finalized poll mode,
+    // even when the adapter already knows a much higher finalized head.
+    let upstream = Upstream::start(Chain::linear(FIRST, 20, TXS)).await;
+    upstream.set_finalized(FIRST + 19);
+    upstream.inject(DEBUG_METHOD, FAULTED, Fault::Null);
+
+    let run = drive_primed(
+        &upstream,
+        debug_traces(),
+        FIRST,
+        Some(FIRST + 3),
+        FIRST + 19,
+        BUDGET,
+        PrimedStream::Finalized,
+    )
+    .await;
+
+    run.assert_components_complete("traces");
+    run.assert_failed_loud(FAULTED);
+    assert_eq!(
+        run.numbers(),
+        vec![FIRST, FIRST + 1],
+        "the complete prefix must be delivered before the short range fails"
+    );
+    assert_eq!(
+        upstream.calls(DEBUG_METHOD, FAULTED),
+        ACQUISITIONS,
+        "finalized poll mode owes the same bounded acquisition budget"
     );
 }

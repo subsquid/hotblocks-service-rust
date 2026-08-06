@@ -418,13 +418,21 @@ async fn test_block_time_endpoint() {
 // Below-query internal error → 500 (regression: must not panic / drop the conn)
 // ---------------------------------------------------------------------------
 
-/// A source seeded at block 10 (parent 9) whose backfill stream fails with a
-/// non-fork error. Used to exercise the below-query error path: the request
-/// must receive a clean HTTP 500 rather than crashing the request task and
-/// dropping the connection.
+/// What the below-query stream does after init has acquired the seed.
+#[derive(Clone, Copy)]
+enum BackfillFault {
+    Error,
+    Empty,
+    EmptyFork,
+}
+
+/// A source seeded at block 10 (parent 9) whose backfill stream fails or ends
+/// empty. Both are internal query failures: neither may crash the request task
+/// or manufacture a conflict without a recovery ref.
 #[derive(Clone)]
 struct BackfillErrorSource {
     seed: Block,
+    fault: BackfillFault,
 }
 
 #[async_trait]
@@ -440,6 +448,7 @@ impl DataSource for BackfillErrorSource {
         req: StreamRequest,
     ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
         let seed = self.seed.clone();
+        let fault = self.fault;
         Box::pin(async_stream::stream! {
             if req.from == seed.number {
                 // init() seeding request — yield the single seed block.
@@ -448,8 +457,18 @@ impl DataSource for BackfillErrorSource {
                     finalized_head: Some(seed.block_ref()),
                 });
             } else {
-                // below-query backfill request — simulate a transient failure.
-                yield Err(StreamError::Other(anyhow::anyhow!("simulated backfill failure")));
+                match fault {
+                    // Below-query backfill request — simulate a transient failure.
+                    BackfillFault::Error => {
+                        yield Err(StreamError::Other(anyhow::anyhow!("simulated backfill failure")));
+                    }
+                    // The requested historic range unexpectedly has no first batch.
+                    BackfillFault::Empty => {}
+                    // A malformed adapter fork cannot supply a rollback point.
+                    BackfillFault::EmptyFork => {
+                        yield Err(StreamError::Fork { previous_blocks: vec![] });
+                    }
+                }
             }
         })
     }
@@ -472,6 +491,7 @@ impl DataSource for BackfillErrorSource {
 async fn test_stream_500_on_backfill_error() {
     let source = BackfillErrorSource {
         seed: make_block(10, "h10", 9, "h9"),
+        fault: BackfillFault::Error,
     };
     let handle = run_data_service(DataServiceOptions {
         source,
@@ -501,6 +521,77 @@ async fn test_stream_500_on_backfill_error() {
         text.contains("simulated backfill failure"),
         "500 body should carry the error: {text}"
     );
+}
+
+/// GAP-6/RP-7: an empty historic acquisition is INTERNAL. Returning 409 with
+/// `previousBlocks: []` gives the client no rollback point and crashes the
+/// reference recovery loop.
+#[tokio::test]
+async fn empty_backfill_returns_500_instead_of_an_empty_conflict() {
+    let source = BackfillErrorSource {
+        seed: make_block(10, "h10", 9, "h9"),
+        fault: BackfillFault::Empty,
+    };
+    let handle = run_data_service(DataServiceOptions {
+        source,
+        block_cache_size: 1000,
+        port: 0,
+        auto_adjust_finalized_head: false,
+    })
+    .await
+    .unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/stream", handle.port))
+        .header("content-type", "application/json")
+        .body(r#"{"fromBlock": 5}"#)
+        .send()
+        .await
+        .expect("an empty backfill must produce a complete HTTP response");
+
+    assert_eq!(resp.status(), 500);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("yielded no blocks"),
+        "the internal failure must explain the empty acquisition: {text}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// GAP-6/RP-7: an empty fork is an internal adapter failure, not a usable 409.
+#[tokio::test]
+async fn empty_backfill_fork_returns_500_instead_of_an_empty_conflict() {
+    let source = BackfillErrorSource {
+        seed: make_block(10, "h10", 9, "h9"),
+        fault: BackfillFault::EmptyFork,
+    };
+    let handle = run_data_service(DataServiceOptions {
+        source,
+        block_cache_size: 1000,
+        port: 0,
+        auto_adjust_finalized_head: false,
+    })
+    .await
+    .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/stream", handle.port))
+        .header("content-type", "application/json")
+        .body(r#"{"fromBlock": 5}"#)
+        .send()
+        .await
+        .expect("an empty fork must produce a complete HTTP response");
+
+    assert_eq!(response.status(), 500);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("reported a fork without previous blocks"));
+
+    handle.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

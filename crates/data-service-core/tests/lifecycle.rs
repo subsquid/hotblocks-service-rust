@@ -791,6 +791,104 @@ async fn sub_finality_fork_ends_the_run_terminally() {
     handle.shutdown().await;
 }
 
+/// Emits one real block so startup completes, then reports the malformed
+/// empty fork signal on every concrete stream. A rebase-to-self reopens the
+/// stream without entering the stalled-session ladder and hot-spins forever.
+struct EmptyForkSource {
+    seed: Block,
+    stream_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl DataSource for EmptyForkSource {
+    async fn get_head(&self) -> anyhow::Result<BlockRef> {
+        Ok(self.seed.block_ref())
+    }
+
+    async fn get_finalized_head(&self) -> anyhow::Result<BlockRef> {
+        Ok(self.seed.block_ref())
+    }
+
+    fn get_finalized_stream(
+        &self,
+        _req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+        let seed = self.seed.clone();
+        Box::pin(async_stream::stream! {
+            yield Ok(BlockBatch {
+                blocks: vec![seed.clone()],
+                finalized_head: Some(seed.block_ref()),
+            });
+        })
+    }
+
+    fn get_stream(
+        &self,
+        _req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+        let call = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async_stream::stream! {
+            if call == 0 {
+                yield Ok(BlockBatch {
+                    blocks: vec![block(2, "h2", 1, "h1")],
+                    finalized_head: None,
+                });
+            }
+            yield Err(StreamError::Fork {
+                previous_blocks: Vec::new(),
+            });
+        })
+    }
+}
+
+/// FM-13/WP-10: an empty fork signal is a session error. The ordinary
+/// stalled-session ladder must apply its backoff instead of repeatedly
+/// rebasing to the current head with no delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_fork_signal_enters_the_session_ladder_instead_of_spinning() {
+    let stream_calls = Arc::new(AtomicUsize::new(0));
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let svc = Arc::new(DataService::new(
+        EmptyForkSource {
+            seed: block(1, "h1", 0, "h0"),
+            stream_calls: Arc::clone(&stream_calls),
+        },
+        10,
+        false,
+        cancel_rx,
+    ));
+    svc.init().await.unwrap();
+
+    let runner = {
+        let svc = Arc::clone(&svc);
+        tokio::spawn(async move { svc.run().await })
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while stream_calls.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the malformed signal must tear down and reopen the session");
+
+    let calls_at_backoff = stream_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        calls_at_backoff, 3,
+        "the ladder allows one stalled retry before applying backoff"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        stream_calls.load(Ordering::SeqCst),
+        calls_at_backoff,
+        "the empty fork signal bypassed the stalled-session backoff"
+    );
+    assert!(!runner.is_finished(), "a malformed fork is recoverable");
+
+    runner.abort();
+    let _ = runner.await;
+}
+
 /// `(from, parent_hash)` of each head-stream request.
 type StreamLog = Arc<Mutex<Vec<(u64, Option<String>)>>>;
 
