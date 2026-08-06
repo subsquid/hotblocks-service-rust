@@ -333,3 +333,157 @@ async fn test_batch_reduce_on_retry() {
         "expected two batches of 2, got {seen:?}"
     );
 }
+
+// ─── Singleton reduced batches retain their validators ──────────────────────
+
+#[tokio::test]
+async fn singleton_reduced_batch_retains_both_validators() {
+    let state = RpcRetryState {
+        attempts: Arc::new(AtomicUsize::new(0)),
+    };
+    let app = Router::new()
+        .route("/", post(rpc_32000_then_success_handler))
+        .with_state(state.clone());
+    let url = spawn_server(app).await;
+    let c = RpcClient::new(RpcClientConfig {
+        url,
+        capacity: 4,
+        retry_attempts: 1,
+        retry_schedule: vec![std::time::Duration::from_millis(1)],
+        retry_internal_server_errors: false,
+        ..Default::default()
+    });
+    let options = CallOptions {
+        validate_result: Some(Box::new(|value| Ok(json!({ "validated": value })))),
+        validate_error: Some(Box::new(|info| {
+            if info.code == -32000 {
+                Err(rpc_client::RpcError::RetryRequested(
+                    "classified not-ready response".into(),
+                ))
+            } else {
+                Err(rpc_client::RpcError::Rpc {
+                    code: info.code,
+                    message: info.message.clone(),
+                    data: info.data.clone(),
+                })
+            }
+        })),
+        ..Default::default()
+    };
+
+    let result = c
+        .batch_call_reduce_on_retry(vec![("eth_getBlockByNumber".into(), None)], &options)
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].as_ref().unwrap(), &json!({ "validated": "ok" }));
+    assert_eq!(state.attempts.load(Ordering::SeqCst), 2);
+}
+
+async fn rpc_32000_then_success_handler(
+    State(state): State<RpcRetryState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let n = state.attempts.fetch_add(1, Ordering::SeqCst);
+    if n == 0 {
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": body["id"],
+            "error": { "code": -32000, "message": "block is not ready" }
+        }))
+    } else {
+        Json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": "ok" }))
+    }
+}
+
+// ─── Partial batch results never replay observed successes ──────────────────
+
+#[derive(Clone, Default)]
+struct PartialBatchState {
+    successful: Arc<AtomicUsize>,
+    retryable: Arc<AtomicUsize>,
+}
+
+#[tokio::test]
+async fn partial_batch_never_reissues_an_observed_success() {
+    let state = PartialBatchState::default();
+    let app = Router::new()
+        .route("/", post(partial_batch_handler))
+        .with_state(state.clone());
+    let url = spawn_server(app).await;
+    let client = RpcClient::new(RpcClientConfig {
+        url,
+        capacity: 4,
+        retry_attempts: 1,
+        retry_schedule: vec![std::time::Duration::from_millis(1)],
+        ..Default::default()
+    });
+    let options = CallOptions {
+        validate_error: Some(Box::new(|info| {
+            if info.code == -32000 {
+                Err(rpc_client::RpcError::RetryRequested(
+                    "classified retryable response".into(),
+                ))
+            } else {
+                Err(rpc_client::RpcError::Rpc {
+                    code: info.code,
+                    message: info.message.clone(),
+                    data: info.data.clone(),
+                })
+            }
+        })),
+        ..Default::default()
+    };
+
+    let results = client
+        .batch_call_reduce_on_retry(
+            vec![("successful".into(), None), ("retryable".into(), None)],
+            &options,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results[0].as_ref().unwrap(), &json!("ok"));
+    assert!(results[1].is_err());
+    assert_eq!(
+        state.successful.load(Ordering::SeqCst),
+        1,
+        "an observed successful batch item must never be sent again"
+    );
+    assert!(state.retryable.load(Ordering::SeqCst) >= 1);
+}
+
+async fn partial_batch_handler(
+    State(state): State<PartialBatchState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let batched = body.is_array();
+    let requests = body.as_array().cloned().unwrap_or_else(|| vec![body]);
+    let mut responses = Vec::with_capacity(requests.len());
+
+    for request in requests {
+        let response = match request["method"].as_str().expect("request method") {
+            "successful" => {
+                state.successful.fetch_add(1, Ordering::SeqCst);
+                json!({ "jsonrpc": "2.0", "id": request["id"], "result": "ok" })
+            }
+            "retryable" => {
+                state.retryable.fetch_add(1, Ordering::SeqCst);
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": { "code": -32000, "message": "not ready" }
+                })
+            }
+            method => panic!("unexpected method {method}"),
+        };
+        responses.push(response);
+    }
+
+    if batched {
+        Json(Value::Array(responses))
+    } else {
+        Json(responses.pop().expect("single response"))
+    }
+}

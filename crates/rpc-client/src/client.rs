@@ -173,6 +173,16 @@ impl RpcClient {
         params: Option<Value>,
         options: CallOptions,
     ) -> Result<Value, RpcError> {
+        self.call_with_options(method, params.as_ref(), &options)
+            .await
+    }
+
+    async fn call_with_options(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+        options: &CallOptions,
+    ) -> Result<Value, RpcError> {
         let retry_attempts = options.retry_attempts.unwrap_or(self.config.retry_attempts);
         let timeout = options.timeout.unwrap_or(self.config.request_timeout);
 
@@ -180,7 +190,7 @@ impl RpcClient {
         loop {
             let id = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
             let result = self
-                .execute_single(id, method, params.as_ref(), timeout, &options)
+                .execute_single(id, method, params, timeout, options)
                 .await;
 
             match result {
@@ -276,17 +286,7 @@ impl RpcClient {
         if calls.len() == 1 {
             let (method, params) = &calls[0];
             let r = self
-                .call(
-                    method,
-                    params.clone(),
-                    CallOptions {
-                        priority: options.priority,
-                        retry_attempts: options.retry_attempts,
-                        timeout: options.timeout,
-                        validate_result: None,
-                        validate_error: None,
-                    },
-                )
+                .call_with_options(method, params.as_ref(), options)
                 .await;
             return Ok(vec![r]);
         }

@@ -157,8 +157,13 @@ errors, timeouts, HTTP 408/429/5xx-gateway, RPC codes −32005/429, rate-limit a
 timeout message patterns; internal-error codes only when the widening flag is on.
 Retries: `P-RPC-RETRY-ATTEMPTS` on schedule `P-RPC-RETRY-SCHEDULE` (indexed by
 attempt, last entry repeated past its end); batches split on
-too-large responses. Diagnostics and error text MUST NOT leak endpoint
-credentials (GAP-26).
+too-large responses. Within one logical batch operation, an item whose successful
+response was observed is complete and MUST NOT be submitted again by RPC-level retry
+or reduction; only unresolved or retryable failed items may be retried. If a
+request-level failure leaves every item outcome unknown, the request may be split and
+retried. This does not weaken WP-11.2: later whole-block re-acquisition is a new
+coherence attempt and intentionally re-fetches its header and selected components.
+Diagnostics and error text MUST NOT leak endpoint credentials (GAP-26).
 
 **IB-14 — Method matrix** (per data selection):
 
@@ -169,8 +174,8 @@ credentials (GAP-26).
 | logs (receipts off) | `eth_getLogs({fromBlock, toBlock})` |
 | receipts | `eth_getBlockReceipts` (probed once; per-tx `eth_getTransactionReceipt` fallback) |
 | traces (debug) | `debug_traceBlockByHash\|ByNumber` with `callTracer {onlyTopCall:false, withLog:true}`, timeout `P-DEBUG-TIMEOUT` |
-| traces (trace API) | `trace_block` / `trace_replayBlockTransactions[trace]` — exactly one per selection (GAP-17); by-number addressing required (GAP-12) |
-| state diffs (trace API) | `trace_replayBlockTransactions[stateDiff]` |
+| traces (trace API) | exactly one per selection (GAP-17): `trace_block(qty)` or `trace_replayBlockTransactions(hash, [trace])` |
+| state diffs (trace API) | `trace_replayBlockTransactions(hash, [stateDiff])` |
 | state diffs (debug) | `debug_traceBlock*` with `prestateTracer {diffMode:true}` |
 | identity | `eth_chainId` (once; SHOULD gate FM-52) |
 

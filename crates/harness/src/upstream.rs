@@ -167,6 +167,7 @@ struct Key {
     method: String,
     tracer: Option<String>,
     block: u64,
+    addressed_by_hash: bool,
 }
 
 struct Injection {
@@ -284,18 +285,39 @@ impl Upstream {
     }
 
     pub fn calls_with_tracer(&self, method: &str, tracer: &str, block: u64) -> usize {
-        let key = Key {
-            method: method.to_string(),
-            tracer: Some(tracer.to_string()),
-            block,
-        };
-        *self
-            .inner
+        self.inner
             .lock()
             .expect("upstream lock")
             .calls
-            .get(&key)
-            .unwrap_or(&0)
+            .iter()
+            .filter(|(k, _)| {
+                k.method == method && k.tracer.as_deref() == Some(tracer) && k.block == block
+            })
+            .map(|(_, n)| *n)
+            .sum()
+    }
+
+    /// Calls whose first parameter addressed `block` by its hash.
+    pub fn calls_by_hash(&self, method: &str, block: u64) -> usize {
+        self.calls_by_address(method, block, true)
+    }
+
+    /// Calls whose first parameter addressed `block` by its number.
+    pub fn calls_by_number(&self, method: &str, block: u64) -> usize {
+        self.calls_by_address(method, block, false)
+    }
+
+    fn calls_by_address(&self, method: &str, block: u64, addressed_by_hash: bool) -> usize {
+        self.inner
+            .lock()
+            .expect("upstream lock")
+            .calls
+            .iter()
+            .filter(|(k, _)| {
+                k.method == method && k.block == block && k.addressed_by_hash == addressed_by_hash
+            })
+            .map(|(_, n)| *n)
+            .sum()
     }
 }
 
@@ -353,6 +375,7 @@ impl Inner {
                 method: method.to_string(),
                 tracer: tracer.clone(),
                 block: number,
+                addressed_by_hash: p0.as_str().is_some_and(|value| value.len() > 42),
             };
             *self.calls.entry(key).or_insert(0) += 1;
 

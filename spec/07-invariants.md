@@ -182,11 +182,11 @@ encoding path.
 **INV-26 — Payload determinism.** [response]
 The canonical record is a deterministic function of (upstream data, data selection):
 same inputs → same bytes, across runs, restarts, and concurrency (REQ-7). No
-iteration-order, timing, or concurrency effect may reach the payload (GAP-13).
+iteration-order, timing, or concurrency effect may reach the payload.
 *Why:* differential testing, caching, and dedup all assume it; nondeterminism also
 breaks REQ-24.
-*Check:* CT-5 — repeated acquisition of recorded corpus, byte-diff (GAP-13 first
-test).
+*Check:* CT-5 — repeated acquisition of recorded corpus, including trace grouping
+across fresh processes, byte-diff.
 
 **INV-27 — Error soundness.** [response]
 Every terminal outcome is one taxonomy class (RP-13); no payload-plus-error hybrid;
