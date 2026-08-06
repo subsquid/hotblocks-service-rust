@@ -1,0 +1,52 @@
+name: Predecessor differential
+
+on:
+  schedule:
+    - cron: "37 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  differential:
+    name: HC-8 differential oracle
+    runs-on: dev-server
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/checkout@v4
+        with:
+          repository: subsquid/squid-sdk
+          ref: 26f7703e127604a40522449eedff3823d6183662
+          path: _predecessor/squid-sdk
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Cache predecessor package store
+        uses: actions/cache@v4
+        with:
+          path: _predecessor/squid-sdk/common/temp/pnpm-store
+          key: ${{ runner.os }}-squid-sdk-pnpm-${{ hashFiles('_predecessor/squid-sdk/common/config/rush/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-squid-sdk-pnpm-
+      - name: Install predecessor dependencies
+        working-directory: _predecessor/squid-sdk
+        run: node common/scripts/install-run-rush.js install
+      - name: Build predecessor oracle
+        working-directory: _predecessor/squid-sdk
+        run: node common/scripts/install-run-rush.js build --to @subsquid/evm-data-service
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Compare contracts
+        env:
+          SQD_PREDECESSOR_PACKAGE_DIR: ${{ github.workspace }}/_predecessor/squid-sdk/evm/evm-data-service
+        run: |
+          set -euo pipefail
+          cargo test -p harness --test ct5_predecessor -- --ignored --nocapture 2>&1 | tee result.log
+          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored" result.log

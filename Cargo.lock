@@ -810,6 +810,7 @@ dependencies = [
  "bytes",
  "flate2",
  "futures",
+ "http-body-util",
  "prometheus",
  "reqwest",
  "serde",

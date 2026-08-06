@@ -27,6 +27,10 @@ honored) and anything else that differs is a defect.
 
 Enables silent cutover and differential testing (the predecessor is the oracle —
 HC-8, REQ-24). Freezes known predecessor warts (409-status conventions, substring
-encoding negotiation, oversized-body status) until REQ-24 is sunset (OQ-4). Known
-remaining breaches are tracked as GAP-18 and GAP-19. Shapes REQ-7, REQ-24, IB-2..IB-9,
+encoding negotiation, oversized-body status) until REQ-24 is sunset (OQ-4). The
+temporary pinned differential runner retired GAP-18, GAP-19 and GAP-27; it is removed
+with this compatibility requirement. Withdrawal keys are currently pinned to the
+recorded geth emission order (`index, validatorIndex, address, amount`), not a
+canonical order; because the predecessor passes those objects through, another
+provider order needs its own fixture and may differ. Shapes REQ-7, REQ-24, IB-2..IB-9,
 INV-25/26.

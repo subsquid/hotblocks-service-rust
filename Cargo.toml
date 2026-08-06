@@ -25,6 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 reqwest = { version = "0.12", features = ["json", "gzip"] }
 axum = "0.8"
+http-body-util = "0.1"
 zstd = "0.13"
 flate2 = "1"
 prometheus = "0.14"
