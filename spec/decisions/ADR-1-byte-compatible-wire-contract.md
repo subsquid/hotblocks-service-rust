@@ -28,5 +28,5 @@ honored) and anything else that differs is a defect.
 Enables silent cutover and differential testing (the predecessor is the oracle —
 HC-8, REQ-24). Freezes known predecessor warts (409-status conventions, substring
 encoding negotiation, oversized-body status) until REQ-24 is sunset (OQ-4). Known
-breaches are tracked as GAP-13, GAP-18, GAP-19. Shapes REQ-7, REQ-24, IB-2..IB-9,
+remaining breaches are tracked as GAP-18 and GAP-19. Shapes REQ-7, REQ-24, IB-2..IB-9,
 INV-25/26.

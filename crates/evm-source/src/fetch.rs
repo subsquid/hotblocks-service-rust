@@ -1327,6 +1327,8 @@ impl Rpc {
     ) -> Result<Vec<Component<Vec<TraceTransactionReplay>>>> {
         let tracers_json: Vec<Value> = tracers.iter().map(|&t| json!(t)).collect();
 
+        // Keep replay requests hash-addressed so they stay bound to the exact
+        // header fetched before a possible reorg.
         let calls: Vec<(String, Option<Value>)> = blocks
             .iter()
             .map(|b| {
@@ -1356,9 +1358,12 @@ impl Rpc {
         &self,
         blocks: &[&RawRpcBlock],
     ) -> Result<Vec<Component<Vec<TraceTransactionReplay>>>> {
+        // Hash-addressed trace_block is not portable: some providers accept it
+        // but return reward-only frames. Use the number, then bind every frame
+        // back to the fetched header in trace_block_replays.
         let calls: Vec<(String, Option<Value>)> = blocks
             .iter()
-            .map(|b| ("trace_block".to_string(), Some(json!([b.hash]))))
+            .map(|b| ("trace_block".to_string(), Some(json!([to_qty(b.number)]))))
             .collect();
 
         let results = self
@@ -1562,8 +1567,10 @@ fn replays_of(
     Ok(replays)
 }
 
-/// A flat frame list over the whole block, reward frames included: every frame
-/// carries this block's hash, every transaction appears.
+/// A flat frame list over the whole block, reward frames included. Because the
+/// request is addressed by number, a reorg may occur between fetching the
+/// header and fetching its traces. Every frame must therefore carry the fetched
+/// block's hash, and every fetched transaction must appear.
 fn trace_block_replays(
     result: std::result::Result<Value, RpcError>,
     block: &RawRpcBlock,
@@ -1586,17 +1593,23 @@ fn trace_block_replays(
         ));
     }
 
-    let mut by_tx: std::collections::HashMap<String, Vec<crate::rpc_data::TraceFrame>> =
-        std::collections::HashMap::new();
+    let mut position_by_tx = std::collections::HashMap::<String, usize>::new();
+    let mut groups = Vec::<(String, Vec<crate::rpc_data::TraceFrame>)>::new();
     for frame in frames {
-        if let Some(hash) = &frame.transaction_hash {
-            by_tx.entry(hash.clone()).or_default().push(frame);
+        if let Some(tx_hash) = frame.transaction_hash.clone() {
+            if let Some(&position) = position_by_tx.get(&tx_hash) {
+                groups[position].1.push(frame);
+            } else {
+                position_by_tx.insert(tx_hash.clone(), groups.len());
+                groups.push((tx_hash, vec![frame]));
+            }
         }
     }
 
-    // Reward-only answers to a hash-addressed call land here (GAP-12).
+    // A reward-only response is incomplete regardless of request form. Never
+    // turn it into a trace-less block that appears coherent.
     for tx in &block.block.transactions {
-        if !by_tx.contains_key(&tx.hash) {
+        if !position_by_tx.contains_key(&tx.hash) {
             return Err(format!(
                 "block {}: trace_block returned no traces for transaction {}",
                 block.number, tx.hash
@@ -1604,7 +1617,9 @@ fn trace_block_replays(
         }
     }
 
-    Ok(by_tx
+    // Match the predecessor's Map semantics: lookup is hashed, emission keeps
+    // the first-seen frame order and is stable across processes.
+    Ok(groups
         .into_iter()
         .map(|(tx_hash, frames)| TraceTransactionReplay {
             transaction_hash: Some(tx_hash),

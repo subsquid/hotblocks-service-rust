@@ -159,8 +159,9 @@ bounded, classified retries: transient upstream errors are retried on a bounded
 schedule; non-transient errors surface immediately.
 *Acceptance:* under a metered fake upstream, aggregate request rate never exceeds the
 configured limit by more than `P-RATE-TOLERANCE`; retry counts per call are bounded by
-`P-RPC-RETRY-ATTEMPTS`.
-*Trace:* WP-11, FM-20..; ADR-3; GAP-10, GAP-20, GAP-21.
+`P-RPC-RETRY-ATTEMPTS`; within one logical RPC batch operation, an item is never
+submitted again after its successful response is observed.
+*Trace:* WP-11, FM-20..; ADR-3; GAP-20, GAP-21.
 
 **REQ-17 — Multi-VM extensibility.** [MUST]
 The core state machine, query contract, and HTTP surface are chain-agnostic: block

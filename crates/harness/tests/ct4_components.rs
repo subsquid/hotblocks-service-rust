@@ -278,6 +278,28 @@ async fn healthy_trace_api_serves_traces_and_state_diffs() {
     assert_eq!(run.error, None);
 }
 
+#[tokio::test]
+async fn trace_block_uses_number_addressing() {
+    let upstream = head_chain().await;
+
+    let run = drive(&upstream, trace_block(), FIRST, 1).await;
+
+    assert_eq!(run.numbers(), vec![FIRST]);
+    assert!(upstream.calls_by_number(TRACE_BLOCK_METHOD, FIRST) > 0);
+    assert_eq!(upstream.calls_by_hash(TRACE_BLOCK_METHOD, FIRST), 0);
+}
+
+#[tokio::test]
+async fn trace_replay_keeps_hash_addressing() {
+    let upstream = head_chain().await;
+
+    let run = drive(&upstream, trace_api(), FIRST, 1).await;
+
+    assert_eq!(run.numbers(), vec![FIRST]);
+    assert!(upstream.calls_by_hash(REPLAY_METHOD, FIRST) > 0);
+    assert_eq!(upstream.calls_by_number(REPLAY_METHOD, FIRST), 0);
+}
+
 // ─── Fault classes on the execution-trace path ────────────────────────────────
 
 #[tokio::test]
@@ -528,7 +550,30 @@ async fn unparsable_replay_payload_retries_then_fails_loud() {
 #[tokio::test]
 async fn trace_block_of_another_block_retries_then_fails_loud() {
     let upstream = head_chain().await;
+    // Models a reorg between fetching header A at this height and asking
+    // trace_block(number): the provider now answers with branch B's frames.
     upstream.inject(TRACE_BLOCK_METHOD, FAULTED, Fault::WrongBlock);
+
+    let run = drive(&upstream, trace_block(), FIRST, 100).await;
+
+    run.assert_components_complete("traces");
+    run.assert_failed_loud(FAULTED);
+    assert_eq!(upstream.calls(TRACE_BLOCK_METHOD, FAULTED), ACQUISITIONS);
+    assert_eq!(
+        upstream.calls_by_number(TRACE_BLOCK_METHOD, FAULTED),
+        ACQUISITIONS,
+        "the by-number compatibility path must still reject frames bound to another hash"
+    );
+}
+
+#[tokio::test]
+async fn trace_block_without_block_hash_retries_then_fails_loud() {
+    let upstream = head_chain().await;
+    upstream.inject(
+        TRACE_BLOCK_METHOD,
+        FAULTED,
+        Fault::DropKey("blockHash".into()),
+    );
 
     let run = drive(&upstream, trace_block(), FIRST, 100).await;
 
@@ -540,8 +585,8 @@ async fn trace_block_of_another_block_retries_then_fails_loud() {
 #[tokio::test]
 async fn trace_block_missing_a_transaction_retries_then_fails_loud() {
     let upstream = head_chain().await;
-    // What a provider answering a hash-addressed `trace_block` with reward-only
-    // frames looks like from here (GAP-12's symptom).
+    // Pin the coverage guard behind the portable by-number request: even a
+    // reward-only answer must never be served as a coherent block.
     upstream.inject(TRACE_BLOCK_METHOD, FAULTED, Fault::Truncated);
 
     let run = drive(&upstream, trace_block(), FIRST, 100).await;
