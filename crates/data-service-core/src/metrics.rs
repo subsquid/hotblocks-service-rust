@@ -1,6 +1,9 @@
 //! Prometheus metrics registry — exact port of `metrics.ts`.
 
+use prometheus::proto::{Metric, MetricFamily, MetricType};
 use prometheus::{CounterVec, Gauge, Histogram, HistogramOpts, Opts, Registry};
+use serde::Serialize;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -70,6 +73,182 @@ impl BlockTimestampCache {
 
 // Global singleton (mirrors the module-level `blockTimestampCache` in metrics.ts).
 static BLOCK_TIMESTAMP_CACHE: OnceLock<Mutex<BlockTimestampCache>> = OnceLock::new();
+
+#[derive(Serialize)]
+struct JsonMetricFamily<'a> {
+    help: &'a str,
+    name: &'a str,
+    #[serde(rename = "type")]
+    metric_type: &'static str,
+    values: Vec<JsonMetricValue>,
+    aggregator: &'static str,
+}
+
+#[derive(Serialize)]
+struct JsonMetricValue {
+    value: Value,
+    labels: Map<String, Value>,
+    #[serde(rename = "metricName", skip_serializing_if = "Option::is_none")]
+    metric_name: Option<String>,
+}
+
+fn json_number(value: f64) -> Value {
+    if value.is_finite() && value.fract() == 0.0 {
+        if value >= 0.0 && value <= u64::MAX as f64 {
+            return Value::from(value as u64);
+        }
+        if value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+            return Value::from(value as i64);
+        }
+    }
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
+}
+
+fn labels(metric: &Metric) -> Map<String, Value> {
+    metric
+        .get_label()
+        .iter()
+        .map(|label| {
+            (
+                label.name().to_string(),
+                Value::String(label.value().to_string()),
+            )
+        })
+        .collect()
+}
+
+fn sample(
+    value: impl Into<Value>,
+    labels: Map<String, Value>,
+    metric_name: Option<String>,
+) -> JsonMetricValue {
+    JsonMetricValue {
+        value: value.into(),
+        labels,
+        metric_name,
+    }
+}
+
+fn metric_values(family: &MetricFamily) -> Vec<JsonMetricValue> {
+    let name = family.name();
+    let mut values = Vec::new();
+
+    for metric in family.get_metric() {
+        match family.get_field_type() {
+            MetricType::GAUGE => values.push(sample(
+                json_number(
+                    metric
+                        .gauge
+                        .as_ref()
+                        .map(|gauge| gauge.value())
+                        .unwrap_or(0.0),
+                ),
+                labels(metric),
+                None,
+            )),
+            MetricType::COUNTER => values.push(sample(
+                json_number(
+                    metric
+                        .counter
+                        .as_ref()
+                        .map(|counter| counter.value())
+                        .unwrap_or(0.0),
+                ),
+                labels(metric),
+                None,
+            )),
+            MetricType::HISTOGRAM => {
+                let Some(histogram) = metric.histogram.as_ref() else {
+                    continue;
+                };
+                for bucket in histogram.get_bucket() {
+                    let mut bucket_labels = labels(metric);
+                    let upper_bound = bucket.upper_bound();
+                    bucket_labels.insert(
+                        "le".to_string(),
+                        if upper_bound.is_infinite() {
+                            Value::String("+Inf".to_string())
+                        } else {
+                            json_number(upper_bound)
+                        },
+                    );
+                    values.push(sample(
+                        Value::from(bucket.cumulative_count()),
+                        bucket_labels,
+                        Some(format!("{name}_bucket")),
+                    ));
+                }
+                let mut infinity_labels = labels(metric);
+                infinity_labels.insert("le".to_string(), Value::String("+Inf".to_string()));
+                values.push(sample(
+                    Value::from(histogram.sample_count()),
+                    infinity_labels,
+                    Some(format!("{name}_bucket")),
+                ));
+                values.push(sample(
+                    json_number(histogram.sample_sum()),
+                    labels(metric),
+                    Some(format!("{name}_sum")),
+                ));
+                values.push(sample(
+                    Value::from(histogram.sample_count()),
+                    labels(metric),
+                    Some(format!("{name}_count")),
+                ));
+            }
+            MetricType::SUMMARY => {
+                let Some(summary) = metric.summary.as_ref() else {
+                    continue;
+                };
+                for quantile in &summary.quantile {
+                    let mut quantile_labels = labels(metric);
+                    quantile_labels
+                        .insert("quantile".to_string(), json_number(quantile.quantile()));
+                    values.push(sample(
+                        json_number(quantile.value()),
+                        quantile_labels,
+                        Some(name.to_string()),
+                    ));
+                }
+                values.push(sample(
+                    json_number(summary.sample_sum()),
+                    labels(metric),
+                    Some(format!("{name}_sum")),
+                ));
+                values.push(sample(
+                    Value::from(summary.sample_count()),
+                    labels(metric),
+                    Some(format!("{name}_count")),
+                ));
+            }
+            MetricType::UNTYPED => values.push(sample(
+                json_number(
+                    metric
+                        .untyped
+                        .as_ref()
+                        .map(|untyped| untyped.value())
+                        .unwrap_or(0.0),
+                ),
+                labels(metric),
+                None,
+            )),
+        }
+    }
+
+    values
+}
+
+fn metric_type_name(metric_type: MetricType) -> &'static str {
+    match metric_type {
+        MetricType::COUNTER => "counter",
+        MetricType::GAUGE => "gauge",
+        MetricType::SUMMARY => "summary",
+        MetricType::UNTYPED => "untyped",
+        MetricType::HISTOGRAM => "histogram",
+    }
+}
 
 fn block_timestamp_cache() -> &'static Mutex<BlockTimestampCache> {
     BLOCK_TIMESTAMP_CACHE
@@ -288,14 +467,25 @@ impl Metrics {
         Ok(String::from_utf8(buf).unwrap_or_default())
     }
 
-    /// Return all metrics as JSON (encoded via text format then parsed).
-    pub fn gather_json(&self) -> serde_json::Value {
-        // Encode as text and return it as a JSON string value (simple approach
-        // that avoids the protobuf internal API, which changed in prometheus 0.14).
-        match self.gather_text() {
-            Ok(text) => serde_json::Value::String(text),
-            Err(e) => serde_json::json!({"error": e.to_string()}),
-        }
+    /// Return the structured metric-family array exposed by prom-client's
+    /// `getMetricsAsJSON`, retained for the temporary REQ-24 wire contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a metric family cannot be serialized to JSON.
+    pub fn gather_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let gathered = self.registry.gather();
+        let families: Vec<_> = gathered
+            .iter()
+            .map(|family| JsonMetricFamily {
+                help: family.help(),
+                name: family.name(),
+                metric_type: metric_type_name(family.get_field_type()),
+                values: metric_values(family),
+                aggregator: "sum",
+            })
+            .collect();
+        serde_json::to_value(families)
     }
 
     /// Look up a single metric family by name (for `/metrics/{name}`).

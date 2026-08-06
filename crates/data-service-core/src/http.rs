@@ -15,6 +15,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::error::Error as _;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
@@ -96,8 +97,17 @@ async fn handle_metrics<S: DataSource>(
     Query(params): Query<JsonQueryParam>,
 ) -> impl IntoResponse {
     if params.json.as_deref() == Some("true") {
-        let json = state.metrics.gather_json();
-        Json(json).into_response()
+        match state.metrics.gather_json() {
+            Ok(json) => Json(json).into_response(),
+            Err(error) => {
+                tracing::error!(?error, "failed to serialize metrics as JSON");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "metrics serialization error",
+                )
+                    .into_response()
+            }
+        }
     } else {
         match state.metrics.gather_text() {
             Ok(text) => (
@@ -160,12 +170,15 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
     // Read body (≤ 1024 bytes enforced by DefaultBodyLimit layer).
     let body_bytes = match axum::body::to_bytes(body, 1024).await {
         Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "request body too large or unreadable",
-            )
-                .into_response()
+        Err(error) => {
+            let too_large = error
+                .source()
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+            return if too_large {
+                (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, "request body unreadable").into_response()
+            };
         }
     };
 

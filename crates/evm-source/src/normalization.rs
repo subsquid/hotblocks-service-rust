@@ -30,10 +30,10 @@ pub struct NormalizedBlock {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedWithdrawal {
-    pub address: String,
-    pub amount: String,
     pub index: String,
     pub validator_index: String,
+    pub address: String,
+    pub amount: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -330,6 +330,21 @@ pub struct NormalizedTraceCallAction {
     pub call_type: String,
 }
 
+/// The predecessor constructs debug-call actions with `callType` before the
+/// remaining fields, while trace-API actions append it last. Keep the two wire
+/// shapes distinct until REQ-24 is sunset.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedDebugTraceCallAction {
+    pub call_type: String,
+    pub from: String,
+    pub to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub gas: String,
+    pub input: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedTraceRewardAction {
@@ -352,6 +367,15 @@ pub struct NormalizedTraceSelfdestructAction {
 pub enum NormalizedTraceAction {
     Create(NormalizedTraceCreateAction),
     Call(NormalizedTraceCallAction),
+    Reward(NormalizedTraceRewardAction),
+    Selfdestruct(NormalizedTraceSelfdestructAction),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum NormalizedDebugTraceAction {
+    Create(NormalizedTraceCreateAction),
+    Call(NormalizedDebugTraceCallAction),
     Reward(NormalizedTraceRewardAction),
     Selfdestruct(NormalizedTraceSelfdestructAction),
 }
@@ -383,8 +407,16 @@ pub enum NormalizedTraceResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum NormalizedTrace {
+    TraceApi(NormalizedTraceApi),
+    Debug(NormalizedDebugTrace),
+}
+
+/// `trace_*` mapping order from the predecessor's `mapTrace` object literal.
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NormalizedTrace {
+pub struct NormalizedTraceApi {
     pub transaction_index: u64,
     pub trace_address: Vec<u64>,
     #[serde(rename = "type")]
@@ -395,6 +427,26 @@ pub struct NormalizedTrace {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revert_reason: Option<String>,
     pub action: NormalizedTraceAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<NormalizedTraceResult>,
+}
+
+/// Debug-frame mapping order. The predecessor spreads a base object containing
+/// `subtraces` before adding `type` and `action`, so this intentionally differs
+/// from [`NormalizedTraceApi`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedDebugTrace {
+    pub transaction_index: u64,
+    pub trace_address: Vec<u64>,
+    pub subtraces: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revert_reason: Option<String>,
+    #[serde(rename = "type")]
+    pub trace_type: String,
+    pub action: NormalizedDebugTraceAction,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<NormalizedTraceResult>,
 }
@@ -709,7 +761,7 @@ pub fn map_trace_frame(src: &TraceFrame, transaction_index: u64) -> NormalizedTr
         None
     };
 
-    NormalizedTrace {
+    NormalizedTrace::TraceApi(NormalizedTraceApi {
         transaction_index,
         trace_address: src.trace_address.clone(),
         trace_type: if src.frame_type == "suicide" {
@@ -722,7 +774,7 @@ pub fn map_trace_frame(src: &TraceFrame, transaction_index: u64) -> NormalizedTr
         revert_reason,
         action: map_trace_action(&src.action),
         result: map_trace_result(src.result.as_ref()),
-    }
+    })
 }
 
 // ─── Debug frame traversal ────────────────────────────────────────────────────
@@ -777,7 +829,7 @@ pub fn map_debug_frame(
         let trace_opt = match frame_type_to_normalized(frame.frame_type.as_str()) {
             "create" => {
                 let input = frame.input.clone().unwrap_or_else(|| "0x".to_string());
-                let action = NormalizedTraceAction::Create(NormalizedTraceCreateAction {
+                let action = NormalizedDebugTraceAction::Create(NormalizedTraceCreateAction {
                     from: frame.from.to_lowercase(),
                     value: frame.value.clone(),
                     gas: frame.gas.clone(),
@@ -796,16 +848,16 @@ pub fn map_debug_frame(
                         None
                     };
 
-                Some(NormalizedTrace {
+                Some(NormalizedTrace::Debug(NormalizedDebugTrace {
                     transaction_index,
                     trace_address: item.trace_address,
-                    trace_type: "create".to_string(),
                     subtraces: item.subtraces,
                     error: base_error,
                     revert_reason: base_revert,
+                    trace_type: "create".to_string(),
                     action,
                     result,
-                })
+                }))
             }
             "call" => {
                 let to = match &frame.to {
@@ -814,13 +866,13 @@ pub fn map_debug_frame(
                 };
                 let input = frame.input.clone().unwrap_or_else(|| "0x".to_string());
                 let call_type = frame.frame_type.to_lowercase();
-                let action = NormalizedTraceAction::Call(NormalizedTraceCallAction {
+                let action = NormalizedDebugTraceAction::Call(NormalizedDebugTraceCallAction {
+                    call_type,
                     from: frame.from.to_lowercase(),
                     to,
                     value: frame.value.clone(),
                     gas: frame.gas.clone(),
                     input,
-                    call_type,
                 });
 
                 let result = if frame.gas_used.is_some() || frame.output.is_some() {
@@ -832,16 +884,16 @@ pub fn map_debug_frame(
                     None
                 };
 
-                Some(NormalizedTrace {
+                Some(NormalizedTrace::Debug(NormalizedDebugTrace {
                     transaction_index,
                     trace_address: item.trace_address,
-                    trace_type: "call".to_string(),
                     subtraces: item.subtraces,
                     error: base_error,
                     revert_reason: base_revert,
+                    trace_type: "call".to_string(),
                     action,
                     result,
-                })
+                }))
             }
             "selfdestruct" => {
                 let to = match &frame.to {
@@ -849,21 +901,21 @@ pub fn map_debug_frame(
                     None => continue,
                 };
                 let action =
-                    NormalizedTraceAction::Selfdestruct(NormalizedTraceSelfdestructAction {
+                    NormalizedDebugTraceAction::Selfdestruct(NormalizedTraceSelfdestructAction {
                         address: frame.from.to_lowercase(),
                         refund_address: to,
                         balance: frame.value.clone(),
                     });
-                Some(NormalizedTrace {
+                Some(NormalizedTrace::Debug(NormalizedDebugTrace {
                     transaction_index,
                     trace_address: item.trace_address,
-                    trace_type: "selfdestruct".to_string(),
                     subtraces: item.subtraces,
                     error: base_error,
                     revert_reason: base_revert,
+                    trace_type: "selfdestruct".to_string(),
                     action,
                     result: None,
-                })
+                }))
             }
             _ => continue,
         };
@@ -1175,10 +1227,10 @@ pub fn map_block_header(src: &RpcBlock) -> NormalizedHeader {
         withdrawals: src.withdrawals.as_deref().map(|ws| {
             ws.iter()
                 .map(|w| NormalizedWithdrawal {
-                    address: w.address.clone(),
-                    amount: w.amount.clone(),
                     index: w.index.clone(),
                     validator_index: w.validator_index.clone(),
+                    address: w.address.clone(),
+                    amount: w.amount.clone(),
                 })
                 .collect()
         }),

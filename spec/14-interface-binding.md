@@ -31,7 +31,7 @@ Clients MUST use a multi-frame/multi-member decoder.
 | finalizedHead | `GET /finalized-head` | 200 JSON, same shape | |
 | readiness | `GET /readiness` | 200 text `true` / 503 text `false` | 503 also on probe failure (RP-10) |
 | stream | `POST /stream` | 200 block frames / 204 empty | see IB-3..IB-8 |
-| metrics | `GET /metrics` | 200 Prometheus text v0.0.4 | `?json=true`: predecessor returns a structured JSON array — current implementation diverges (GAP-18, pending OQ-4) |
+| metrics | `GET /metrics` | 200 Prometheus text v0.0.4 | `?json=true`: structured JSON array of Prometheus metric families |
 | metric | `GET /metrics/{name}` | 200 single-metric text | 404 text `requested metric not found` |
 | blockIngestTime | `GET /block-time/{height}` | 200 text decimal ms timestamp | 404 text `Timestamp not found for the specified block`; entries expire per `P-BLOCKTIME-TTL`, capacity `P-BLOCKTIME-CACHE` |
 
@@ -67,7 +67,7 @@ breach), ascending, newest last. No finalized-head headers.
 
 | Class | Status | Body |
 |---|---|---|
-| INVALID_REQUEST | 400 | text diagnostic; oversized body: predecessor uses 413 (GAP-19, pending OQ-4) |
+| INVALID_REQUEST | 400; 413 when the body exceeds `P-REQ-BODY-MAX` | text diagnostic |
 | CONFLICT | 409 | IB-6 |
 | EMPTY | 204 | IB-5 |
 | NOT_FOUND | 404 | text diagnostic |

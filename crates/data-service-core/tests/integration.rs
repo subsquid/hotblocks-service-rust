@@ -378,6 +378,79 @@ async fn test_metrics_endpoint() {
         text.contains("sqd_hotblocks"),
         "missing sqd metrics: {text}"
     );
+
+    handle.shutdown().await;
+}
+
+/// GAP-18/REQ-24: the temporary predecessor-compatibility contract exposes
+/// prom-client's structured metric-family array, not text exposition wrapped
+/// in a JSON string.
+#[tokio::test]
+async fn metrics_json_endpoint_returns_structured_families() {
+    let source = MockSource {
+        chain: Arc::new(simple_chain(3)),
+        fork_after: None,
+    };
+    let handle = run_data_service(DataServiceOptions {
+        source,
+        block_cache_size: 100,
+        port: 0,
+        auto_adjust_finalized_head: false,
+    })
+    .await
+    .unwrap();
+
+    let response = reqwest::get(format!(
+        "http://127.0.0.1:{}/metrics?json=true",
+        handle.port
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let body: serde_json::Value = response.json().await.unwrap();
+    let families = body
+        .as_array()
+        .expect("the JSON metrics mode must return a metric-family array");
+    let last_block = families
+        .iter()
+        .find(|family| family["name"] == "sqd_hotblocks_last_block")
+        .expect("last-block metric family");
+    assert_eq!(last_block["help"], "Number of the last stored block");
+    assert_eq!(last_block["type"], "gauge");
+    assert_eq!(last_block["aggregator"], "sum");
+    assert!(last_block["values"].is_array());
+
+    handle.shutdown().await;
+}
+
+/// GAP-19/REQ-24: preserve the predecessor's payload-too-large status while
+/// the migration wire contract remains active.
+#[tokio::test]
+async fn oversized_stream_request_returns_413() {
+    let source = MockSource {
+        chain: Arc::new(simple_chain(3)),
+        fork_after: None,
+    };
+    let handle = run_data_service(DataServiceOptions {
+        source,
+        block_cache_size: 100,
+        port: 0,
+        auto_adjust_finalized_head: false,
+    })
+    .await
+    .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/stream", handle.port))
+        .header("content-type", "application/json")
+        .body(vec![b'x'; 1025])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413);
+
+    handle.shutdown().await;
 }
 
 #[tokio::test]

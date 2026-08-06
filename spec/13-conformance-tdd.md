@@ -266,14 +266,14 @@ differential corpus, no soak, no benchmarks yet.
 | REQ-16 | CT-4 | P ! | retry classification, including the reduced singleton-batch path, is unit-tested; a partial-batch regression proves an observed successful item is never reissued; GAP-20/21 remain |
 | REQ-17 | CT-1 | U | synthetic non-EVM adapter run absent |
 | REQ-20..23 | CT-6/2 | P | shutdown only |
-| REQ-24 | CT-5 | U ! | GAP-27: no differential runner; GAP-18/19 known breaches |
+| REQ-24 | CT-5 | P | HC-8 compares exact recorded payload bytes plus the live JSON-metrics and oversized-request contracts against a pinned predecessor revision each night. The corpus covers logs, receipts, debug traces, trace replays and state diffs; broader network coverage remains partial, and the runner is removed when OQ-4 sunsets REQ-24 |
 | REQ-30..32 | CT-5 | U ! | GAP-24, GAP-25; REQ-32's verification half is covered under REQ-14, GAP-20 remains |
 
-## Gap register (2026-08-03)
+## Gap register (2026-08-06)
 
 Priorities: P0 active production risk · P1 correctness hole with plausible trigger ·
 P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry point.
-Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, GAP-3, GAP-5, GAP-6, GAP-7, GAP-8, GAP-9, GAP-10, GAP-11, GAP-12, GAP-13, GAP-17, GAP-29, GAP-32, GAP-33, GAP-35, GAP-36.
+Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, GAP-3, GAP-5, GAP-6, GAP-7, GAP-8, GAP-9, GAP-10, GAP-11, GAP-12, GAP-13, GAP-17, GAP-18, GAP-19, GAP-27, GAP-29, GAP-32, GAP-33, GAP-35, GAP-36.
 
 | GAP | Statement | Violates | Prio | First test |
 |---|---|---|---|---|
@@ -294,8 +294,8 @@ Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, 
 | GAP-15 | Structural validation of debug-trace frames (and the opt-in call-tree check) is absent; unmappable frames from buggy providers historically caused a week-long ingestion stall in the predecessor. Frames that fail to *deserialize* are bounded-rejected since 2026-08-05 (CT-4); the gap is now frames that parse but describe an impossible call tree | REQ-9, LIV-2, FM-25 | P2 | CT-4: corpus with a well-formed but structurally impossible frame; assert bounded rejection, not stall |
 | GAP-16 | Per-network quirk handling for several networks of the predecessor's supported set is absent (phantom transactions, duplicated receipts, provider-specific trace addressing) — blocked on OQ-6 scope decision. This explicitly includes any supported provider that requires a non-baseline address form for `trace_replayBlockTransactions`; GAP-12's parity fix does not retire that risk. Two classes are honored since 2026-08-05: polygon-based chains may leave transactions uncovered by debug traces (IB-16's quirk tolerance), and the verification exemptions of GAP-9. Tempo's `0x76` verification landed with the 2026-08-05 review fixes. What remains on the verification side is Arbitrum's retryable encoders `0x66`/`0x68`/`0x69`, so blocks carrying one are exempt from the transaction-commitment check instead of verified by it | REQ-15, FM-14 | P2 | CT-4: per-network quirk corpus (port the predecessor's fixtures), including the polygon coverage exemption; CT-5: the corpus asserts the remaining Arbitrum family verifies rather than being exempt |
 | GAP-17 | **Retired 2026-08-05.** The trace API picks one method per selection, as the baseline does: the replay call carries traces only where it already runs for state diffs, otherwise `trace_block` answers alone. Forced by GAP-3's closure — once a component failure is fatal, a discarded second answer can end the session | — | retired | — |
-| GAP-18 | The JSON metrics mode returns a string containing text exposition instead of the predecessor's structured array | REQ-24, IB | P3 (OQ-4) | CT-5 differential on the metrics route |
-| GAP-19 | Oversized request bodies return the generic invalid-request status instead of the payload-too-large status the predecessor uses | REQ-24, IB | P3 (OQ-4) | CT-5: oversized body; assert status per 14 |
+| GAP-18 | **Retired 2026-08-06.** JSON metrics mode returns structured Prometheus metric families rather than a JSON string containing text exposition. A focused route regression and HC-8's live predecessor probe pin the shape without making family or sample order part of the service contract | — | retired | — |
+| GAP-19 | **Retired 2026-08-06.** A request body above `P-REQ-BODY-MAX` returns payload-too-large (413); other malformed requests remain invalid-request (400). A focused live-route regression and HC-8's predecessor probe pin the distinction | — | retired | — |
 | GAP-20 | The upstream batch-size cap option is accepted but bypassed by the dominant call path | INV-36, REQ-16 | P2 | CT-5: metered upstream; assert max observed batch ≤ configured cap |
 | GAP-21 | The upstream rate limiter admits concurrent callers past the budget (check-then-act race) | REQ-16, HZ-7 | P2 | CT-8: concurrent acquisition against a metered upstream; assert rate ≤ limit + tolerance |
 | GAP-22 | A backfill failure after HTTP has emitted a prefix — either the original continuity-check panic or a bounded acquisition error now reachable after GAP-11/ADR-19 — only logs and stops the producer. The client receives a truncated 200 with no server-side alarm/counter. GAP-11 widened this trigger: the short finalized path previously hung before it could terminate the response | INV-27, INV-31, FM-32 | P2 | CT-4: inject both continuity failure and acquisition exhaustion after a prefix; assert frame-boundary truncation **and** an OB-7 event/counter |
@@ -307,7 +307,7 @@ Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, 
 | GAP-29 | **Retired 2026-08-04.** `push` absorbs a redelivery matching the buffered block on the full linkage tuple, decided before the DEF-4 height check | — | retired | — |
 | GAP-30 | The post-wait re-resolution is not dispatched through full range resolution: a height evicted during the wait yields the empty form — without the mandatory watermark metadata — instead of a window-underflow response. The same watermark-less form also fires pre-wait: the below-window check and the query run under two separate lock acquisitions, so eviction racing admission hits it too | RP-3, RP-8, INV-24, IB-5 | P2 | CT-3: request just above head racing eviction across the wait (and across admission); assert backfill or a watermarked empty form |
 | GAP-31 | The response budget and disconnect reap are bypassed by unbounded internal waits: the first backfill batch is awaited without a deadline, and a stalled consumer blocks the producer indefinitely between budget checks | RP-20, RP-21, LIV-3, LIV-10 | P2 | CT-8: stalled upstream during a backfill request, and a stalled reader mid-stream; assert termination within `P-RESP-BUDGET` + `P-DISCONNECT-REAP` |
-| GAP-27 | No differential runner against the predecessor exists, though byte-compatibility (REQ-24) is the migration's acceptance criterion; the worst historical payload bug was found by a manual diff | REQ-24, HC-8 | P1 | build HC-8; run recorded-corpus diff in CI nightly |
+| GAP-27 | **Retired 2026-08-06.** The ignored HC-8 test invokes a predecessor checkout pinned to the migration-oracle revision and compares exact JSONL bytes over recorded logs, receipts, debug traces, trace replays and state diffs, plus live JSON-metrics and oversized-request behavior. Its separate nightly workflow keeps the predecessor out of production dependencies and ordinary PR gates. The first run exposed and retired debug-trace and withdrawal field-order defects hidden by semantic JSON comparisons. This harness is temporary and is deleted when OQ-4 sunsets REQ-24 | — | retired | — |
 | GAP-34 | Readiness probes upstream on every request (`is_ready` calls `get_head`), so probe frequency is upstream load an orchestrator controls, drawn from the budget ingestion shares. RP-10/RP-22 describe the local-view comparison ADR-17 proposes; until that lands, the coupling RP-22 no longer mentions is still real | RP-10, RP-22, REQ-16 | P2 | CT-8: probe `/readiness` at 1 Hz under S1; assert upstream call count is independent of probe rate |
 | GAP-35 | **Retired 2026-08-04.** Batches are judged on DEF-20 shape — non-empty, ascending, pairwise linked — before anything mutates, so a malformed one is rejected whole instead of half-applying or silently dropping its out-of-order blocks | — | retired | — |
 | GAP-36 | **Retired 2026-08-05.** Seed hashes, ordinary block and parent hashes, and finality-report hashes are checked for HTTP field-value safety before any chain mutation, so no committed finality hash can panic `/stream` header construction | — | retired | — |
@@ -340,7 +340,7 @@ Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, 
    on the buffer the service commits; LIV-7 and LIV-11 flipped U→P, INV-4 U→P.
 3. **Phase 2 — correctness core**: full CT-1 generation (reorg/finality/duplicate
    histories), CT-2 kill-point matrix, remaining CT-4 integrity corpus, CT-5 golden +
-   config-honesty, HC-8 differential (GAP-27). *Exit:* all
+   config-honesty. *Exit:* all
    INV rows ≥ P, INV-11/12/13/22/27/28 = C.
    *Started 2026-08-05* with the verification family: GAP-8, GAP-9 and GAP-32 closed
    together by `crates/evm-source/tests/verification_corpus.rs` (17 cases over the
@@ -363,6 +363,11 @@ Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, 
    grouping makes trace payload bytes stable across fresh processes. The regressions
    cover both request forms, wrong and absent frame hashes, classified retry, and
    cross-process byte equality. INV-26 moved U→P.
+   The GAP-18/19/27 slice then built the temporary HC-8 runner. Its nightly-only,
+   pinned predecessor process compares exact recorded EVM payload bytes and probes the
+   two live HTTP edge contracts; focused route tests fail independently of that
+   external oracle. The first differential run corrected debug-trace and withdrawal
+   wire field order. REQ-24 and HC-8 moved U→P; OQ-4 owns removal of the runner.
 4. **Phase 3 — robustness**: CT-4 upstream-fault matrix (GAP-14/15), CT-9 fuzz
    both surfaces, CT-8 isolation, quirk corpora per OQ-6 (GAP-16), observability
    conformance (GAP-4/22/24/25). *Exit:* FM cross-reference fully exercised.
@@ -412,7 +417,7 @@ the executed-test-count ratchet; the latter remains part of HC-11.
 | HC-5 | Executable reference model (this doc's pseudocode) | CT-1..3 | P | core transitions + query verdicts in `crates/harness`; backfill/wait paths not yet modeled |
 | HC-6 | Structural validators as a library | every CT | P | reusable core in `crates/harness`: linear independent zstd-frame/gzip-member splitting (REQ-6), DEF-2/4/5 block shape and linkage, snapshot-judged coverage start + branch, conflict shape and `P-FORK-REFS-MAX` bound, mandatory endpoint body content types, route-aware unknown-route 404, IB-2 DATA negotiation (`Content-Encoding` + `Vary`), RP-13 taxonomy, and watermark rules; the full route-by-route IB sweep remains CT-5 work |
 | HC-7 | Client driver: poll loop, RP-7 recovery, fuzzer, disconnector | CT-1..3, 8, 9 | U | |
-| HC-8 | Differential runner vs predecessor implementation | CT-5, REQ-24, GAP-27 | U | acceptance criterion of the migration; absent |
+| HC-8 | Differential runner vs predecessor implementation | CT-5, REQ-24, GAP-27 | P | temporary ignored runner with a separate nightly workflow and pinned predecessor revision; exact recorded payload bytes plus live JSON-metrics and oversized-request probes are covered, while the corpus is not the full supported-network set; remove at OQ-4 |
 | HC-9 | Load/swarm driver (S3..S6) | CT-3, 8 | U | |
 | HC-10 | Observability scraper + quiescence gate | CT-6, 7; INV-30/31 | U | |
 | HC-11 | Coverage instrumentation in CI | MG-2 | U | |

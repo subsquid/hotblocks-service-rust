@@ -214,7 +214,7 @@ its predecessor implementation on: the HTTP surface of 14, the per-block payload
 and each cites an ADR.
 *Acceptance:* differential run against the predecessor on a recorded corpus (HC-8)
 shows no diffs outside the enumerated list.
-*Trace:* ADR-1; GAP-18, GAP-19, GAP-27.
+*Trace:* ADR-1; HC-8; retired GAP-18, GAP-19, GAP-27.
 
 ## Operations
 
@@ -261,6 +261,6 @@ The following are deliberately left open; conformance tests MUST NOT pin them:
 | OQ-1 | Non-EVM adapters (Solana first): mapping of slots→height/parent coordinates, finality/commitment semantics, payload canonical form — what, if anything, does the core contract miss? | product/eng | REQ-17 acceptance beyond the synthetic adapter |
 | OQ-2 | The intended post-migration redesign ("change how it works") is not yet specified; which parts of this suite does it supersede? | product | roadmap ADRs |
 | OQ-3 | Should the buffer survive restarts (warm restart), or is NG1 permanent? | product/eng | NG1, INV-40 |
-| OQ-4 | When is REQ-24 (predecessor byte-compatibility) sunset, releasing GAP-18/19 and the `?json` shape to be fixed forward? | product | REQ-24, GAP-18, GAP-19 |
+| OQ-4 | When is REQ-24 (predecessor byte-compatibility) sunset, allowing the temporary HC-8 oracle and predecessor-specific compatibility shapes to be removed? | product | REQ-24 |
 | OQ-5 | One process per chain (NG3) — does multi-dataset serving enter the roadmap? | product | NG3 |
 | OQ-6 | The supported-network set for REQ-15 (is Cronos/Hedera/Tac in scope?) | ops | GAP-16 priority |
