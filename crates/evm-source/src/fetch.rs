@@ -15,6 +15,7 @@ use crate::rpc_data::{
     RpcWithdrawal, TraceTransactionReplay,
 };
 use crate::types::{qty2_u64, to_qty};
+use crate::verification::{check_call_frame_tree, check_debug_frame_structure};
 
 /// A component, or why the block is incoherent (DEF-15). The caller marks the
 /// block invalid: WP-11.2 re-acquires, WP-11.3 fails loud. Never emptied or
@@ -24,6 +25,39 @@ type Component<T> = std::result::Result<T, String>;
 /// Why an enabled verification check rejected the block — incoherence on the
 /// same path, never an immediate session error (WP-11.4).
 type VerificationResult = std::result::Result<(), String>;
+
+/// Semantic debug call-tree policy. Structural requirements needed for lossless
+/// normalization are enforced in every mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CallFrameValidationMode {
+    #[default]
+    Off,
+    Observe,
+    Reject,
+}
+
+impl CallFrameValidationMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            CallFrameValidationMode::Off => "off",
+            CallFrameValidationMode::Observe => "observe",
+            CallFrameValidationMode::Reject => "reject",
+        }
+    }
+}
+
+impl std::str::FromStr for CallFrameValidationMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(CallFrameValidationMode::Off),
+            "observe" => Ok(CallFrameValidationMode::Observe),
+            "reject" => Ok(CallFrameValidationMode::Reject),
+            _ => Err(format!("unsupported call-frame validation mode: {value}")),
+        }
+    }
+}
 
 /// Options for the Rpc fetch layer.
 #[derive(Debug, Clone, Default)]
@@ -38,18 +72,30 @@ pub struct RpcOptions {
     pub verify_receipts_root: bool,
     pub verify_withdrawals_root: bool,
     pub verify_logs_bloom: bool,
+    pub call_frame_validation: CallFrameValidationMode,
     pub check_log_index: bool,
     pub check_cumulative_gas_used: bool,
     pub use_gas_used_for_receipts_root: bool,
 }
 
 impl RpcOptions {
-    fn validate_request(&self, req: &crate::types::DataRequest) -> Result<()> {
-        if self.verify_receipts_root && !req.receipts {
-            bail!("verify_receipts_root requires receipt acquisition");
+    /// Validate option relationships before acquisition starts.
+    pub fn validate(&self) -> Result<()> {
+        if self.call_frame_validation == CallFrameValidationMode::Reject
+            && (!self.verify_tx_root || !self.verify_tx_sender)
+        {
+            bail!("call-frame validation reject requires verify_tx_root and verify_tx_sender");
         }
         if self.use_gas_used_for_receipts_root && !self.verify_receipts_root {
             bail!("use_gas_used_for_receipts_root requires verify_receipts_root");
+        }
+        Ok(())
+    }
+
+    fn validate_request(&self, req: &crate::types::DataRequest) -> Result<()> {
+        self.validate()?;
+        if self.verify_receipts_root && !req.receipts {
+            bail!("verify_receipts_root requires receipt acquisition");
         }
         Ok(())
     }
@@ -1199,12 +1245,7 @@ impl Rpc {
             let frames: Component<Vec<Option<DebugFrameResult>>> =
                 if block.block.transactions.len() == arr.len() {
                     arr.into_iter()
-                        .enumerate()
-                        .map(|(j, item)| {
-                            let frame: DebugFrameResult = parse_entry(item, "trace frame", block)?;
-                            check_frame_label(frame.tx_hash.as_deref(), j, block)?;
-                            Ok(Some(frame))
-                        })
+                        .map(|item| parse_entry(item, "trace frame", block).map(Some))
                         .collect()
                 } else {
                     match_by_tx_hash(
@@ -1215,7 +1256,9 @@ impl Rpc {
                     )
                 };
 
-            out.push(frames);
+            out.push(frames.and_then(|frames| {
+                validate_debug_frames(frames, block, self.options.call_frame_validation)
+            }));
         }
 
         Ok(out)
@@ -1406,6 +1449,83 @@ fn parse_entry<T: serde::de::DeserializeOwned>(
 ) -> Component<T> {
     serde_json::from_value(item)
         .map_err(|e| format!("block {}: unparsable {what}: {e}", block.number))
+}
+
+const CALL_FRAME_VIOLATION_SAMPLE_LIMIT: usize = 3;
+
+fn validate_debug_frames(
+    frames: Vec<Option<DebugFrameResult>>,
+    block: &RawRpcBlock,
+    mode: CallFrameValidationMode,
+) -> Component<Vec<Option<DebugFrameResult>>> {
+    let mut violating_transaction_count = 0usize;
+    let mut violation_samples = Vec::new();
+
+    for (position, frame) in frames.iter().enumerate() {
+        let Some(frame) = frame else {
+            continue;
+        };
+        let Some(transaction) = block.block.transactions.get(position) else {
+            return Err(format!(
+                "block {}: debug call frame at position {position} has no transaction",
+                block.number
+            ));
+        };
+
+        check_frame_label(frame.tx_hash.as_deref(), position, block)?;
+
+        if let Some(violation) = check_debug_frame_structure(&frame.result) {
+            return Err(format!(
+                "block {}: invalid debug call frames for transaction {}: {violation}",
+                block.number, transaction.hash
+            ));
+        }
+
+        if mode == CallFrameValidationMode::Off {
+            continue;
+        }
+        let Some(violation) = check_call_frame_tree(transaction, &frame.result) else {
+            continue;
+        };
+
+        if mode == CallFrameValidationMode::Reject {
+            return Err(format!(
+                "block {}: invalid debug call frames for transaction {}: {violation}",
+                block.number, transaction.hash
+            ));
+        }
+
+        violating_transaction_count += 1;
+        if violation_samples.len() < CALL_FRAME_VIOLATION_SAMPLE_LIMIT {
+            violation_samples.push((position, transaction.hash.clone(), violation));
+        }
+    }
+
+    if violating_transaction_count > 0 {
+        let omitted_violation_count = violating_transaction_count - violation_samples.len();
+        warn!(
+            block_number = block.number,
+            block_hash = %block.hash,
+            call_frame_validation = mode.as_str(),
+            violating_transaction_count,
+            sampled_violation_count = violation_samples.len(),
+            omitted_violation_count,
+            "debug call frame consistency violations observed; block accepted"
+        );
+        for (transaction_index, transaction_hash, violation) in violation_samples {
+            warn!(
+                block_number = block.number,
+                block_hash = %block.hash,
+                call_frame_validation = mode.as_str(),
+                transaction_index,
+                transaction_hash = %transaction_hash,
+                violation = %violation,
+                "debug call frame consistency violation sample"
+            );
+        }
+    }
+
+    Ok(frames)
 }
 
 /// A result labelled with another transaction belongs to another block,

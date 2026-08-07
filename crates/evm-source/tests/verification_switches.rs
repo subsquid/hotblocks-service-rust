@@ -8,9 +8,10 @@
 use std::sync::Arc;
 
 use axum::{extract::State, response::IntoResponse, routing::post, Router};
-use evm_source::fetch::{Rpc, RpcOptions};
-use evm_source::rpc_data::RawRpcBlock;
+use evm_source::fetch::{CallFrameValidationMode, Rpc, RpcOptions};
+use evm_source::rpc_data::{RawRpcBlock, RpcReceipt};
 use evm_source::types::DataRequest;
+use evm_source::verification::receipts_root;
 use rpc_client::{RpcClient, RpcClientConfig};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -36,13 +37,16 @@ struct Upstream {
     chain_id: Value,
     block: Value,
     receipts: Value,
+    debug_frames: Value,
 }
 
 impl Upstream {
     fn recorded() -> Self {
+        let block = fixture("block.json");
         Upstream {
             chain_id: json!("0x1"),
-            block: fixture("block.json"),
+            debug_frames: debug_frames_for(&block),
+            block,
             receipts: fixture("receipts.json"),
         }
     }
@@ -62,6 +66,11 @@ impl Upstream {
         self
     }
 
+    fn forge_debug_frames(mut self, f: impl FnOnce(&mut Value)) -> Self {
+        f(&mut self.debug_frames);
+        self
+    }
+
     fn logs(&self) -> Value {
         let logs: Vec<Value> = self
             .receipts
@@ -72,6 +81,32 @@ impl Upstream {
             .collect();
         json!(logs)
     }
+}
+
+fn debug_frames_for(block: &Value) -> Value {
+    let frames: Vec<Value> = block["transactions"]
+        .as_array()
+        .expect("transactions array")
+        .iter()
+        .map(|tx| {
+            let to = tx.get("to").cloned().unwrap_or(Value::Null);
+            let frame_type = if to.is_null() { "CREATE" } else { "CALL" };
+            json!({
+                "txHash": tx["hash"].clone(),
+                "result": {
+                    "type": frame_type,
+                    "from": tx["from"].clone(),
+                    "to": to,
+                    "input": tx.get("input").cloned().unwrap_or_else(|| json!("0x")),
+                    "output": "0x",
+                    "value": tx.get("value").cloned().unwrap_or_else(|| json!("0x0")),
+                    "gas": tx["gas"].clone(),
+                    "gasUsed": "0x0"
+                }
+            })
+        })
+        .collect();
+    json!(frames)
 }
 
 async fn answer(State(up): State<Arc<Upstream>>, body: axum::body::Bytes) -> impl IntoResponse {
@@ -96,6 +131,7 @@ async fn answer(State(up): State<Arc<Upstream>>, body: axum::body::Bytes) -> imp
             "eth_getBlockReceipts" if p0 == "latest" => json!([]),
             "eth_getBlockReceipts" => up.receipts.clone(),
             "eth_getLogs" => up.logs(),
+            "debug_traceBlockByHash" | "debug_traceBlockByNumber" => up.debug_frames.clone(),
             _ => Value::Null,
         };
         responses.push(json!({"jsonrpc": "2.0", "id": id, "result": result}));
@@ -165,6 +201,13 @@ fn with_logs() -> DataRequest {
     }
 }
 
+fn with_debug_traces() -> DataRequest {
+    DataRequest {
+        traces: true,
+        ..DataRequest::default()
+    }
+}
+
 fn assert_accepted(blocks: &[RawRpcBlock], what: &str) {
     let block = blocks.first().unwrap_or_else(|| panic!("{what}: no block"));
     assert!(
@@ -194,6 +237,15 @@ fn all_switches_on() -> RpcOptions {
     }
 }
 
+fn call_frame_options(call_frame_validation: CallFrameValidationMode) -> RpcOptions {
+    RpcOptions {
+        verify_tx_sender: true,
+        verify_tx_root: true,
+        call_frame_validation,
+        ..RpcOptions::default()
+    }
+}
+
 // ─── Every switch enforces, and only when it is on ────────────────────────────
 
 #[tokio::test]
@@ -211,6 +263,184 @@ async fn the_recorded_block_passes_every_switch() {
     )
     .await;
     assert_accepted(&blocks, "all applicable switches on, logs path");
+}
+
+#[tokio::test]
+async fn optional_log_and_pre_status_receipt_fields_are_tolerated() {
+    let without_optionals = Upstream::recorded().forge_receipts(|receipts| {
+        for receipt in receipts.as_array_mut().expect("receipts array") {
+            receipt
+                .as_object_mut()
+                .expect("receipt object")
+                .remove("status");
+            receipt["root"] =
+                json!("0x1111111111111111111111111111111111111111111111111111111111111111");
+            receipt
+                .as_object_mut()
+                .expect("receipt object")
+                .remove("type");
+            for log in receipt["logs"].as_array_mut().expect("logs array") {
+                log.as_object_mut().expect("log object").remove("removed");
+            }
+        }
+    });
+
+    let blocks = acquire(without_optionals, RpcOptions::default(), with_receipts()).await;
+
+    assert_accepted(&blocks, "baseline optional receipt fields");
+    let receipts = blocks[0].receipts.as_deref().expect("receipts attached");
+    assert!(receipts
+        .iter()
+        .all(|receipt| receipt.status.is_none() && receipt.root.is_some()));
+    assert!(receipts
+        .iter()
+        .flat_map(|receipt| &receipt.logs)
+        .all(|log| log.removed.is_none()));
+}
+
+#[test]
+fn receipt_status_takes_precedence_and_legacy_root_is_the_fallback() {
+    let mut value = fixture("receipts.json")[0].clone();
+    value
+        .as_object_mut()
+        .expect("receipt object")
+        .remove("status");
+    value["root"] = json!("0x1111111111111111111111111111111111111111111111111111111111111111");
+    value["type"] = json!("0x0");
+    let with_root: RpcReceipt = serde_json::from_value(value.clone()).expect("pre-status receipt");
+
+    let mut without_type_value = value;
+    without_type_value
+        .as_object_mut()
+        .expect("receipt object")
+        .remove("type");
+    let without_type: RpcReceipt =
+        serde_json::from_value(without_type_value).expect("pre-EIP-2718 receipt without type");
+
+    let root_commitment = receipts_root(&[&with_root], false).expect("root-backed receipt");
+    assert_eq!(
+        receipts_root(&[&without_type], false).expect("missing type defaults to legacy"),
+        root_commitment
+    );
+
+    let mut non_minimal_root_type = with_root.clone();
+    non_minimal_root_type.receipt_type = "0x00".to_string();
+    assert_eq!(
+        receipts_root(&[&non_minimal_root_type], false).expect("non-minimal legacy type"),
+        root_commitment
+    );
+
+    let mut with_status = with_root.clone();
+    with_status.root = None;
+    with_status.status = Some("0x1".to_string());
+    let status_commitment = receipts_root(&[&with_status], false).expect("status-backed receipt");
+    assert_ne!(root_commitment, status_commitment);
+
+    let mut non_minimal_status_type = with_status.clone();
+    non_minimal_status_type.receipt_type = "0x00".to_string();
+    assert_eq!(
+        receipts_root(&[&non_minimal_status_type], false)
+            .expect("non-minimal zero remains an untyped receipt"),
+        status_commitment
+    );
+
+    let mut with_both = with_status.clone();
+    with_both.root = Some("0x".to_string());
+    assert_eq!(
+        receipts_root(&[&with_both], false).expect("status takes precedence"),
+        status_commitment
+    );
+
+    let mut typed_with_root = with_root.clone();
+    typed_with_root.receipt_type = "0x1".to_string();
+    assert!(receipts_root(&[&typed_with_root], false)
+        .expect_err("typed receipts cannot fall back to a state root")
+        .to_string()
+        .contains("typed receipt"));
+
+    with_status.status = None;
+    assert!(receipts_root(&[&with_status], false)
+        .expect_err("a receipt needs either root or status")
+        .to_string()
+        .contains("receipt.status is missing"));
+}
+
+#[tokio::test]
+async fn structurally_unmappable_debug_frames_are_always_rejected() {
+    let malformed = Upstream::recorded().forge_debug_frames(|frames| {
+        let result = frames[0]["result"]
+            .as_object_mut()
+            .expect("debug frame result");
+        result.insert(
+            "calls".to_string(),
+            json!([{
+                "type": "SELFDESTRUCT",
+                "from": result["to"].clone(),
+                "gas": "0x0"
+            }]),
+        );
+    });
+
+    let blocks = acquire(malformed, RpcOptions::default(), with_debug_traces()).await;
+
+    assert_rejected(&blocks, "structural call-frame validation");
+    assert!(blocks[0]
+        .error_message
+        .as_deref()
+        .is_some_and(|reason| reason.contains("selfdestruct frame 0 has no beneficiary")));
+}
+
+#[tokio::test]
+async fn semantic_call_frame_validation_observes_or_rejects_by_mode() {
+    let inconsistent = Upstream::recorded().forge_debug_frames(|frames| {
+        frames[0]["result"]["from"] = json!("0x0000000000000000000000000000000000000000");
+    });
+
+    let blocks = acquire(
+        inconsistent.clone(),
+        call_frame_options(CallFrameValidationMode::Off),
+        with_debug_traces(),
+    )
+    .await;
+    assert_accepted(&blocks, "semantic validation off");
+
+    let blocks = acquire(
+        inconsistent.clone(),
+        call_frame_options(CallFrameValidationMode::Observe),
+        with_debug_traces(),
+    )
+    .await;
+    assert_accepted(&blocks, "semantic validation observe");
+
+    let blocks = acquire(
+        inconsistent,
+        call_frame_options(CallFrameValidationMode::Reject),
+        with_debug_traces(),
+    )
+    .await;
+    assert_rejected(&blocks, "semantic validation reject");
+    assert!(blocks[0]
+        .error_message
+        .as_deref()
+        .is_some_and(|reason| reason.contains("root frame is executed by")));
+}
+
+#[tokio::test]
+async fn rejecting_semantic_call_frames_requires_verification_switches() {
+    let error = try_acquire(
+        Upstream::recorded(),
+        RpcOptions {
+            call_frame_validation: CallFrameValidationMode::Reject,
+            ..RpcOptions::default()
+        },
+        with_debug_traces(),
+    )
+    .await
+    .expect_err("reject mode without verification switches must be invalid configuration");
+
+    assert!(error
+        .to_string()
+        .contains("call-frame validation reject requires verify_tx_root and verify_tx_sender"));
 }
 
 #[tokio::test]

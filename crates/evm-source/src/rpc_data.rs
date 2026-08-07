@@ -295,12 +295,17 @@ pub struct RpcLog {
     pub address: String,
     pub topics: Vec<String>,
     pub data: String,
-    pub removed: bool,
+    /// Optional in baseline RPC responses and absent on some providers.
+    pub removed: Option<bool>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
 
 // ─── Receipt ─────────────────────────────────────────────────────────────────
+
+fn default_receipt_type() -> String {
+    "0x0".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -316,9 +321,13 @@ pub struct RpcReceipt {
     pub effective_gas_price: Option<String>,
     pub logs: Vec<RpcLog>,
     pub logs_bloom: String,
-    pub status: String,
+    /// Post-Byzantium execution status. Older receipts carry `root` instead.
+    pub status: Option<String>,
+    /// Pre-Byzantium state root, used only when a legacy receipt has no status.
+    pub root: Option<String>,
     pub to: Option<String>,
-    #[serde(rename = "type")]
+    /// Typed receipts postdate the legacy format; absence means type zero.
+    #[serde(rename = "type", default = "default_receipt_type")]
     pub receipt_type: String,
     pub blob_gas_used: Option<String>,
     pub blob_gas_price: Option<String>,
@@ -476,6 +485,84 @@ pub struct TraceTransactionReplay {
 }
 
 // ─── Debug frames ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DebugFrameKind {
+    Call,
+    CallCode,
+    DelegateCall,
+    StaticCall,
+    Invalid,
+    Create,
+    Create2,
+    Selfdestruct,
+    Stop,
+    Unknown,
+}
+
+impl DebugFrameKind {
+    pub(crate) fn classify(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("CALL") {
+            Self::Call
+        } else if value.eq_ignore_ascii_case("CALLCODE") {
+            Self::CallCode
+        } else if value.eq_ignore_ascii_case("DELEGATECALL") {
+            Self::DelegateCall
+        } else if value.eq_ignore_ascii_case("STATICCALL") {
+            Self::StaticCall
+        } else if value.eq_ignore_ascii_case("INVALID") {
+            Self::Invalid
+        } else if value.eq_ignore_ascii_case("CREATE") {
+            Self::Create
+        } else if value.eq_ignore_ascii_case("CREATE2") {
+            Self::Create2
+        } else if value.eq_ignore_ascii_case("SELFDESTRUCT") {
+            Self::Selfdestruct
+        } else if value.eq_ignore_ascii_case("STOP") {
+            Self::Stop
+        } else {
+            Self::Unknown
+        }
+    }
+
+    pub(crate) fn normalized(self) -> Option<&'static str> {
+        match self {
+            Self::Call | Self::CallCode | Self::DelegateCall | Self::StaticCall | Self::Invalid => {
+                Some("call")
+            }
+            Self::Create | Self::Create2 => Some("create"),
+            Self::Selfdestruct => Some("selfdestruct"),
+            Self::Stop | Self::Unknown => None,
+        }
+    }
+
+    pub(crate) fn is_call(self) -> bool {
+        matches!(
+            self,
+            Self::Call | Self::CallCode | Self::DelegateCall | Self::StaticCall | Self::Invalid
+        )
+    }
+
+    pub(crate) fn is_root_call(self) -> bool {
+        matches!(self, Self::Call | Self::Invalid)
+    }
+
+    pub(crate) fn is_create(self) -> bool {
+        matches!(self, Self::Create | Self::Create2)
+    }
+
+    pub(crate) fn is_selfdestruct(self) -> bool {
+        self == Self::Selfdestruct
+    }
+
+    pub(crate) fn is_mappable(self) -> bool {
+        self.normalized().is_some()
+    }
+
+    pub(crate) fn preserves_context(self) -> bool {
+        matches!(self, Self::CallCode | Self::DelegateCall)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

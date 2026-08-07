@@ -75,8 +75,12 @@ Data selection: `--with-receipts`, `--with-traces`, `--with-statediffs`,
 
 Verification (all off by default): `--verify-block-hash`, `--verify-tx-sender`,
 `--verify-tx-root`, `--verify-receipts-root`, `--verify-withdrawals-root`,
-`--verify-logs-bloom`. Tune consistency checks with `--skip-log-index-check`,
-`--skip-cumulative-gas-used-check`, `--use-gas-used-for-receipts-root`.
+`--verify-logs-bloom`. `--call-frame-validation <off|observe|reject>` controls
+semantic debug call-tree checks. The `reject` configuration requires both
+`--verify-tx-root` and `--verify-tx-sender`; documented verification exemptions
+still apply to individual blocks and transactions. Tune consistency checks with
+`--skip-log-index-check`, `--skip-cumulative-gas-used-check`,
+`--use-gas-used-for-receipts-root`.
 
 `--profile-block-timings` emits per-block pipeline timing logs (target
 `block_timing`).

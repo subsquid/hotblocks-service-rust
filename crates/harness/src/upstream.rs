@@ -148,6 +148,9 @@ pub enum Fault {
     /// One entry stripped of its own label and given another transaction's
     /// frames: the misattribution that survives per-transaction counting.
     MixedFrames,
+    /// A schema-valid debug response whose nested self-destruct frame has no
+    /// beneficiary, so normalization cannot map the tree without data loss.
+    InvalidDebugFrameStructure,
     /// One header field replaced by a value the block's own contents do not
     /// commit to — the forged input REQ-14's switches exist to catch.
     ForgedField { key: String, value: Value },
@@ -511,6 +514,25 @@ impl Inner {
                     (borrowed, first.get_mut("trace"))
                 {
                     own.extend(extra);
+                }
+                Ok(value)
+            }
+            Fault::InvalidDebugFrameStructure => {
+                let mut value = self.truthful(method, tracer, block);
+                if let Some(result) = value
+                    .as_array_mut()
+                    .and_then(|entries| entries.first_mut())
+                    .and_then(|entry| entry.get_mut("result"))
+                    .and_then(Value::as_object_mut)
+                {
+                    result.insert(
+                        "calls".to_string(),
+                        json!([{
+                            "type": "SELFDESTRUCT",
+                            "from": addr(2),
+                            "gas": "0x0"
+                        }]),
+                    );
                 }
                 Ok(value)
             }

@@ -382,6 +382,22 @@ async fn unparsable_trace_frame_retries_then_fails_loud() {
     assert_eq!(upstream.calls(DEBUG_METHOD, FAULTED), ACQUISITIONS);
 }
 
+#[tokio::test]
+async fn structurally_unmappable_trace_retries_then_fails_loud() {
+    let upstream = head_chain().await;
+    upstream.inject(DEBUG_METHOD, FAULTED, Fault::InvalidDebugFrameStructure);
+
+    let run = drive(&upstream, debug_traces(), FIRST, 100).await;
+
+    run.assert_components_complete("traces");
+    run.assert_failed_loud(FAULTED);
+    assert_eq!(
+        upstream.calls(DEBUG_METHOD, FAULTED),
+        ACQUISITIONS,
+        "a schema-valid but unmappable tree gets the bounded whole-block retry budget"
+    );
+}
+
 // ─── The same faults on the state-diff path ───────────────────────────────────
 
 #[tokio::test]

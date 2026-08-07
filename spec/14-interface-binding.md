@@ -112,14 +112,19 @@ symbols in 15.
 | `--with-receipts` / `--with-traces` / `--with-statediffs` | off | data selection (DEF-22); receipts and logs are mutually exclusive acquisitions — receipts off ⇒ logs on |
 | `--use-trace-api`, `--use-debug-api-for-statediffs`, `--use-debug-trace-block-by-number` | off | EVM acquisition method choices |
 | `--verify-block-hash`, `--verify-tx-sender`, `--verify-tx-root`, `--verify-receipts-root`, `--verify-withdrawals-root`, `--verify-logs-bloom` | off | verification policy (DEF-25); each is applied per block, and its failure is incoherence (WP-11.4) |
+| `--call-frame-validation <off\|observe\|reject>` | `off` | semantic debug call-frame policy; structural validation is unconditional, while `reject` requires the transaction-root and sender verification switches to be enabled |
 | `--skip-log-index-check`, `--skip-cumulative-gas-used-check`, `--use-gas-used-for-receipts-root` | off | coherence-check tuning (DEF-15 instantiation) |
 | `--profile-block-timings` | off | opt-in per-block timing telemetry (ADR-5 family; not in the predecessor) |
 
 Receipt-dependent policy is validated at startup: `--verify-receipts-root` and
 `--skip-cumulative-gas-used-check` require `--with-receipts`, while
 `--use-gas-used-for-receipts-root` additionally requires
-`--verify-receipts-root`. The other five verification switches operate on the
-header/transactions or on logs available through either acquisition path.
+`--verify-receipts-root`. `--call-frame-validation reject` requires both
+`--verify-tx-root` and `--verify-tx-sender`. The other five verification switches
+operate on the header/transactions or on logs available through either acquisition
+path. The `reject` requirement is a configuration relationship, not a per-block
+guarantee: documented network and transaction exemptions can make either verification
+check inapplicable to a particular input.
 
 Environment: `RUST_LOG`-style filter takes precedence; `SQD_TRACE/DEBUG/INFO/WARN/
 ERROR/FATAL` set the global level for chart compatibility (values are not
@@ -184,17 +189,27 @@ block hash equals the header hash; receipt count equals transaction count; log
 indices are block-wise continuous from 0 (unless skipped by configuration);
 cumulative gas is non-decreasing and consistent per transaction (unless skipped);
 an empty log set is coherent only with an empty logs-bloom; trace/state-diff results
-must reference the requested block and cover its transactions. Enabled verification
-checks (DEF-25) join this predicate.
+must reference the requested block and cover its transactions. Debug call frames
+MUST satisfy the structural mapping preconditions used by normalization regardless
+of semantic-validation mode. Semantic call-frame validation binds roots to verified
+transactions and checks nested call-context consistency: `off` does not evaluate
+that semantic predicate, `observe` accepts violations with bounded per-block
+diagnostics, and `reject` joins violations into this coherence predicate. Enabled
+verification checks (DEF-25) join this predicate. Empty `to`, `output`, and
+`gasUsed` strings on a failed create are treated as absent result fields; a nested
+`STOP` is not droppable because it occupies a child position with no normalized
+record.
 
-**IB-16 — Tolerances.** The adapter MUST tolerate (as the predecessor does):
-absent optional fields per the baseline schema (log-removal marker, pre-status-era
-receipts — GAP-14); null entries in receipt arrays — stripped with alarm, which by
-construction fails IB-15's receipt-count check for the batch method, so coherence is
-re-established via the per-tx receipt fallback (IB-14) or WP-11.2 retry, never by
-relaxing the count check or serving the stripped set; providers
-that answer not-yet-indexed blocks with null/absent results (retry class, FM-16);
-and the documented per-network quirks of the supported set (REQ-15, GAP-16).
+**IB-16 — Tolerances.** The adapter MUST tolerate the predecessor's optional
+baseline fields (log-removal marker and pre-status-era receipt status — GAP-14).
+It MUST additionally interpret an absent receipt type as legacy type zero and
+accept a non-minimal zero quantity in that field. Null entries in receipt arrays
+are stripped with alarm, which by construction fails IB-15's receipt-count check
+for the batch method, so coherence is re-established via the per-tx receipt
+fallback (IB-14) or WP-11.2 retry, never by relaxing the count check or serving
+the stripped set. The adapter MUST also tolerate providers that answer
+not-yet-indexed blocks with null/absent results (retry class, FM-16), plus the
+documented per-network quirks of the supported set (REQ-15, GAP-16).
 
 **IB-17 — Budget.** All methods above share the single configured budget (rate
 limit × batch cap × concurrency) — REQ-16/RP-22/ADR-3.
