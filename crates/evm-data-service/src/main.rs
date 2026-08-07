@@ -3,9 +3,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use data_service_core::service::{run_data_service, DataServiceOptions, RunEnd};
-use evm_source::fetch::RpcOptions;
+use evm_source::fetch::{CallFrameValidationMode, RpcOptions};
 use evm_source::source::{EvmRpcDataSource, EvmRpcDataSourceOptions};
 use evm_source::types::DataRequest;
 use rpc_client::{RpcClient, RpcClientConfig};
@@ -142,6 +142,10 @@ struct Args {
     #[arg(long)]
     verify_logs_bloom: bool,
 
+    /// Validate semantic debug call-frame consistency: off, observe, or reject
+    #[arg(long, value_name = "mode", value_enum, default_value = "off")]
+    call_frame_validation: CallFrameValidationArg,
+
     /// Do not check log indices within a block are sequential
     #[arg(long)]
     skip_log_index_check: bool,
@@ -165,6 +169,42 @@ struct Args {
     /// Emit per-block pipeline timing logs (target=block_timing) for latency profiling
     #[arg(long)]
     profile_block_timings: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CallFrameValidationArg {
+    Off,
+    Observe,
+    Reject,
+}
+
+impl From<CallFrameValidationArg> for CallFrameValidationMode {
+    fn from(value: CallFrameValidationArg) -> Self {
+        match value {
+            CallFrameValidationArg::Off => Self::Off,
+            CallFrameValidationArg::Observe => Self::Observe,
+            CallFrameValidationArg::Reject => Self::Reject,
+        }
+    }
+}
+
+impl Args {
+    fn rpc_options(&self) -> RpcOptions {
+        RpcOptions {
+            finality_confirmation: self.finality_confirmation,
+            finalized_head_ttl: None,
+            verify_block_hash: self.verify_block_hash,
+            verify_tx_sender: self.verify_tx_sender,
+            verify_tx_root: self.verify_tx_root,
+            verify_receipts_root: self.verify_receipts_root,
+            verify_withdrawals_root: self.verify_withdrawals_root,
+            verify_logs_bloom: self.verify_logs_bloom,
+            call_frame_validation: self.call_frame_validation.into(),
+            check_log_index: !self.skip_log_index_check,
+            check_cumulative_gas_used: !self.skip_cumulative_gas_used_check,
+            use_gas_used_for_receipts_root: self.use_gas_used_for_receipts_root,
+        }
+    }
 }
 
 fn sqd_log_filter() -> tracing_subscriber::EnvFilter {
@@ -200,6 +240,9 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    let rpc_options = args.rpc_options();
+    rpc_options.validate()?;
+
     let client = Arc::new(RpcClient::new(RpcClientConfig {
         url: args.http_rpc,
         max_batch_call_size: args.http_rpc_max_batch_call_size,
@@ -218,19 +261,7 @@ async fn main() -> anyhow::Result<()> {
     let source = EvmRpcDataSource::new(
         client,
         EvmRpcDataSourceOptions {
-            rpc_options: RpcOptions {
-                finality_confirmation: args.finality_confirmation,
-                finalized_head_ttl: None,
-                verify_block_hash: args.verify_block_hash,
-                verify_tx_sender: args.verify_tx_sender,
-                verify_tx_root: args.verify_tx_root,
-                verify_receipts_root: args.verify_receipts_root,
-                verify_withdrawals_root: args.verify_withdrawals_root,
-                verify_logs_bloom: args.verify_logs_bloom,
-                check_log_index: !args.skip_log_index_check,
-                check_cumulative_gas_used: !args.skip_cumulative_gas_used_check,
-                use_gas_used_for_receipts_root: args.use_gas_used_for_receipts_root,
-            },
+            rpc_options,
             data_request: DataRequest {
                 logs: !args.with_receipts,
                 receipts: args.with_receipts,
@@ -330,6 +361,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn parse_with(extra: &[&str]) -> Result<Args, clap::Error> {
@@ -385,6 +417,52 @@ mod tests {
 
         assert!(parse_with(&["--skip-cumulative-gas-used-check"]).is_err());
         assert!(parse_with(&["--with-receipts", "--skip-cumulative-gas-used-check",]).is_ok());
+    }
+
+    #[test]
+    fn call_frame_validation_values_and_reject_configuration_are_validated() {
+        let off = parse_with(&[]).expect("default call-frame mode");
+        assert_eq!(off.call_frame_validation, CallFrameValidationArg::Off);
+
+        let observe =
+            parse_with(&["--call-frame-validation", "observe"]).expect("observe call-frame mode");
+        assert_eq!(
+            observe.call_frame_validation,
+            CallFrameValidationArg::Observe
+        );
+        observe
+            .rpc_options()
+            .validate()
+            .expect("observe does not require verification switches");
+
+        let reject =
+            parse_with(&["--call-frame-validation", "reject"]).expect("reject call-frame mode");
+        assert!(reject.rpc_options().validate().is_err());
+
+        let configured_reject = parse_with(&[
+            "--call-frame-validation",
+            "reject",
+            "--verify-tx-root",
+            "--verify-tx-sender",
+        ])
+        .expect("reject with verification switches");
+        configured_reject
+            .rpc_options()
+            .validate()
+            .expect("reject with both verification switches");
+
+        assert!(parse_with(&["--call-frame-validation", "unknown"]).is_err());
+
+        let command = Args::command();
+        let possible_values: Vec<_> = command
+            .get_arguments()
+            .find(|argument| argument.get_id().as_str() == "call_frame_validation")
+            .expect("call-frame argument")
+            .get_possible_values()
+            .into_iter()
+            .map(|value| value.get_name().to_string())
+            .collect();
+        assert_eq!(possible_values, ["off", "observe", "reject"]);
     }
 
     #[tokio::test]

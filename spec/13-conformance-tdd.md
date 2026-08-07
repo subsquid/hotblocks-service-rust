@@ -1,6 +1,6 @@
 # 13 — Conformance & TDD program
 
-**Mutable doc #1.** Statuses dated **2026-08-06**, derived from the actual test
+**Mutable doc #1.** Statuses dated **2026-08-07**, derived from the actual test
 inventory of the current implementation (not aspiration).
 
 ## Harness architecture
@@ -198,7 +198,7 @@ Every record inside the eligible range is matched on hash *and* parentRef — th
 record has no predecessor for pairwise linkage to check, so a forged parent there is
 otherwise invisible.
 
-## Traceability matrix (2026-08-06)
+## Traceability matrix (2026-08-07)
 
 Status: **C** covered (black-box, automated) / **P** partial / **U** unchecked.
 `!` = known-violated today (see gap register). Current inventory: unit tests on the
@@ -236,7 +236,7 @@ differential corpus, no soak, no benchmarks yet.
 | INV-25 | CT-5 | P | golden fixtures (one network) + ledger byte-fidelity and dual-encoding compare (CT-1 smoke) |
 | INV-26 | CT-5 | P | trace grouping is byte-stable across fresh processes and preserves first-seen order; the broader recorded corpus and concurrency matrix remain absent |
 | INV-27 | CT-4/9 | U ! | the empty-backfill boundary is covered; GAP-22 remains on mid-response continuity or bounded-acquisition failure after a prefix |
-| INV-28 | CT-4 | P | CT-4 component-fault corpus over the real adapter: error, null, wrong-block, partial-coverage and unparsable payloads on both trace-API methods, the debug frames path and the debug state-diff path, each asserting bounded re-acquisition then fail-loud, plus the happy-path cassette. The receipts and logs components have no injected faults yet, and the per-network quirk corpora are absent (GAP-14, GAP-16) |
+| INV-28 | CT-4 | P | CT-4 component-fault corpus over the real adapter: error, null, wrong-block, partial-coverage and unparsable payloads on both trace-API methods, the debug frames path and the debug state-diff path, each asserting bounded re-acquisition then fail-loud, plus a structurally unmappable debug tree and the happy-path cassette. Recorded acquisition covers the optional receipt/log schema forms; other receipt/log faults and the per-network quirk corpora remain absent (GAP-16) |
 | INV-29 | CT-3 | U | scoping is stated; no per-client sequential-read assertion exists |
 | INV-30 | CT-5 | U ! | GAP-24: dead gauge exposed |
 | INV-31 | CT-4 | U ! | GAP-4: alarm conditions are log-only |
@@ -259,21 +259,21 @@ differential corpus, no soak, no benchmarks yet.
 | REQ-1..6 | CT-1/5 | P | endpoint smoke + one fork recovery; REQ-6 framing (one frame per record, every boundary a safe cut) validated on both encodings (CT-1 smoke) |
 | REQ-7 | CT-5 | P | one-network golden corpus |
 | REQ-8 | CT-5 | P | selection combinations exercised only via recorded-corpus configs |
-| REQ-9 | CT-4 | P | the retry half of retry-then-alarm is asserted on the trace and state-diff components, bound included (`P-ENRICH-RETRIES` re-acquisitions, then a session error naming the block); two cases prime the local finality view and pin the same contract on the real strided range and short finalized-poll paths, including delivery of the complete prefix below the fault. The alarm half stays log-only (GAP-4) and the remaining components are uninjected |
+| REQ-9 | CT-4 | P | the retry half of retry-then-alarm is asserted on the trace and state-diff components, bound included (`P-ENRICH-RETRIES` re-acquisitions, then a session error naming the block); this includes a schema-valid debug tree normalization cannot map. Semantic call-tree validation is exercised in `off`, `observe`, and `reject` with both verification switches configured. Two cases prime the local finality view and pin the same retry contract on the real strided range and short finalized-poll paths, including delivery of the complete prefix below the fault. The alarm half stays log-only (GAP-4) and the remaining components are uninjected |
 | REQ-10..13 | CT-1/2/6 | P | |
 | REQ-14 | CT-5/CT-4 | P | CT-5 runs all six checks over a corpus of recorded blocks from seven networks — honest ones accepted, one forged field per switch rejected, the baseline's system-transaction exemptions honored; CT-4 pins the failure path (bounded re-acquisition, then a session error). The startup half of INV-36 is untested because no accepted switch is unimplemented |
-| REQ-15 | CT-4/CT-5 | P ! | the verification exemptions are covered by the CT-5 corpus; the quirk corpora of GAP-16 are absent (scope: OQ-6) |
+| REQ-15 | CT-4/CT-5 | P ! | the verification exemptions and baseline optional receipt/log fields are covered by recorded acquisition; the quirk corpora of GAP-16 are absent (scope: OQ-6) |
 | REQ-16 | CT-4 | P ! | retry classification, including the reduced singleton-batch path, is unit-tested; a partial-batch regression proves an observed successful item is never reissued; GAP-20/21 remain |
 | REQ-17 | CT-1 | U | synthetic non-EVM adapter run absent |
 | REQ-20..23 | CT-6/2 | P | shutdown only |
 | REQ-24 | CT-5 | P | HC-8 compares exact recorded payload bytes plus the live JSON-metrics and oversized-request contracts against a pinned predecessor revision each night. The corpus covers logs, receipts, debug traces, trace replays and state diffs; broader network coverage remains partial, and the runner is removed when OQ-4 sunsets REQ-24 |
 | REQ-30..32 | CT-5 | U ! | GAP-24, GAP-25; REQ-32's verification half is covered under REQ-14, GAP-20 remains |
 
-## Gap register (2026-08-06)
+## Gap register (2026-08-07)
 
 Priorities: P0 active production risk · P1 correctness hole with plausible trigger ·
 P2 bounded/rare · P3 polish. "First test" = cheapest failing-test-first entry point.
-Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, GAP-3, GAP-5, GAP-6, GAP-7, GAP-8, GAP-9, GAP-10, GAP-11, GAP-12, GAP-13, GAP-17, GAP-18, GAP-19, GAP-27, GAP-29, GAP-32, GAP-33, GAP-35, GAP-36.
+Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, GAP-3, GAP-5, GAP-6, GAP-7, GAP-8, GAP-9, GAP-10, GAP-11, GAP-12, GAP-13, GAP-14, GAP-15, GAP-17, GAP-18, GAP-19, GAP-27, GAP-29, GAP-32, GAP-33, GAP-35, GAP-36.
 
 | GAP | Statement | Violates | Prio | First test |
 |---|---|---|---|---|
@@ -290,8 +290,8 @@ Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, 
 | GAP-11 | **Retired 2026-08-06.** Every finalized range batch — concurrent strided backfill and the short/tail finalized poll path — retains its initial batch for throughput, but re-fetches a missing or incoherent block, including its header and every selected component, up to `P-ENRICH-RETRIES` times. Exhaustion delivers the complete prefix below the fault, then ends the session naming the block before another batch can cross the gap. Two CT-4 regressions prime the local finalized view, force each path, and count the initial acquisition plus every retry. ADR-19 records the resulting historic-read latency/termination policy; when a query has already emitted that prefix, bounded failure reaches GAP-22 as a truncated 200 where the old path hung indefinitely | — | retired | — |
 | GAP-12 | **Retired 2026-08-06.** The original gap statement overstated the predecessor contract. Its [number-only correction](https://github.com/subsquid/squid-sdk/commit/d295dff144c72ece9592d250498a907659978b55) and pinned source use a number for [`trace_block`](https://github.com/subsquid/squid-sdk/blob/26f7703e127604a40522449eedff3823d6183662/evm/evm-rpc/src/rpc.ts#L1006-L1042), while [`trace_replayBlockTransactions`](https://github.com/subsquid/squid-sdk/blob/26f7703e127604a40522449eedff3823d6183662/evm/evm-rpc/src/rpc.ts#L1271-L1293) intentionally remains hash-addressed. The request-form regressions pin that parity contract; they do not claim universal provider support — provider-specific addressing remains open under GAP-16. Since the number-addressed call may cross a reorg, every returned frame must name the fetched header hash and every fetched transaction must be covered; wrong or absent hashes trigger bounded whole-block re-acquisition and then fail loud | — | retired | — |
 | GAP-13 | **Retired 2026-08-06.** Trace frames use a hash lookup only to find their group; groups are emitted from a first-seen-order vector, matching the predecessor's insertion-ordered map. CT-5 acquires the same block in two fresh processes, compares canonical bytes, and pins transaction-group order | — | retired | — |
-| GAP-14 | The upstream schema is stricter than the baseline tolerances: fields the predecessor treats as optional (log-removal marker, receipt status on pre-status-era blocks) are required, so affected networks fail to parse entire blocks | FM-25, REQ-15 | P2 | CT-4: corpus block lacking the optional fields; assert acceptance |
-| GAP-15 | Structural validation of debug-trace frames (and the opt-in call-tree check) is absent; unmappable frames from buggy providers historically caused a week-long ingestion stall in the predecessor. Frames that fail to *deserialize* are bounded-rejected since 2026-08-05 (CT-4); the gap is now frames that parse but describe an impossible call tree | REQ-9, LIV-2, FM-25 | P2 | CT-4: corpus with a well-formed but structurally impossible frame; assert bounded rejection, not stall |
+| GAP-14 | **Retired 2026-08-07.** The log-removal marker is optional. Receipt encoding uses post-Byzantium status when present and falls back to the pre-Byzantium state root only for a legacy untyped receipt with no status. An absent receipt type defaults to legacy type zero, and type quantities are interpreted numerically. Recorded acquisition removes the optional fields without losing the receipt batch; focused commitment tests pin precedence, absent/non-minimal type-zero forms, and the status/root RLP position | — | retired | — |
+| GAP-15 | **Retired 2026-08-07.** Every debug call tree passes a network-independent structural gate before normalization; a schema-valid tree with an unmappable frame is re-acquired through the bounded whole-block budget and then fails loud. Semantic consistency is separately configurable as `off`, bounded `observe`, or configuration-gated `reject`; the CLI requires transaction-root and sender verification switches before startup, while their documented block and transaction exemptions remain in force | — | retired | — |
 | GAP-16 | Per-network quirk handling for several networks of the predecessor's supported set is absent (phantom transactions, duplicated receipts, provider-specific trace addressing) — blocked on OQ-6 scope decision. This explicitly includes any supported provider that requires a non-baseline address form for `trace_replayBlockTransactions`; GAP-12's parity fix does not retire that risk. Two classes are honored since 2026-08-05: polygon-based chains may leave transactions uncovered by debug traces (IB-16's quirk tolerance), and the verification exemptions of GAP-9. Tempo's `0x76` verification landed with the 2026-08-05 review fixes. What remains on the verification side is Arbitrum's retryable encoders `0x66`/`0x68`/`0x69`, so blocks carrying one are exempt from the transaction-commitment check instead of verified by it | REQ-15, FM-14 | P2 | CT-4: per-network quirk corpus (port the predecessor's fixtures), including the polygon coverage exemption; CT-5: the corpus asserts the remaining Arbitrum family verifies rather than being exempt |
 | GAP-17 | **Retired 2026-08-05.** The trace API picks one method per selection, as the baseline does: the replay call carries traces only where it already runs for state diffs, otherwise `trace_block` answers alone. Forced by GAP-3's closure — once a component failure is fatal, a discarded second answer can end the session | — | retired | — |
 | GAP-18 | **Retired 2026-08-06.** JSON metrics mode returns structured Prometheus metric families rather than a JSON string containing text exposition. A focused route regression and HC-8's live predecessor probe pin the shape without making family or sample order part of the service contract | — | retired | — |
@@ -371,6 +371,10 @@ Retired rows stay in place — IDs are stable and ADRs cite them: GAP-1, GAP-2, 
 4. **Phase 3 — robustness**: CT-4 upstream-fault matrix (GAP-14/15), CT-9 fuzz
    both surfaces, CT-8 isolation, quirk corpora per OQ-6 (GAP-16), observability
    conformance (GAP-4/22/24/25). *Exit:* FM cross-reference fully exercised.
+   The GAP-14/15 slice closed 2026-08-07: recorded receipt acquisition now covers
+   the baseline's optional log marker and status/root forms, and debug frames pass
+   structural plus policy-controlled semantic validation before normalization. CT-4
+   drives an unmappable tree through the complete bounded retry/fail-loud path.
 5. **Phase 4 — performance regime**: HC-10/HC-12, CT-6 baselines, CT-7 soak
    (GAP-2 regression guard, GAP-23), MG-5 armed. *Exit:* SLO table baselined; ⚠
    targets ratified via ADR-13.

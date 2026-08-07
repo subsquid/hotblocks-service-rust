@@ -6,9 +6,10 @@ use anyhow::{anyhow, bail};
 use sha3::{Digest, Keccak256};
 
 use crate::rpc_data::{
-    AccessListItem, EIP7702AuthorizationItem, RpcBlock, RpcLog, RpcReceipt, RpcTransaction,
-    RpcWithdrawal, TempoCall, TempoCallScope, TempoPrimitiveSignature, TempoSelectorRule,
-    TempoSignatureObject, TempoSignedAuthorization, TempoSignedKeyAuthorization, TempoTokenLimit,
+    AccessListItem, DebugFrame, DebugFrameKind, EIP7702AuthorizationItem, RpcBlock, RpcLog,
+    RpcReceipt, RpcTransaction, RpcWithdrawal, TempoCall, TempoCallScope, TempoPrimitiveSignature,
+    TempoSelectorRule, TempoSignatureObject, TempoSignedAuthorization, TempoSignedKeyAuthorization,
+    TempoTokenLimit,
 };
 
 // ─── Helper: decode 0x-hex to bytes ──────────────────────────────────────────
@@ -1348,10 +1349,275 @@ fn encode_rlp_big_uint(s: &str) -> anyhow::Result<Vec<u8>> {
     Ok(encode_rlp_bytes(&decode_hex_big_int(s)?))
 }
 
+// ─── Debug call-frame validation ──────────────────────────────────────────────
+
+fn is_address(value: &str) -> bool {
+    value
+        .strip_prefix("0x")
+        .is_some_and(|digits| digits.len() == 40 && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn trace_address(path: &[usize]) -> String {
+    path.iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn frame_label(path: &[usize]) -> String {
+    if path.is_empty() {
+        "root frame".to_string()
+    } else {
+        format!("frame {}", trace_address(path))
+    }
+}
+
+fn typed_frame_label(path: &[usize], kind: &str) -> String {
+    if path.is_empty() {
+        format!("root {kind} frame")
+    } else {
+        format!("{kind} frame {}", trace_address(path))
+    }
+}
+
+/// Check every non-heuristic requirement needed to map a debug frame without
+/// dropping or inventing data. This gate applies on every network and in every
+/// semantic-validation mode.
+pub fn check_debug_frame_structure(root: &DebugFrame) -> Option<String> {
+    check_frame_structure(root, &mut Vec::new())
+}
+
+fn check_frame_structure(frame: &DebugFrame, path: &mut Vec<usize>) -> Option<String> {
+    let kind = DebugFrameKind::classify(&frame.frame_type);
+
+    if kind == DebugFrameKind::Stop {
+        if path.is_empty() {
+            if frame.calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+                return Some("root STOP frame has subcalls".to_string());
+            }
+            return None;
+        }
+        // A root STOP represents an empty transaction trace. Nested STOP has
+        // no normalized record but would still occupy a child/subtrace slot,
+        // so dropping it would corrupt the normalized tree shape.
+        return Some(format!(
+            "{} has unsupported type {}",
+            frame_label(path),
+            frame.frame_type
+        ));
+    }
+
+    if !kind.is_mappable() {
+        return Some(format!(
+            "{} has unsupported type {}",
+            frame_label(path),
+            frame.frame_type
+        ));
+    }
+
+    if !is_address(&frame.from) {
+        return Some(format!(
+            "{} has invalid from address {}",
+            frame_label(path),
+            frame.from
+        ));
+    }
+    if let Some(to) = frame.to.as_deref() {
+        let empty_failed_create_target = kind.is_create() && to.is_empty();
+        if !empty_failed_create_target && !is_address(to) {
+            return Some(format!("{} has invalid to address {to}", frame_label(path)));
+        }
+    }
+
+    if kind.is_call() {
+        if frame.to.is_none() {
+            return Some(format!("{} has no target", typed_frame_label(path, "call")));
+        }
+        if frame.input.is_none() {
+            return Some(format!("{} has no input", typed_frame_label(path, "call")));
+        }
+    } else if kind.is_create() {
+        if frame.input.is_none() {
+            return Some(format!(
+                "{} has no init code",
+                typed_frame_label(path, "create")
+            ));
+        }
+        let has_result = frame.to.as_deref().is_some_and(|value| !value.is_empty())
+            || frame
+                .output
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+        let has_gas_used = frame
+            .gas_used
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+        if has_result && !has_gas_used {
+            return Some(format!(
+                "{} has a result but no gas used",
+                typed_frame_label(path, "create")
+            ));
+        }
+    } else if kind.is_selfdestruct() && frame.to.is_none() {
+        return Some(format!(
+            "{} has no beneficiary",
+            typed_frame_label(path, "selfdestruct")
+        ));
+    }
+
+    for (index, child) in frame
+        .calls
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        path.push(index);
+        let violation = check_frame_structure(child, path);
+        path.pop();
+        if violation.is_some() {
+            return violation;
+        }
+    }
+    None
+}
+
+/// Check that a structurally mappable tree agrees with the transaction and its
+/// own execution stack. Debug traces have no consensus commitment, so callers
+/// choose whether a semantic violation is observed or rejected. Callers should
+/// run [`check_debug_frame_structure`] first; the defensive checks below also
+/// keep standalone use from descending through an unmappable subtree.
+pub fn check_call_frame_tree(tx: &RpcTransaction, root: &DebugFrame) -> Option<String> {
+    let root_kind = DebugFrameKind::classify(&root.frame_type);
+    if root_kind == DebugFrameKind::Stop {
+        return None;
+    }
+
+    if !root.from.eq_ignore_ascii_case(&tx.from) {
+        return Some(format!(
+            "root frame is executed by {}, but the transaction is sent by {}",
+            root.from, tx.from
+        ));
+    }
+
+    match tx.to.as_deref() {
+        None if !root_kind.is_create() => {
+            return Some(format!(
+                "root frame has type {}, but the transaction creates a contract",
+                root.frame_type
+            ));
+        }
+        Some(target) => {
+            if !root_kind.is_root_call() {
+                return Some(format!(
+                    "root frame has type {}, but the transaction calls {target}",
+                    root.frame_type
+                ));
+            }
+            if root
+                .to
+                .as_deref()
+                .is_none_or(|actual| !actual.eq_ignore_ascii_case(target))
+            {
+                return Some(format!(
+                    "root frame calls {}, but the transaction calls {target}",
+                    root.to.as_deref().unwrap_or("nothing")
+                ));
+            }
+        }
+        None => {}
+    }
+
+    check_subcalls(root, &mut Vec::new())
+}
+
+fn check_subcalls(parent: &DebugFrame, path: &mut Vec<usize>) -> Option<String> {
+    let parent_kind = DebugFrameKind::classify(&parent.frame_type);
+    let executor = if parent_kind.preserves_context() {
+        Some(parent.from.as_str())
+    } else {
+        parent.to.as_deref()
+    };
+
+    for (index, child) in parent
+        .calls
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        path.push(index);
+
+        if let Some(executor) = executor {
+            if !child.from.eq_ignore_ascii_case(executor) {
+                let violation = format!(
+                    "frame {} is executed by {}, but {executor} is on top of the call stack",
+                    trace_address(path),
+                    child.from
+                );
+                path.pop();
+                return Some(violation);
+            }
+        }
+
+        let child_kind = DebugFrameKind::classify(&child.frame_type);
+        if child_kind.is_selfdestruct() && child.to.is_none() {
+            let violation = format!(
+                "{} has no beneficiary",
+                typed_frame_label(path, "selfdestruct")
+            );
+            path.pop();
+            return Some(violation);
+        }
+
+        let violation = if child_kind.is_mappable() {
+            check_subcalls(child, path)
+        } else {
+            None
+        };
+        path.pop();
+        if violation.is_some() {
+            return violation;
+        }
+    }
+    None
+}
+
 // ─── Receipt encoding ─────────────────────────────────────────────────────────
 
+fn parse_receipt_type(receipt: &RpcReceipt) -> anyhow::Result<u8> {
+    let value = parse_qty_u128_checked(&receipt.receipt_type, "receipt.type")?;
+    u8::try_from(value)
+        .map_err(|_| anyhow!("receipt.type exceeds one byte: {}", receipt.receipt_type))
+}
+
+fn encode_receipt_status_or_root(
+    receipt: &RpcReceipt,
+    receipt_type: u8,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(status) = receipt.status.as_deref() {
+        return Ok(encode_rlp_uint(parse_qty_u128_checked(
+            status,
+            "receipt.status",
+        )?));
+    }
+
+    if receipt_type != 0 {
+        bail!(
+            "receipt.status is missing for typed receipt {}",
+            receipt.receipt_type
+        );
+    }
+
+    let root = receipt
+        .root
+        .as_deref()
+        .ok_or_else(|| anyhow!("receipt.status is missing and legacy receipt.root is absent"))?;
+    let root = decode_hex(root).map_err(|error| anyhow!("receipt.root: {error}"))?;
+    Ok(encode_rlp_bytes(&root))
+}
+
 fn encode_receipt(receipt: &RpcReceipt, use_gas_used: bool) -> anyhow::Result<Vec<u8>> {
-    let status = parse_qty_u128(&receipt.status);
     let gas_field = if use_gas_used {
         &receipt.gas_used
     } else {
@@ -1359,11 +1625,14 @@ fn encode_receipt(receipt: &RpcReceipt, use_gas_used: bool) -> anyhow::Result<Ve
     };
 
     let logs_encoded = encode_logs(&receipt.logs);
+    let receipt_type = parse_receipt_type(receipt)?;
 
-    let tx_type = receipt.receipt_type.as_str();
-
-    if tx_type == "0x7e" {
+    if receipt_type == 0x7e {
         // Optimism deposit receipt
+        let status = receipt
+            .status
+            .as_deref()
+            .ok_or_else(|| anyhow!("receipt.status is missing for 0x7e receipt"))?;
         let deposit_nonce = receipt
             .deposit_nonce
             .as_deref()
@@ -1371,7 +1640,10 @@ fn encode_receipt(receipt: &RpcReceipt, use_gas_used: bool) -> anyhow::Result<Ve
         let has_receipt_version = receipt.deposit_receipt_version.is_some();
 
         let mut payload = Vec::new();
-        payload.extend(encode_rlp_uint(status));
+        payload.extend(encode_rlp_uint(parse_qty_u128_checked(
+            status,
+            "receipt.status",
+        )?));
         payload.extend(encode_rlp_uint(parse_qty_u128(gas_field)));
         payload.extend(encode_rlp_bytes(&decode_hex_or_empty(&receipt.logs_bloom)));
         payload.extend(logs_encoded);
@@ -1388,7 +1660,7 @@ fn encode_receipt(receipt: &RpcReceipt, use_gas_used: bool) -> anyhow::Result<Ve
     }
 
     let mut payload = Vec::new();
-    payload.extend(encode_rlp_uint(status));
+    payload.extend(encode_receipt_status_or_root(receipt, receipt_type)?);
     payload.extend(encode_rlp_uint(parse_qty_u128(gas_field)));
     payload.extend(encode_rlp_bytes(&decode_hex_or_empty(&receipt.logs_bloom)));
     payload.extend(logs_encoded);
@@ -1397,14 +1669,11 @@ fn encode_receipt(receipt: &RpcReceipt, use_gas_used: bool) -> anyhow::Result<Ve
     encode_rlp_length(payload.len(), 0xc0, &mut list);
     list.extend(payload);
 
-    if tx_type == "0x0" {
+    if receipt_type == 0 {
         return Ok(list);
     }
 
-    let type_byte = u8::from_str_radix(tx_type.strip_prefix("0x").unwrap_or(tx_type), 16)
-        .map_err(|_| anyhow!("invalid receipt type: {tx_type}"))?;
-
-    let mut out = vec![type_byte];
+    let mut out = vec![receipt_type];
     out.extend(list);
     Ok(out)
 }

@@ -4,9 +4,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::rpc_data::{
-    AccessListItem, DebugFrame, DebugFrameResult, DebugStateDiffResult, EIP7702AuthorizationItem,
-    RawRpcBlock, RpcBlock, RpcLog, RpcReceipt, RpcTransaction, TempoPrimitiveSignature,
-    TempoSignatureObject, TraceAction, TraceFrame, TraceResult,
+    AccessListItem, DebugFrame, DebugFrameKind, DebugFrameResult, DebugStateDiffResult,
+    EIP7702AuthorizationItem, RawRpcBlock, RpcBlock, RpcLog, RpcReceipt, RpcTransaction,
+    TempoPrimitiveSignature, TempoSignatureObject, TraceAction, TraceFrame, TraceResult,
 };
 use crate::types::{qty2_u64, safe_qty2_u64, to_qty};
 
@@ -647,7 +647,7 @@ pub fn map_transaction(
         effective_gas_price: receipt.and_then(|r| r.effective_gas_price.clone()),
         gas_used: receipt.map(|r| r.gas_used.clone()),
         logs_bloom: receipt.map(|r| r.logs_bloom.clone()),
-        status: receipt.map(|r| qty2_u64(&r.status)),
+        status: receipt.and_then(|r| r.status.as_deref()).map(qty2_u64),
         blob_gas_used: receipt.and_then(|r| r.blob_gas_used.clone()),
         blob_gas_price: receipt.and_then(|r| r.blob_gas_price.clone()),
         l1_base_fee_scalar: receipt
@@ -809,7 +809,7 @@ pub fn map_debug_frame(
 ) -> Vec<NormalizedTrace> {
     // STOP type with no subcalls produces no traces
     let frame_type = frame_result.result.frame_type.as_str();
-    if frame_type == "STOP"
+    if DebugFrameKind::classify(frame_type) == DebugFrameKind::Stop
         && frame_result
             .result
             .calls
@@ -837,16 +837,18 @@ pub fn map_debug_frame(
                     creation_method: None,
                 });
 
-                let result =
-                    if frame.gas_used.is_some() || frame.output.is_some() || frame.to.is_some() {
-                        Some(NormalizedTraceResult::Create(NormalizedTraceCreateResult {
-                            gas_used: frame.gas_used.clone().unwrap_or_default(),
-                            code: frame.output.clone(),
-                            address: frame.to.as_deref().map(|s| s.to_lowercase()),
-                        }))
-                    } else {
-                        None
-                    };
+                let gas_used = frame.gas_used.as_ref().filter(|value| !value.is_empty());
+                let output = frame.output.as_ref().filter(|value| !value.is_empty());
+                let address = frame.to.as_ref().filter(|value| !value.is_empty());
+                let result = if gas_used.is_some() || output.is_some() || address.is_some() {
+                    Some(NormalizedTraceResult::Create(NormalizedTraceCreateResult {
+                        gas_used: gas_used.cloned().unwrap_or_default(),
+                        code: output.cloned(),
+                        address: address.map(|value| value.to_lowercase()),
+                    }))
+                } else {
+                    None
+                };
 
                 Some(NormalizedTrace::Debug(NormalizedDebugTrace {
                     transaction_index,
@@ -928,12 +930,9 @@ pub fn map_debug_frame(
 }
 
 fn frame_type_to_normalized(t: &str) -> &'static str {
-    match t.to_uppercase().as_str() {
-        "CREATE" | "CREATE2" => "create",
-        "CALL" | "CALLCODE" | "DELEGATECALL" | "STATICCALL" | "INVALID" => "call",
-        "SELFDESTRUCT" => "selfdestruct",
-        _ => "unknown",
-    }
+    DebugFrameKind::classify(t)
+        .normalized()
+        .unwrap_or("unknown")
 }
 
 // ─── State diff normalization ─────────────────────────────────────────────────
