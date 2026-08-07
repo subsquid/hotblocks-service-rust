@@ -276,7 +276,8 @@ async fn ct1_happy_path_matches_reference_model() {
         );
     }
 
-    // Readiness carries the exact text the binding pins (14 §operations).
+    // The generic core publishes the simulator's local head view. Readiness
+    // carries the exact text the binding pins (14 §operations).
     let r = client.get_raw("/readiness").await.unwrap();
     assert_eq!((r.status, r.body.as_ref()), (200, b"true".as_ref()));
 

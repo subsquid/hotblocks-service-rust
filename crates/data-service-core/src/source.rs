@@ -45,6 +45,11 @@ impl StreamError {
 #[async_trait]
 pub trait DataSource: Send + Sync + 'static {
     /// Return the current chain head (latest block ref).
+    ///
+    /// The core invokes this independently of readiness probes to maintain
+    /// OB-4's local upstream view. Implementations must therefore support this
+    /// call concurrently with an open stream. A failed or timed-out read leaves
+    /// the previous observation in place until it becomes stale.
     async fn get_head(&self) -> anyhow::Result<BlockRef>;
 
     /// Return the current finalized head.

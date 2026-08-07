@@ -39,6 +39,9 @@ impl RpcObserver for MetricsRpcObserver {
 /// Map a client error onto OB-8's closed class set. Exhaustive on purpose.
 fn classify(error: &RpcError) -> UpstreamErrorClass {
     match error {
+        // Construction fails before an observer can see this; keep the match
+        // exhaustive without adding a runtime label for configuration.
+        RpcError::InvalidConfig(_) => UpstreamErrorClass::Protocol,
         RpcError::Rpc { .. } => UpstreamErrorClass::Rpc,
         RpcError::Http { .. } => UpstreamErrorClass::Http,
         RpcError::Connection(_) => UpstreamErrorClass::Connection,

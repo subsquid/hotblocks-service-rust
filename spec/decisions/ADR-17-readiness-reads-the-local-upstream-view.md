@@ -1,6 +1,6 @@
 # ADR-17 — Readiness compares against the local upstream view, not a fresh probe
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 
@@ -26,6 +26,14 @@ adapter failed — a probe never returns an internal error to a router.
 Readiness becomes a pure local read: no upstream call, no share of the upstream
 budget, no failure mode of its own.
 
+The core owns the observation contract. It refreshes `DataSource::get_head` every
+`P-STALL-ALARM / 2`, with each read bounded to one quarter of that period. The tail of
+every committed source batch may advance the local head number between reads, but it
+does not refresh the successful-read timestamp used for readiness. Adapter-specific
+acquisition may publish more precise numbers, but readiness does not depend on that
+optional integration. A failed refresh is logged and leaves the previous successful
+read to age out normally, even while batches continue to arrive.
+
 ## Consequences
 
 The readiness-probe hazard is retired from 11's register: probe frequency no longer
@@ -33,16 +41,16 @@ affects upstream load, and readiness cost
 becomes independent of orchestrator configuration. SLI-7 measures the freshness of
 the ingestion loop's own view rather than the adapter's probe latency.
 
-Readiness staleness is now bounded by the head-following cadence instead of being
-zero-by-construction. Under a healthy upstream the loop observes the head at least
-once per block, so the view is fresher than a block time; under an unhealthy one the
-`P-STALL-ALARM` floor flips readiness off before the stall alarm's own threshold
-elapses, which is the behavior a router wants anyway.
+Readiness staleness is now bounded by the head-following cadence and the core refresh
+instead of being zero-by-construction. Under a healthy upstream the number moves with
+committed source batches and its successful-read timestamp is refreshed before
+`P-STALL-ALARM`; under an unhealthy one that timestamp ages out regardless of local
+commit progress, which is the behavior a router wants anyway.
 
-This binds readiness to an observable the implementation exposes since GAP-25 closed
-(2026-08-07): the upstream head and finalized views carry the observation timestamps
-the staleness floor reads. Only the probe's own switch away from a per-request
-upstream call is left (GAP-34).
+This binds readiness to the observable exposed since GAP-25 closed: the upstream head
+view carries its last successful-read Prometheus timestamp plus typed monotonic times
+for read freshness and numeric progress. GAP-34 closed with the probe's switch away
+from a per-request upstream call on 2026-08-07.
 
 Rejected: caching the probe result with a short TTL. It keeps the upstream call, keeps
 the failure mode, and adds a second staleness parameter to reason about.

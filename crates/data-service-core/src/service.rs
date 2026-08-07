@@ -9,7 +9,7 @@ use futures::StreamExt;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Options for `run_data_service`.
 pub struct DataServiceOptions<S> {
@@ -17,8 +17,8 @@ pub struct DataServiceOptions<S> {
     pub block_cache_size: usize,
     pub port: u16,
     pub auto_adjust_finalized_head: bool,
-    /// The registry the acquisition layer writes its OB-4 counters to. `None`
-    /// builds a private one, leaving the upstream half at zero.
+    /// Registry shared by the acquisition layer and core. `None` builds a
+    /// private registry; the core still maintains the upstream-head view.
     pub metrics: Option<Arc<Metrics>>,
 }
 
@@ -169,6 +169,7 @@ pub struct DataServiceHandle {
     cancel_tx: watch::Sender<bool>,
     server_task: tokio::task::JoinHandle<()>,
     service_task: tokio::task::JoinHandle<()>,
+    head_observer_task: tokio::task::JoinHandle<()>,
     levels_task: tokio::task::JoinHandle<()>,
 }
 
@@ -181,9 +182,11 @@ impl DataServiceHandle {
         let _ = self.cancel_tx.send(true);
         // Abort the service task so we don't wait for a stuck stream.next().
         self.service_task.abort();
+        self.head_observer_task.abort();
         self.levels_task.abort();
         let _ = self.service_task.await;
         let _ = self.server_task.await;
+        let _ = self.head_observer_task.await;
         let _ = self.levels_task.await;
     }
 }
@@ -246,6 +249,20 @@ pub async fn run_data_service<S: DataSource>(
         let _ = ended_tx.send(end);
     });
 
+    // Maintain the generic DataSource contract behind readiness. The ticker is
+    // independent of HTTP probe cadence, and stream batches below provide a
+    // lower-bound observation between explicit reads.
+    let head_service = Arc::clone(&service);
+    let head_observer_task = tokio::spawn(async move {
+        let cadence = head_service.metrics.upstream_head_refresh_interval();
+        let mut ticker = tokio::time::interval(cadence);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            head_service.refresh_upstream_head().await;
+        }
+    });
+
     // LIV-2's level must flip without waiting for a scrape: OB-10's capture
     // is an edge, and nobody may be looking.
     let metrics = Arc::clone(&service.metrics);
@@ -266,6 +283,7 @@ pub async fn run_data_service<S: DataSource>(
         cancel_tx,
         server_task,
         service_task,
+        head_observer_task,
         levels_task,
     })
 }
@@ -360,9 +378,22 @@ impl<S: DataSource> DataService<S> {
     }
 
     pub async fn is_ready(&self) -> bool {
-        match self.source.get_head().await {
-            Ok(head) => head.number <= self.get_chain_ref(|c| c.get_head().number),
-            Err(_) => false,
+        self.metrics
+            .fresh_upstream_head()
+            .is_some_and(|head| head <= self.get_chain_ref(|c| c.get_head().number))
+    }
+
+    async fn refresh_upstream_head(&self) {
+        let timeout = self.metrics.upstream_head_refresh_timeout();
+        match tokio::time::timeout(timeout, self.source.get_head()).await {
+            Ok(Ok(head)) => self.metrics.observe_upstream_head(head.number),
+            Ok(Err(_)) => warn!(
+                "upstream head observation failed; readiness will use the previous view until it becomes stale"
+            ),
+            Err(_) => warn!(
+                timeout_ms = timeout.as_millis(),
+                "upstream head observation timed out; readiness will use the previous view until it becomes stale"
+            ),
         }
     }
 
@@ -679,12 +710,17 @@ impl<S: DataSource> DataService<S> {
                     Ok(inserted) => {
                         let inserted_any = !inserted.is_empty();
                         chain.commit_batch();
-                        // Ingest-time observables are published only by a batch
-                        // that survived, each carrying the instant its own block
-                        // landed: a rolled-back block must not answer
-                        // `/block-time`, an absorbed duplicate must not rewrite
-                        // the time its block was first seen (WP-6), and no block
-                        // is charged for the batch it waited on.
+                        // Ingest-time observables are published only by a
+                        // batch that survived. Source progress belongs to the
+                        // committed tail; each inserted block carries the
+                        // instant it became queryable, so a rolled-back block
+                        // must not answer `/block-time`, an absorbed duplicate
+                        // must not rewrite the time its block was first seen
+                        // (WP-6), and no block is charged for the batch it
+                        // waited on.
+                        if let Some(last) = batch.blocks.last() {
+                            self.metrics.observe_upstream_progress(last.number);
+                        }
                         for Ingested { index, at_ms } in inserted {
                             let block = &batch.blocks[index];
                             record_block_ingestion(block.number, at_ms);

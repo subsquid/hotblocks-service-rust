@@ -9,7 +9,7 @@ use data_service_core::metrics::get_block_ingestion_timestamp;
 use data_service_core::service::{DataService, DivergentReseed, RunEnd};
 use data_service_core::source::{BlockBatch, DataSource, StreamError, StreamRequest};
 use data_service_core::types::{Block, BlockRef};
-use data_service_core::{run_data_service, DataServiceOptions};
+use data_service_core::{run_data_service, DataServiceOptions, Metrics};
 use futures::stream::BoxStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,6 +27,18 @@ fn block(number: u64, hash: &str, parent_number: u64, parent_hash: &str) -> Bloc
         json_line_zstd: Bytes::from(zstd::encode_all(json.as_bytes(), 1).unwrap()),
         timings: None,
     }
+}
+
+fn gauge_value(metrics: &Metrics, name: &str) -> f64 {
+    let text = metrics
+        .get_single_metric_text(name)
+        .unwrap_or_else(|| panic!("missing metric {name}"));
+    text.lines()
+        .find(|line| line.starts_with(name) && line.as_bytes().get(name.len()) == Some(&b' '))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_else(|| panic!("missing sample for {name}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("invalid sample for {name}"))
 }
 
 /// Seeds T1 normally, optionally replays that seed on the head stream, then
@@ -1066,6 +1078,11 @@ async fn ingest_time_is_published_only_by_a_committed_batch() {
         seen(BASE + 2).is_some(),
         "every inserted block in the committed batch is timestamped"
     );
+    assert_eq!(
+        gauge_value(&svc.metrics, "sqd_hotblocks_upstream_head"),
+        (BASE + 2) as f64,
+        "committed progress advances the local upstream view"
+    );
 
     // Make an incorrect restamp distinguishable, then let the source replay
     // the already committed block and deliver the rejected batch.
@@ -1089,6 +1106,11 @@ async fn ingest_time_is_published_only_by_a_committed_batch() {
         seen(BASE + 3),
         None,
         "a rolled-back block must not answer /block-time"
+    );
+    assert_eq!(
+        gauge_value(&svc.metrics, "sqd_hotblocks_upstream_head"),
+        (BASE + 2) as f64,
+        "a rolled-back batch must not advance upstream progress"
     );
 
     cancel_tx.send(true).unwrap();

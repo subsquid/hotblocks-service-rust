@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::{stream, StreamExt};
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::warn;
@@ -12,6 +13,9 @@ use crate::rate::RateMeter;
 use crate::transport::ws::{WsTransport, DEFAULT_POOL_SIZE};
 use crate::transport::{HttpTransport, OwnedRpcRequest, RpcResponse, RpcTransport};
 
+/// Default aggregate limit for concurrent upstream requests.
+pub const DEFAULT_REQUEST_CAPACITY: usize = 10;
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 /// Configuration for `RpcClient`.
@@ -21,10 +25,12 @@ pub struct RpcClientConfig {
     pub url: String,
     /// Max number of JSON-RPC calls in one HTTP batch array.
     /// Defaults to unlimited (or `max(1, rate_limit/5)` when rate_limit is set).
+    /// Must be non-zero and no larger than one configured rate window can admit.
     pub max_batch_call_size: Option<usize>,
     /// Max concurrent in-flight HTTP requests.
     pub capacity: usize,
     /// Max calls per second (rate counted by batch items, not requests).
+    /// Must be finite and greater than zero when configured.
     pub rate_limit: Option<f64>,
     /// Per-request HTTP timeout (zero = no timeout).
     pub request_timeout: Duration,
@@ -48,7 +54,7 @@ impl Default for RpcClientConfig {
             // contract). Real callers always override this.
             url: "http://localhost".into(),
             max_batch_call_size: None,
-            capacity: 10,
+            capacity: DEFAULT_REQUEST_CAPACITY,
             rate_limit: None,
             request_timeout: Duration::ZERO,
             retry_attempts: 0,
@@ -104,6 +110,7 @@ pub struct RpcClient {
     transport: Arc<dyn RpcTransport>,
     config: Arc<RpcClientConfig>,
     max_batch_call_size: usize,
+    batch_concurrency: usize,
     semaphore: Arc<Semaphore>,
     counter: Arc<AtomicU64>,
     rate: Option<Arc<Mutex<RateState>>>,
@@ -116,18 +123,40 @@ impl RpcClient {
     ///
     /// # Panics
     ///
-    /// Panics if `config.url` cannot be parsed as a URL or uses an unsupported
-    /// scheme (anything other than `http`/`https`/`ws`/`wss`). This mirrors the
-    /// prior `reqwest`-based constructor, which also panicked on a bad client
-    /// build. Use [`RpcClient::try_new`] for the fallible variant that returns
-    /// the error instead of panicking.
+    /// Panics if the configuration is invalid, including an unparseable or
+    /// unsupported URL, zero capacity/batch size, a non-positive rate, or a
+    /// batch that one rate window can never admit. Use [`RpcClient::try_new`]
+    /// for the fallible variant.
     pub fn new(config: RpcClientConfig) -> Self {
         Self::try_new(config).expect("failed to build RpcClient")
     }
 
-    /// Fallible constructor: errors on an unsupported / unparseable URL scheme.
+    /// Fallible constructor: validates request-budget invariants and the URL
+    /// scheme before constructing any transport.
     pub fn try_new(config: RpcClientConfig) -> Result<Self, RpcError> {
+        const RATE_WINDOW_SIZE: usize = 10;
+
+        if config.capacity == 0 {
+            return Err(RpcError::InvalidConfig(
+                "capacity must be greater than zero".into(),
+            ));
+        }
         let rate_limit = config.rate_limit;
+        if rate_limit.is_some_and(|limit| !limit.is_finite() || limit <= 0.0) {
+            return Err(RpcError::InvalidConfig(
+                "rate_limit must be finite and greater than zero".into(),
+            ));
+        }
+
+        let rate_meter = rate_limit.map(|limit| RateMeter::for_rate_limit(RATE_WINDOW_SIZE, limit));
+        if rate_limit
+            .zip(rate_meter.as_ref())
+            .is_some_and(|(limit, meter)| meter.calls_per_window(limit) == 0)
+        {
+            return Err(RpcError::InvalidConfig(
+                "rate_limit is too small for the rate-meter window".into(),
+            ));
+        }
 
         let max_batch_call_size = config.max_batch_call_size.unwrap_or_else(|| {
             if let Some(rl) = rate_limit {
@@ -136,30 +165,37 @@ impl RpcClient {
                 usize::MAX
             }
         });
+        if max_batch_call_size == 0 {
+            return Err(RpcError::InvalidConfig(
+                "max_batch_call_size must be greater than zero".into(),
+            ));
+        }
+        if let Some((limit, meter)) = rate_limit.zip(rate_meter.as_ref()) {
+            let calls_per_window = meter.calls_per_window(limit);
+            if max_batch_call_size > calls_per_window {
+                return Err(RpcError::InvalidConfig(format!(
+                    "max_batch_call_size ({max_batch_call_size}) exceeds the {calls_per_window} calls admitted by one rate window"
+                )));
+            }
+        }
 
-        let rate = rate_limit.map(|rl| {
-            let window_size = 10usize;
-            let slot_time = if rl < 1.0 {
-                (1000.0 / (rl * window_size as f64)).ceil() as u64
-            } else {
-                100u64
-            };
-            Arc::new(Mutex::new(RateState {
-                meter: RateMeter::new(window_size, slot_time),
-                limit: rl,
-            }))
-        });
+        let rate = rate_limit
+            .zip(rate_meter)
+            .map(|(limit, meter)| Arc::new(Mutex::new(RateState { meter, limit })));
+
+        let request_capacity = config.capacity.min(Semaphore::MAX_PERMITS);
 
         let transport = build_transport(
             &config.url,
-            config.capacity,
+            request_capacity,
             config.ws_pool_size.unwrap_or(DEFAULT_POOL_SIZE),
         )?;
 
         Ok(RpcClient {
             transport,
             max_batch_call_size,
-            semaphore: Arc::new(Semaphore::new(config.capacity.min(Semaphore::MAX_PERMITS))),
+            batch_concurrency: request_capacity,
+            semaphore: Arc::new(Semaphore::new(request_capacity)),
             counter: Arc::new(AtomicU64::new(0)),
             rate,
             config: Arc::new(config),
@@ -236,8 +272,9 @@ impl RpcClient {
         }
     }
 
-    /// Batch JSON-RPC call. Splits by `max_batch_call_size`, respects rate and
-    /// capacity limits.  Returns per-call Results (not all-or-nothing).
+    /// Batch JSON-RPC call. Splits by `max_batch_call_size`, runs capped chunks
+    /// concurrently under the shared rate/capacity limits, and preserves input
+    /// order. Returns per-call Results (not all-or-nothing).
     pub async fn batch_call(
         &self,
         calls: Vec<(String, Option<Value>)>,
@@ -247,11 +284,14 @@ impl RpcClient {
             return Ok(vec![]);
         }
 
-        let chunk_size = self.max_batch_call_size;
-        let mut results: Vec<Result<Value, RpcError>> = Vec::with_capacity(calls.len());
-
-        for chunk in calls.chunks(chunk_size) {
-            let chunk_results = self.batch_chunk(chunk, options).await?;
+        let call_count = calls.len();
+        let chunks = stream::iter(split_calls(calls, self.max_batch_call_size))
+            .map(|chunk| async move { self.batch_chunk(&chunk, options).await })
+            .buffered(self.batch_concurrency);
+        futures::pin_mut!(chunks);
+        let mut results: Vec<Result<Value, RpcError>> = Vec::with_capacity(call_count);
+        while let Some(chunk_results) = chunks.next().await {
+            let chunk_results = chunk_results?;
             results.extend(chunk_results);
         }
 
@@ -266,7 +306,20 @@ impl RpcClient {
         calls: Vec<(String, Option<Value>)>,
         options: &CallOptions,
     ) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
-        self.reduce_batch(calls, options).await
+        if calls.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let call_count = calls.len();
+        let chunks = stream::iter(split_calls(calls, self.max_batch_call_size))
+            .map(|chunk| self.reduce_batch(chunk, options))
+            .buffered(self.batch_concurrency);
+        futures::pin_mut!(chunks);
+        let mut results = Vec::with_capacity(call_count);
+        while let Some(chunk_results) = chunks.next().await {
+            results.extend(chunk_results?);
+        }
+        Ok(results)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -405,24 +458,26 @@ impl RpcClient {
     }
 
     /// Wait until the sliding-window rate allows `count` more items.
+    ///
+    /// Reservations are atomic, but differently sized concurrent callers have
+    /// no fairness guarantee. Construction only guarantees that one capped
+    /// batch fits when the configured window is otherwise empty.
     async fn wait_for_rate(&self, count: usize) {
         let Some(rate_arc) = &self.rate else { return };
 
         loop {
-            let now_ms = now_millis();
-
-            let (current_rate, slot_time_ms, limit) = {
-                let r = rate_arc.lock().await;
-                (r.meter.get_rate(now_ms), r.meter.slot_time, r.limit)
+            let wait = {
+                let mut rate = rate_arc.lock().await;
+                let now_ms = now_millis();
+                if rate.meter.get_rate(now_ms) + rate.meter.contribution(count as u64) <= rate.limit
+                {
+                    rate.meter.inc(count as u64, now_ms);
+                    return;
+                }
+                Duration::from_millis(rate.meter.slot_time)
             };
 
-            if current_rate + count as f64 <= limit {
-                let mut r = rate_arc.lock().await;
-                r.meter.inc(count as u64, now_millis());
-                return;
-            }
-
-            tokio::time::sleep(Duration::from_millis(slot_time_ms)).await;
+            tokio::time::sleep(wait).await;
         }
     }
 
@@ -492,6 +547,17 @@ fn retry_pause(schedule: &[Duration], attempt: usize) -> Duration {
         .get(idx)
         .copied()
         .unwrap_or(Duration::from_millis(20_000))
+}
+
+fn split_calls(
+    calls: Vec<(String, Option<Value>)>,
+    chunk_size: usize,
+) -> impl Iterator<Item = Vec<(String, Option<Value>)>> {
+    let mut calls = calls.into_iter();
+    std::iter::from_fn(move || {
+        let chunk: Vec<_> = calls.by_ref().take(chunk_size).collect();
+        (!chunk.is_empty()).then_some(chunk)
+    })
 }
 
 fn now_millis() -> u64 {
@@ -646,5 +712,102 @@ mod tests {
         let client = RpcClient::new(config);
         // max(1, floor(0.5/5)) = max(1, 0) = 1
         assert_eq!(client.max_batch_call_size, 1);
+    }
+
+    #[test]
+    fn zero_batch_size_is_rejected() {
+        let error = RpcClient::try_new(RpcClientConfig {
+            url: "http://localhost".into(),
+            max_batch_call_size: Some(0),
+            ..Default::default()
+        })
+        .err()
+        .expect("zero batch size must be rejected");
+        assert!(
+            matches!(error, RpcError::InvalidConfig(message) if message.contains("greater than zero"))
+        );
+    }
+
+    #[test]
+    fn batch_larger_than_rate_window_is_rejected() {
+        let error = RpcClient::try_new(RpcClientConfig {
+            url: "http://localhost".into(),
+            max_batch_call_size: Some(50),
+            rate_limit: Some(10.0),
+            ..Default::default()
+        })
+        .err()
+        .expect("an unsatisfiable batch must be rejected");
+        assert!(
+            matches!(error, RpcError::InvalidConfig(message) if message.contains("exceeds the 10 calls"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fractional_rate_admits_one_call_per_extended_window() {
+        let client = RpcClient::new(RpcClientConfig {
+            url: "http://localhost".into(),
+            rate_limit: Some(0.5),
+            ..Default::default()
+        });
+        tokio::time::timeout(Duration::from_millis(50), client.wait_for_rate(1))
+            .await
+            .expect("a single call must be satisfiable at a fractional rate");
+    }
+
+    /// GAP-21: every concurrent waiter must check and reserve from one rate
+    /// state transition. Queueing all waiters behind the state lock makes the
+    /// old check-then-act race deterministic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_rate_waiters_reserve_budget_atomically() {
+        const LIMIT: usize = 4;
+        const CALLERS: usize = LIMIT * 2;
+
+        let client = Arc::new(RpcClient::new(RpcClientConfig {
+            url: "http://localhost".into(),
+            capacity: CALLERS,
+            rate_limit: Some(LIMIT as f64),
+            ..Default::default()
+        }));
+        let rate = Arc::clone(client.rate.as_ref().expect("configured rate state"));
+        let state_guard = rate.lock().await;
+        let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::with_capacity(CALLERS);
+
+        for _ in 0..CALLERS {
+            let client = Arc::clone(&client);
+            let start = Arc::clone(&start);
+            let waiting = Arc::clone(&waiting);
+            let admitted = Arc::clone(&admitted);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                waiting.fetch_add(1, Ordering::Relaxed);
+                client.wait_for_rate(1).await;
+                admitted.fetch_add(1, Ordering::Relaxed);
+            }));
+        }
+
+        start.wait().await;
+        while waiting.load(Ordering::Relaxed) != CALLERS {
+            tokio::task::yield_now().await;
+        }
+        // Give the final waiter a poll so every first lock acquisition is
+        // queued before the guard is released.
+        tokio::task::yield_now().await;
+        drop(state_guard);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            admitted.load(Ordering::Relaxed),
+            LIMIT,
+            "one rolling window must not admit more than its configured budget"
+        );
+
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }

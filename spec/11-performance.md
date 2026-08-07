@@ -111,9 +111,10 @@ these are standing risks.)
 - **HZ-6 — Unbounded request concurrency.** While GAP-28 is open (no admission cap,
   RP-23): aggregate snapshot + buffer cost scales with client count. → PF-1, INV-35.
   Probe: S5 connection flood.
-- **HZ-7 — Budget-limiter race.** A rate limiter admitting concurrent callers can
-  overshoot the configured budget. → REQ-16. Probe: metered upstream under S6
-  (GAP-21's test).
+- **HZ-7 — Retired 2026-08-07.** Rate admission and reservation are one state
+  transition; deterministic queued-waiter and metered concurrent-call regressions
+  close the overshoot race (GAP-21). Full S6 saturation remains part of CT-8, not a
+  known limiter defect.
 - **HZ-8 — Finality-probe amplification.** Finality confirmation that probes
   per-block can multiply upstream calls at high block rates. → REQ-16, SLI-6. Probe:
   S1 at `W-BLOCK-INTERVAL` ≤ 250 ms, count upstream calls per block.

@@ -7,7 +7,7 @@ use axum::{extract::State, routing::post, Json, Router};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-use rpc_client::{CallOptions, RpcClient, RpcClientConfig};
+use rpc_client::{CallOptions, RpcClient, RpcClientConfig, DEFAULT_REQUEST_CAPACITY};
 
 // ─── Mock server helpers ──────────────────────────────────────────────────────
 
@@ -334,6 +334,107 @@ async fn test_batch_reduce_on_retry() {
     );
 }
 
+/// GAP-20: both public batch entry points apply the size cap before their
+/// first round trip; reduce-on-retry never gets one oversized initial attempt.
+#[tokio::test]
+async fn reduce_on_retry_respects_the_configured_batch_cap() {
+    let state = ReduceState {
+        calls: Arc::new(tokio::sync::Mutex::new(vec![])),
+    };
+    let app = Router::new()
+        .route("/", post(reduce_handler))
+        .with_state(state.clone());
+    let url = spawn_server(app).await;
+
+    let client = RpcClient::new(RpcClientConfig {
+        url,
+        capacity: 8,
+        max_batch_call_size: Some(2),
+        ..Default::default()
+    });
+    let calls = || (0..5).map(|i| (format!("method_{i}"), None)).collect();
+
+    let plain = client
+        .batch_call(calls(), &CallOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(plain.len(), 5);
+    assert!(plain.iter().all(Result::is_ok));
+    let mut seen = state.calls.lock().await.clone();
+    seen.sort_unstable();
+    assert_eq!(seen, vec![1, 2, 2]);
+    state.calls.lock().await.clear();
+
+    let results = client
+        .batch_call_reduce_on_retry(calls(), &CallOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 5);
+    assert!(results.iter().all(Result::is_ok));
+    let mut seen = state.calls.lock().await.clone();
+    seen.sort_unstable();
+    assert_eq!(seen, vec![1, 2, 2]);
+}
+
+#[derive(Clone, Default)]
+struct ConcurrentChunkState {
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
+}
+
+async fn concurrent_chunk_handler(
+    State(state): State<ConcurrentChunkState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let in_flight = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+    state.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    state.in_flight.fetch_sub(1, Ordering::SeqCst);
+    echo_handler(Json(body)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_cap_without_rate_limit_has_bounded_concurrency_and_order() {
+    const CALLS: usize = 40;
+
+    let state = ConcurrentChunkState::default();
+    let app = Router::new()
+        .route("/", post(concurrent_chunk_handler))
+        .with_state(state.clone());
+    let url = spawn_server(app).await;
+    let client = RpcClient::new(RpcClientConfig {
+        url,
+        max_batch_call_size: Some(2),
+        ..Default::default()
+    });
+    let calls = || (0..CALLS).map(|i| (format!("method_{i}"), None)).collect();
+
+    for reduced in [false, true] {
+        state.max_in_flight.store(0, Ordering::SeqCst);
+        let results = if reduced {
+            client
+                .batch_call_reduce_on_retry(calls(), &CallOptions::default())
+                .await
+                .unwrap()
+        } else {
+            client
+                .batch_call(calls(), &CallOptions::default())
+                .await
+                .unwrap()
+        };
+
+        for (index, result) in results.into_iter().enumerate() {
+            assert_eq!(result.unwrap(), json!(format!("method_{index}")));
+        }
+        assert_eq!(
+            state.max_in_flight.load(Ordering::SeqCst),
+            DEFAULT_REQUEST_CAPACITY,
+            "chunk fan-out must overlap without exceeding request capacity"
+        );
+    }
+}
+
 // ─── Singleton reduced batches retain their validators ──────────────────────
 
 #[tokio::test]
@@ -486,4 +587,75 @@ async fn partial_batch_handler(
     } else {
         Json(responses.pop().expect("single response"))
     }
+}
+
+// ─── Aggregate rate under concurrent callers ────────────────────────────────
+
+#[derive(Clone, Default)]
+struct MeteredState {
+    arrivals: Arc<tokio::sync::Mutex<Vec<std::time::Instant>>>,
+}
+
+async fn metered_handler(
+    State(state): State<MeteredState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    state.arrivals.lock().await.push(std::time::Instant::now());
+    echo_handler(Json(body)).await
+}
+
+/// GAP-21/CT-8: concurrent acquisition shares one atomic rate reservation;
+/// only one configured window reaches the metered upstream at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_calls_respect_the_aggregate_rate_limit() {
+    const LIMIT: usize = 4;
+    const CALLERS: usize = LIMIT * 2;
+
+    let state = MeteredState::default();
+    let app = Router::new()
+        .route("/", post(metered_handler))
+        .with_state(state.clone());
+    let url = spawn_server(app).await;
+    let client = Arc::new(RpcClient::new(RpcClientConfig {
+        url,
+        capacity: CALLERS,
+        rate_limit: Some(LIMIT as f64),
+        ..Default::default()
+    }));
+    let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+    let mut tasks = Vec::with_capacity(CALLERS);
+
+    for i in 0..CALLERS {
+        let client = Arc::clone(&client);
+        let start = Arc::clone(&start);
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            client
+                .call(&format!("method_{i}"), None, CallOptions::default())
+                .await
+        }));
+    }
+
+    start.wait().await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        state.arrivals.lock().await.len() <= LIMIT,
+        "the first rolling window exceeded the configured call budget"
+    );
+
+    for task in tasks {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("rate-limited call did not finish")
+            .expect("call task panicked");
+        result.expect("metered upstream call failed");
+    }
+
+    let arrivals = state.arrivals.lock().await;
+    assert_eq!(arrivals.len(), CALLERS);
+    assert!(
+        arrivals.last().unwrap().duration_since(arrivals[0])
+            >= std::time::Duration::from_millis(800),
+        "two windows of calls reached upstream as one burst"
+    );
 }

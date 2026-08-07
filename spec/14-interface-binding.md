@@ -103,9 +103,9 @@ symbols in 15.
 | `--block-cache-size` | `P-CACHE-SIZE` | window (DEF-24) |
 | `--http-rpc-stride-size` | `P-STRIDE-SIZE` | acquisition range-batch size |
 | `--http-rpc-stride-concurrency` | `P-STRIDE-CONCURRENCY` | concurrent range batches |
-| `--http-rpc-rate-limit` | unset | upstream budget, items/s (REQ-16) |
+| `--http-rpc-rate-limit` | unset | `P-RPC-RATE-LIMIT`, upstream budget in items/s (REQ-16) |
 | `--http-rpc-timeout` | `P-RPC-TIMEOUT` | per-call timeout |
-| `--http-rpc-max-batch-call-size` | unset | upstream call-batch cap (GAP-20) |
+| `--http-rpc-max-batch-call-size` | `P-RPC-BATCH-MAX` | upstream call-batch cap (GAP-20) |
 | `--http-retry-internal-server-errors` | off | widen retryable classification (FM-23) |
 | `--finality-confirmation <n>` | unset | finality policy `offset(n)` (DEF-23) |
 | `--auto-adjust-finalized-head` | off | DEF-24, WP-24 |
@@ -115,6 +115,12 @@ symbols in 15.
 | `--call-frame-validation <off\|observe\|reject>` | `off` | semantic debug call-frame policy; structural validation is unconditional, while `reject` requires the transaction-root and sender verification switches to be enabled |
 | `--skip-log-index-check`, `--skip-cumulative-gas-used-check`, `--use-gas-used-for-receipts-root` | off | coherence-check tuning (DEF-15 instantiation) |
 | `--profile-block-timings` | off | opt-in per-block timing telemetry (ADR-5 family; not in the predecessor) |
+
+The RPC rate, batch and capacity values are validated before startup. Zero batch sizes,
+non-positive/non-finite rates, and a batch cap larger than one otherwise-empty rate
+window can admit are configuration errors. This proves each capped reservation is
+possible in isolation; it does not promise fairness between differently sized
+concurrent reservations.
 
 Receipt-dependent policy is validated at startup: `--verify-receipts-root` and
 `--skip-cumulative-gas-used-check` require `--with-receipts`, while
