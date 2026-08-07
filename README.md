@@ -85,6 +85,23 @@ still apply to individual blocks and transactions. Tune consistency checks with
 `--profile-block-timings` emits per-block pipeline timing logs (target
 `block_timing`).
 
+## Metrics
+
+`/metrics` serves the buffer's state (first/last/finalized height, stored
+blocks, window excess), a commit heartbeat, arrival and processing lag, query
+outcomes by class with their durations, response truncations by cause, the last
+observed upstream head and finalized head with the time each was observed,
+upstream request/error/retry counts by class, and lifecycle timestamps.
+
+Alarms are levels and counters, not just log lines: `over_window`,
+`stall_alarm` and `terminal_state` are levels; force advances, integrity
+violations, session restarts by cause, fork rebases, watermark regressions and
+acquisition-retry exhaustion are counters. `spec/14-interface-binding.md` (IB-12)
+lists the exact series and their label sets, all of which are registered at zero
+before their first event.
+
+Process- and runtime-level metrics are outside this service's scope.
+
 ## Differences from the TypeScript service
 
 The API and data format match. The items below are where it deliberately
@@ -96,7 +113,9 @@ diverges — in structure, in runtime behavior, or to fix a TS bug.
   recovery, zstd) to worker threads, spawning a fresh worker per backfill
   request. Rust runs IO on tokio and CPU-bound block processing via
   `tokio::task::spawn_blocking`. One shared RPC client serves both head-following
-  and backfill, so they share a single rate-limit budget — intended.
+  and backfill, so they share a single rate-limit budget — intended. The
+  `sqd_hotblocks_active_workers` gauge goes with them: there is nothing left for
+  it to count, and a gauge frozen at zero reads as healthy.
 - **Generic core, chain-specific edge.** The TS service is EVM-specific
   throughout; here the chain-agnostic machinery lives in `data-service-core` and
   EVM specifics in `evm-source` (see the layout above).

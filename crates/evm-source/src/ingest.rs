@@ -224,6 +224,9 @@ async fn acquire_range_stride(
             };
 
             if retries >= P_ENRICH_RETRIES {
+                if let Some(metrics) = rpc.metrics() {
+                    metrics.record_acquisition_retry_exhausted();
+                }
                 return RangeAcquisition {
                     blocks: complete,
                     failure: Some(anyhow!(
@@ -452,6 +455,11 @@ pub async fn ingest_range(
                             cadence.record_block(now);
                             hot_streak += 1;
                             incoherent_attempts = 0;
+                            // OB-4: this path never reads the head tag, but a
+                            // delivered N proves the upstream reached N.
+                            if let Some(metrics) = rpc.metrics() {
+                                metrics.observe_upstream_head(next_num);
+                            }
                             let body_received = if profile_block_timings { Some(now) } else { None };
                             pending.push_back((next_num, spawn_enrich(body, body_received)));
                             next_num += 1;
@@ -467,6 +475,9 @@ pub async fn ingest_range(
                                 .error_message
                                 .unwrap_or_else(|| "incoherent block".to_string());
                             if incoherent_attempts >= P_ENRICH_RETRIES {
+                                if let Some(metrics) = rpc.metrics() {
+                                    metrics.record_acquisition_retry_exhausted();
+                                }
                                 // Deliver what is already in flight first: those
                                 // blocks are complete and sit below the failure
                                 // (WP-11.5).
@@ -515,6 +526,15 @@ pub async fn ingest_range(
                             // Not produced yet. While waiting, opportunistically
                             // drain a completed front task.
                             hot_streak = 0;
+                            // An exact OB-4 observation, not an absence of one:
+                            // N does not exist and N-1 was delivered, so the
+                            // upstream head is N-1. LIV-2 needs it to tell an
+                            // idle chain from a stalled service here.
+                            if let (Some(metrics), Some(below)) =
+                                (rpc.metrics(), next_num.checked_sub(1))
+                            {
+                                metrics.observe_upstream_head(below);
+                            }
                             let delay = cadence.next_poll_delay(Instant::now());
                             if let Some((_, task)) = pending.front_mut() {
                                 match tokio::time::timeout(delay, task).await {

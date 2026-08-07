@@ -1,7 +1,7 @@
 //! DataService ingestion loop — exact port of `data-service.ts`.
 
 use crate::chain::{is_chain, Chain, Push};
-use crate::metrics::{now_ms, record_block_ingestion, Metrics};
+use crate::metrics::{now_ms, record_block_ingestion, Metrics, QueryClass, SessionRestart};
 use crate::source::{BlockBatch, DataSource, StreamError, StreamRequest};
 use crate::types::{Block, BlockHeader, BlockRef, DataResponse, InvalidBaseBlock, QueryError};
 use anyhow::Context;
@@ -17,6 +17,9 @@ pub struct DataServiceOptions<S> {
     pub block_cache_size: usize,
     pub port: u16,
     pub auto_adjust_finalized_head: bool,
+    /// The registry the acquisition layer writes its OB-4 counters to. `None`
+    /// builds a private one, leaving the upstream half at zero.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 /// FM-30: a T1 re-seed named a height the buffer it would discard holds under
@@ -135,6 +138,12 @@ fn validate_ingest_batch(batch: &BlockBatch) -> Result<(), StreamError> {
     Ok(())
 }
 
+/// A query verdict together with the OB-5 class it will be counted under.
+pub struct QueryOutcome {
+    pub response: DataResponse,
+    pub class: QueryClass,
+}
+
 /// How the ingestion run ended. Anything but `Stopped` requires action from
 /// the binary: exit non-zero per IB-11 (FM-31 startup failure, FM-30
 /// terminal divergence — ADR-12).
@@ -155,22 +164,27 @@ pub struct DataServiceHandle {
     pub started: tokio::sync::oneshot::Receiver<anyhow::Result<()>>,
     /// Resolves when the ingestion run ends; `RunEnd` says how (IB-11).
     pub ended: tokio::sync::oneshot::Receiver<RunEnd>,
+    pub metrics: Arc<Metrics>,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     cancel_tx: watch::Sender<bool>,
     server_task: tokio::task::JoinHandle<()>,
     service_task: tokio::task::JoinHandle<()>,
+    levels_task: tokio::task::JoinHandle<()>,
 }
 
 impl DataServiceHandle {
     pub async fn shutdown(self) {
+        self.metrics.record_shutdown_start();
         // Signal the HTTP server to stop accepting new connections.
         let _ = self.shutdown_tx.send(());
         // Signal the ingestion loop to stop (wakes it even if blocked on stream.next()).
         let _ = self.cancel_tx.send(true);
         // Abort the service task so we don't wait for a stuck stream.next().
         self.service_task.abort();
+        self.levels_task.abort();
         let _ = self.service_task.await;
         let _ = self.server_task.await;
+        let _ = self.levels_task.await;
     }
 }
 
@@ -181,11 +195,12 @@ pub async fn run_data_service<S: DataSource>(
 ) -> anyhow::Result<DataServiceHandle> {
     let (cancel_tx, cancel_rx) = watch::channel(false);
 
-    let service = Arc::new(DataService::new(
+    let service = Arc::new(DataService::with_metrics(
         opts.source,
         opts.block_cache_size,
         opts.auto_adjust_finalized_head,
         cancel_rx,
+        opts.metrics.unwrap_or_default(),
     ));
 
     service.init().await?;
@@ -231,14 +246,27 @@ pub async fn run_data_service<S: DataSource>(
         let _ = ended_tx.send(end);
     });
 
+    // LIV-2's level must flip without waiting for a scrape: OB-10's capture
+    // is an edge, and nobody may be looking.
+    let metrics = Arc::clone(&service.metrics);
+    let levels_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            metrics.refresh_derived_levels();
+        }
+    });
+
     Ok(DataServiceHandle {
         port,
         started: started_rx,
         ended: ended_rx,
+        metrics: Arc::clone(&service.metrics),
         shutdown_tx,
         cancel_tx,
         server_task,
         service_task,
+        levels_task,
     })
 }
 
@@ -272,13 +300,31 @@ impl<S: DataSource> DataService<S> {
         auto_adjust_finalized_head: bool,
         cancel_rx: watch::Receiver<bool>,
     ) -> Self {
+        Self::with_metrics(
+            source,
+            buffer_size,
+            auto_adjust_finalized_head,
+            cancel_rx,
+            Arc::new(Metrics::new()),
+        )
+    }
+
+    /// Share the acquisition layer's registry, so its OB-4 counters land on
+    /// the same scrape surface as the state levels.
+    pub fn with_metrics(
+        source: S,
+        buffer_size: usize,
+        auto_adjust_finalized_head: bool,
+        cancel_rx: watch::Receiver<bool>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         let (block_watch_tx, block_watch_rx) = watch::channel(0u64);
         let (started_tx, started_rx) = watch::channel(Err(()));
         Self {
             source,
             buffer_size,
             auto_adjust_finalized_head,
-            metrics: Arc::new(Metrics::new()),
+            metrics,
             chain: RwLock::new(None),
             block_watch_tx,
             block_watch_rx,
@@ -405,6 +451,7 @@ impl<S: DataSource> DataService<S> {
             if seed.number < prev_finalized.number {
                 // WP-20: an epoch reset below the previous watermark is
                 // legal but MUST be alarmed as a watermark regression.
+                self.metrics.record_watermark_regression();
                 error!(
                     seed_number = seed.number,
                     seed_hash = %seed.hash,
@@ -450,10 +497,14 @@ impl<S: DataSource> DataService<S> {
                     // WP-20: a divergent seed is FM-30, not a retry.
                     Err(e) if e.is::<DivergentReseed>() => {
                         error!(%e, "terminal divergence on re-seed");
+                        self.metrics.record_terminal_state();
                         return RunEnd::Terminal(e);
                     }
                     Err(e) => Err(StreamError::Other(e)),
                     Ok(()) => {
+                        // Only a re-seed that replaced the buffer restarted
+                        // anything; a failed one falls back to the ladder.
+                        self.metrics.record_session_restart(SessionRestart::Reset);
                         base = self.get_chain_ref(|c| c.get_header().block_ref());
                         info!(block = base.number, hash = %base.hash, "restarted data ingestion");
                         self.ingest_session(&base, &mut first_block_ingested, &mut finalized_max)
@@ -480,6 +531,7 @@ impl<S: DataSource> DataService<S> {
                             "head stream ended before the first block was ingested"
                         ));
                     }
+                    self.metrics.record_session_restart(SessionRestart::Error);
                     let head = self.get_chain_ref(|c| c.get_header().block_ref());
                     stacked = if head.number == base.number {
                         stacked + 1
@@ -487,6 +539,8 @@ impl<S: DataSource> DataService<S> {
                         0
                     };
                     base = head;
+                    self.metrics
+                        .note_session_end(stacked, Some("stream ended without an error"));
                     let pause = if stacked > 1 { 30 } else { 0 };
                     error!(
                         "data ingestion terminated, will restart in {} seconds",
@@ -503,6 +557,11 @@ impl<S: DataSource> DataService<S> {
                     let fork_base = self.get_chain_ref(|c| c.get_fork_base(&previous_blocks));
                     match fork_base {
                         Some(fb) => {
+                            // Only here: a fork the buffer cannot rebase onto
+                            // ends the run, and nothing restarts.
+                            self.metrics.record_session_restart(SessionRestart::Fork);
+                            self.metrics.record_fork_rebase();
+                            self.metrics.note_session_end(0, None);
                             info!(
                                 fork_base_number = fb.number,
                                 fork_base_hash = %fb.hash,
@@ -514,6 +573,7 @@ impl<S: DataSource> DataService<S> {
                         None => {
                             // FM-30: divergence at or below the finalized head.
                             let finalized = self.get_finalized_head();
+                            self.metrics.record_terminal_state();
                             error!(
                                 finalized_head_number = finalized.number,
                                 finalized_head_hash = %finalized.hash,
@@ -541,6 +601,7 @@ impl<S: DataSource> DataService<S> {
                             err.context("first ingestion session died before its first block"),
                         );
                     }
+                    self.metrics.record_session_restart(SessionRestart::Error);
                     let head = self.get_chain_ref(|c| c.get_header().block_ref());
                     stacked = if head.number == base.number {
                         stacked + 1
@@ -548,6 +609,8 @@ impl<S: DataSource> DataService<S> {
                         0
                     };
                     base = head;
+                    self.metrics
+                        .note_session_end(stacked, Some(&err.to_string()));
                     let pause = if stacked > 1 { 30u64 } else { 0 };
                     error!(%err, "data ingestion terminated, will restart in {} seconds", pause);
                     if pause > 0 {
@@ -633,9 +696,14 @@ impl<S: DataSource> DataService<S> {
                     }
                     Err(e) => {
                         chain.rollback_batch();
+                        self.metrics.record_integrity_violation();
                         return Err(e);
                     }
                 };
+
+                // OB-2 counts the batch, not the blocks: an all-duplicate
+                // batch is still ingestion working.
+                self.metrics.record_commit();
 
                 // At-least-once delivery admits a non-empty batch made only of
                 // absorbed redeliveries. It commits no new head and cannot
@@ -649,8 +717,15 @@ impl<S: DataSource> DataService<S> {
                     }
                 }
 
-                if !chain.compact() {
-                    error!("block finalization lags behind and prevents cache purging");
+                let compaction = chain.compact();
+                if let Some(past) = compaction.force_advanced_past {
+                    self.metrics.record_force_advance(past);
+                }
+                if !compaction.within_window() {
+                    error!(
+                        excess = compaction.excess,
+                        "block finalization lags behind and prevents cache purging"
+                    );
                 }
 
                 self.trigger_update_locked(chain);
@@ -784,6 +859,7 @@ impl<S: DataSource> DataService<S> {
         self.metrics
             .set_finalized_block(chain.get_finalized_head().number);
         self.metrics.set_stored_blocks(chain.size());
+        self.metrics.set_window_excess(chain.window_excess());
 
         let _ = self.block_watch_tx.send(last.number);
     }
@@ -801,53 +877,67 @@ impl<S: DataSource> DataService<S> {
     /// in-range queries serve from cache (waiting up to 5s if needed).
     ///
     /// Mirrors `DataService.query` in data-service.ts.
+    /// The verdict and the OB-5 class it falls in, counted by neither: RP-13's
+    /// outcome is only settled once the first record exists, which happens on
+    /// the response path. `record_query_outcome` closes it there.
     pub async fn query(
         &self,
         from: u64,
         parent_hash: Option<&str>,
-    ) -> Result<DataResponse, QueryError> {
+    ) -> Result<QueryOutcome, QueryError> {
+        self.classify_query(from, parent_hash)
+            .await
+            .map(|(response, class)| QueryOutcome { response, class })
+    }
+
+    /// Settle one query's OB-5 outcome. `elapsed` runs from admission, so it
+    /// covers producing the first record and not just reaching the verdict.
+    pub fn record_query_outcome(&self, class: QueryClass, elapsed: std::time::Duration) {
+        // `queries_total` keeps the predecessor's three values (REQ-24);
+        // OB-5's classes are the finer split beside it.
+        let compat = match class {
+            QueryClass::Backfill => "backfill",
+            QueryClass::Window | QueryClass::WaitEmpty => "cache",
+            QueryClass::Conflict | QueryClass::Error => "error",
+        };
+        self.metrics.inc_query(compat);
+        self.metrics.record_query(class, elapsed);
+    }
+
+    /// The query itself, paired with the OB-5 class its verdict falls in.
+    async fn classify_query(
+        &self,
+        from: u64,
+        parent_hash: Option<&str>,
+    ) -> Result<(DataResponse, QueryClass), QueryError> {
         let below_window = self.get_chain_ref(|c| {
             let first = c.first_block();
             first.parent_number != first.number && from <= first.parent_number
         });
 
-        let result = if below_window {
-            let res = self.below_query(from, parent_hash).await;
-            match &res {
-                Err(_) => self.metrics.inc_query("error"),
-                Ok(_) => self.metrics.inc_query("backfill"),
+        if below_window {
+            return self
+                .below_query(from, parent_hash)
+                .await
+                .map(|response| (response, QueryClass::Backfill));
+        }
+
+        // Try cache first.
+        match self.get_chain_ref(|c| c.query(from, parent_hash))? {
+            resp if resp.tail.is_some() => Ok((resp, QueryClass::Window)),
+            _ => {
+                // Block not yet available — wait up to 5s.
+                self.wait_for_block(from).await;
+                let resp = self.get_chain_ref(|c| c.query(from, parent_hash))?;
+                // RP-12: an expired wait is a distinct outcome from a window.
+                let class = if resp.tail.is_some() {
+                    QueryClass::Window
+                } else {
+                    QueryClass::WaitEmpty
+                };
+                Ok((resp, class))
             }
-            return res;
-        } else {
-            // Try cache first.
-            let res = self.get_chain_ref(|c| c.query(from, parent_hash));
-            match res {
-                Err(invalid) => {
-                    self.metrics.inc_query("error");
-                    return Err(invalid.into());
-                }
-                Ok(resp) if resp.tail.is_some() => {
-                    self.metrics.inc_query("cache");
-                    return Ok(resp);
-                }
-                Ok(_) => {
-                    // Block not yet available — wait up to 5s.
-                    self.wait_for_block(from).await;
-                    let res2 = self.get_chain_ref(|c| c.query(from, parent_hash));
-                    match res2 {
-                        Err(invalid) => {
-                            self.metrics.inc_query("error");
-                            Err(invalid.into())
-                        }
-                        Ok(r) => {
-                            self.metrics.inc_query("cache");
-                            Ok(r)
-                        }
-                    }
-                }
-            }
-        };
-        result
+        }
     }
 
     /// Wait until `block_number` is available in the chain, or 5 seconds pass.
@@ -945,7 +1035,7 @@ impl<S: DataSource> DataService<S> {
 
                 // Yield first batch.
                 for block in first_batch.blocks.iter() {
-                    assert_chain_continuity(ph_clone.as_deref(), prev.as_ref(), block);
+                    check_chain_continuity(ph_clone.as_deref(), prev.as_ref(), block)?;
                     prev = Some(block.clone());
                 }
                 yield first_batch.blocks.clone();
@@ -955,20 +1045,24 @@ impl<S: DataSource> DataService<S> {
                 while let Some(item) = remaining.next().await {
                     let batch = item.map_err(|e| anyhow::anyhow!("{e}"))?;
                     for block in batch.blocks.iter() {
-                        assert_chain_continuity(ph_clone.as_deref(), prev.as_ref(), block);
+                        check_chain_continuity(ph_clone.as_deref(), prev.as_ref(), block)?;
                         prev = Some(block.clone());
                     }
                     yield batch.blocks;
                 }
 
-                // Assert continuity with the snapshot tail.
-                assert!(prev.is_some(), "at least one block was expected");
+                // Continuity with the snapshot tail closes the splice.
+                if prev.is_none() {
+                    Err(anyhow::anyhow!(
+                        "below-query stream ended without delivering a block"
+                    ))?;
+                }
                 if let Some(first_tail) = tail_for_stream.first() {
-                    assert_chain_continuity(
+                    check_chain_continuity(
                         ph_clone.as_deref(),
                         prev.as_ref(),
                         first_tail,
-                    );
+                    )?;
                 }
             })
         };
@@ -1015,11 +1109,25 @@ fn log_block_info(block: &BlockHeader, msg: &str) {
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn assert_chain_continuity(parent_hash: Option<&str>, prev: Option<&Block>, next: &Block) {
+/// A continuity break mid-backfill is a source fault, not a defect: it reaches
+/// the response as a countable stream error, not a panic dropping the body.
+fn check_chain_continuity(
+    parent_hash: Option<&str>,
+    prev: Option<&Block>,
+    next: &Block,
+) -> anyhow::Result<()> {
     let ok = match (prev, parent_hash) {
         (Some(p), _) => p.number == next.parent_number && p.hash == next.parent_hash,
         (None, Some(ph)) => ph == next.parent_hash,
         (None, None) => true,
     };
-    assert!(ok, "chain continuity was violated by the data source");
+    anyhow::ensure!(
+        ok,
+        "chain continuity was violated by the data source at {}#{} (parent {}#{})",
+        next.number,
+        next.hash,
+        next.parent_number,
+        next.parent_hash
+    );
+    Ok(())
 }

@@ -222,9 +222,10 @@ shows no diffs outside the enumerated list.
 The service exposes machine-readable metrics, a liveness probe, and a readiness probe
 that reflects "caught up to the upstream head". All signals of 12 are present and
 truthful (a registered signal that cannot move is a defect).
+Process- and runtime-level metrics are outside this service's scope.
 *Acceptance:* 12's property→observable table is fully decidable from the scrape
 surface; OB conformance checks (CT-5) pass.
-*Trace:* OB-1..; INV-30; GAP-24, GAP-25.
+*Trace:* OB-1..; INV-30; IB-12; retired GAP-4, GAP-24, GAP-25.
 
 **REQ-31 — Bounded log volume.** [SHOULD]
 Steady-state operation emits at most `P-LOG-RATE-STEADY` log records per ingested

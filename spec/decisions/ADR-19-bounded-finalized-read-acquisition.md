@@ -29,9 +29,10 @@ remain ⚠ under ADR-13.
 Exhaustion names the block and ends the stream. Before the first response frame,
 `below_query` maps that failure to INTERNAL (HTTP 500). After a valid prefix has already
 been emitted, the wire format cannot carry an in-band error: HTTP remains 200 and ends
-at a frame boundary, which clients resume from per ADR-10. The server logs the cause,
-but the missing alarm/counter remains GAP-22; closing GAP-11 deliberately widened that
-gap from continuity failures to bounded acquisition failures after a prefix.
+at a frame boundary, which clients resume from per ADR-10. Closing GAP-11 widened that
+path from continuity failures to bounded acquisition failures after a prefix; both now
+raise OB-5's `error` truncation counter, which is the server-side alarm INV-27 owes
+once in-band signalling is gone (GAP-22).
 
 When the polled finalized head is still below the requested start, no acquisition
 obligation exists. Finalized poll mode keeps waiting at its 100 ms cadence and does not
@@ -42,8 +43,8 @@ spin or a synthetic acquisition error.
 That precondition is a hard internal assertion, not a recoverable stream error. If a
 future call site violates it, unwinding ends the task polling the stream instead of
 producing the HTTP 500 described above: before the first frame the client loses the
-request without that response, and after a prefix it observes a truncated 200. This is
-the same unalarmed task-failure class tracked by GAP-22. The assertion is reserved for
+request without that response, and after a prefix it observes a truncated 200 that no
+counter reaches, since the counting path unwound with it. The assertion is reserved for
 a caller bug; ordinary missing or incoherent upstream data follows the named-error path.
 
 Rejected: preserve indefinite polling below a reported finalized head. It tolerates an

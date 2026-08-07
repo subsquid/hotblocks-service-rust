@@ -85,6 +85,7 @@ async fn drive_sut(
         .query(seed.number, None)
         .await
         .expect("the buffer must stay servable")
+        .response
         .tail
         .expect("a window query returns the snapshot");
     let observed = Observed {

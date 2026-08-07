@@ -9,9 +9,11 @@ pub mod fetch;
 pub mod ingest;
 pub mod mapping;
 pub mod normalization;
+pub mod observability;
 pub mod rpc_data;
 pub mod source;
 pub mod types;
 pub mod verification;
 
+pub use observability::MetricsRpcObserver;
 pub use source::{EvmRpcDataSource, EvmRpcDataSourceOptions};

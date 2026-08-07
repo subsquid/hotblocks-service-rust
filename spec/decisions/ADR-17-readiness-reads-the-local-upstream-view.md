@@ -39,9 +39,10 @@ once per block, so the view is fresher than a block time; under an unhealthy one
 `P-STALL-ALARM` floor flips readiness off before the stall alarm's own threshold
 elapses, which is the behavior a router wants anyway.
 
-This binds readiness to an observable the implementation does not expose yet: GAP-25
-tracks the missing upstream-head view, so the change lands with OB-4's gauge or not
-at all.
+This binds readiness to an observable the implementation exposes since GAP-25 closed
+(2026-08-07): the upstream head and finalized views carry the observation timestamps
+the staleness floor reads. Only the probe's own switch away from a per-request
+upstream call is left (GAP-34).
 
 Rejected: caching the probe result with a short TTL. It keeps the upstream call, keeps
 the failure mode, and adds a second staleness parameter to reason about.

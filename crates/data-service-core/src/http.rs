@@ -1,9 +1,9 @@
 //! Axum HTTP application — exact port of `http-app.ts`.
 
-use crate::metrics::get_block_ingestion_timestamp;
+use crate::metrics::{get_block_ingestion_timestamp, QueryClass, TruncationCause};
 use crate::service::DataService;
 use crate::source::DataSource;
-use crate::types::{Block, DataResponse, InvalidBaseBlock, QueryError};
+use crate::types::{Block, InvalidBaseBlock, QueryError};
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -63,9 +63,24 @@ pub fn build_router<S: DataSource>(service: Arc<DataService<S>>) -> Router {
         .route("/metrics", get(handle_metrics::<S>))
         .route("/metrics/{name}", get(handle_metrics_name::<S>))
         .route("/block-time/{height}", get(handle_block_time::<S>))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&service),
+            note_acceptance::<S>,
+        ))
         .with_state(service)
         // Enforce a 1024-byte body limit on POST /stream.
         .layer(axum::extract::DefaultBodyLimit::max(1024))
+}
+
+/// OB-9's first-acceptance timestamp: the moment a request was answered, which
+/// is what LIV-5 bounds. Binding the listener proves nothing about reachability.
+async fn note_acceptance<S: DataSource>(
+    State(state): State<SharedService<S>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    state.metrics.record_first_acceptance();
+    next.run(request).await
 }
 
 // ---------------------------------------------------------------------------
@@ -199,17 +214,24 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
         )
         .await;
 
-    let data_response: DataResponse = match result {
+    // Settling the outcome only where the request actually ends keeps a query
+    // that 500s off the success counters (OB-5) and puts the whole admission
+    // window, first record included, in its duration.
+    let settle = |class: QueryClass| state.record_query_outcome(class, start.elapsed());
+
+    let (data_response, class) = match result {
         Err(QueryError::InvalidBaseBlock(InvalidBaseBlock { prev })) => {
+            settle(QueryClass::Conflict);
             return (
                 StatusCode::CONFLICT,
                 Json(PreviousBlocksResponse {
                     previous_blocks: prev,
                 }),
             )
-                .into_response()
+                .into_response();
         }
         Err(QueryError::Internal(e)) => {
+            settle(QueryClass::Error);
             tracing::error!(%e, "internal error while servicing /stream query");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -217,7 +239,7 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
             )
                 .into_response();
         }
-        Ok(r) => r,
+        Ok(outcome) => (outcome.response, outcome.class),
     };
 
     // Build response headers.
@@ -242,10 +264,42 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
             .unwrap_or(false);
 
     if !has_content {
+        settle(QueryClass::WaitEmpty);
         return (StatusCode::NO_CONTENT, resp_headers).into_response();
     }
 
     let use_zstd = accept_encoding.contains("zstd");
+    let mut frames = frame_stream(
+        data_response.head,
+        data_response.tail.unwrap_or_default(),
+        use_zstd,
+    );
+
+    // RP-13 owes INTERNAL for a failure before the first record, and once 200
+    // is on the wire that can no longer be said — so the first frame is
+    // produced before the status is chosen. RP-20 keeps the budget out of it:
+    // a bound reached before any record is the empty form, not a failure.
+    let budget = max_duration.saturating_sub(start.elapsed());
+    let first = match tokio::time::timeout(budget, frames.next()).await {
+        Ok(Some(Ok(frame))) => Some(frame),
+        Ok(Some(Err(e))) => {
+            settle(QueryClass::Error);
+            tracing::error!(%e, "query failed before its first record");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Internal server error\n\n{e:#}"),
+            )
+                .into_response();
+        }
+        Ok(None) | Err(_) => None,
+    };
+    let Some(first) = first else {
+        // Nothing was produced, so whatever the path, the outcome is RP-12's
+        // empty form rather than the class that path would have served.
+        settle(QueryClass::WaitEmpty);
+        return (StatusCode::NO_CONTENT, resp_headers).into_response();
+    };
+    settle(class);
 
     resp_headers.insert(
         "content-type",
@@ -259,96 +313,37 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
 
     // Stream blocks via a channel.
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
-
-    let head = data_response.head;
-    let tail = data_response.tail.unwrap_or_default();
+    let metrics = Arc::clone(&state.metrics);
 
     tokio::spawn(async move {
-        // Helper: encode a single block payload.
-        async fn encode_block(block: &Block, use_zstd: bool) -> anyhow::Result<Bytes> {
-            if use_zstd {
-                Ok(block.json_line_zstd.clone())
-            } else {
-                // Decompress zstd, then recompress gzip level 1.
-                let raw = tokio::task::spawn_blocking({
-                    let zstd_bytes = block.json_line_zstd.clone();
-                    move || zstd::decode_all(std::io::Cursor::new(zstd_bytes.as_ref()))
-                })
-                .await??;
+        // Past the first record the status is committed, so every exit below is
+        // a truncation (RP-12) and its counter is the only server-side alarm an
+        // error still gets (INV-27). Each send carries one whole frame, so the
+        // body ends on a record boundary whatever the cause.
+        let truncate = |cause: TruncationCause| metrics.record_truncation(cause);
 
-                let gz = tokio::task::spawn_blocking(move || {
-                    let mut enc = GzEncoder::new(Vec::new(), Compression::new(1));
-                    enc.write_all(&raw)?;
-                    enc.finish()
-                })
-                .await??;
-
-                Ok(Bytes::from(gz))
-            }
-        }
-
-        // Head batches (backfill stream).
-        if let Some(mut head_stream) = head {
-            while let Some(batch_result) = head_stream.next().await {
-                let blocks = match batch_result {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::error!(%e, "head stream error during HTTP stream");
-                        return;
-                    }
-                };
-                for block in &blocks {
+        let mut pending = Some(first);
+        loop {
+            let frame = match pending.take() {
+                Some(frame) => frame,
+                None => {
                     if start.elapsed() > max_duration {
-                        return;
+                        return truncate(TruncationCause::Budget);
                     }
-                    match encode_block(block, use_zstd).await {
-                        Ok(payload) => {
-                            if tx.send(Ok(payload)).await.is_err() {
-                                return; // Client disconnected.
-                            }
-                            tracing::debug!(
-                                stage = "block-served",
-                                source = "head",
-                                block_number = block.number,
-                                block_hash = %block.hash,
-                                "block served {}#{}", block.number, block.hash
-                            );
+                    match frames.next().await {
+                        None => return,
+                        Some(Err(e)) => {
+                            tracing::error!(%e, "query failed after its first record");
+                            return truncate(TruncationCause::Error);
                         }
-                        Err(e) => {
-                            tracing::error!(%e, "encoding error");
-                            return;
-                        }
+                        Some(Ok(frame)) => frame,
                     }
                 }
-                if start.elapsed() > max_duration {
-                    return;
-                }
+            };
+            if tx.send(Ok(frame.bytes.clone())).await.is_err() {
+                return truncate(TruncationCause::Disconnect);
             }
-        }
-
-        // Tail blocks (snapshot).
-        for block in &tail {
-            if start.elapsed() > max_duration {
-                return;
-            }
-            match encode_block(block, use_zstd).await {
-                Ok(payload) => {
-                    if tx.send(Ok(payload)).await.is_err() {
-                        return;
-                    }
-                    tracing::debug!(
-                        stage = "block-served",
-                        source = "tail",
-                        block_number = block.number,
-                        block_hash = %block.hash,
-                        "block served {}#{}", block.number, block.hash
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(%e, "encoding error");
-                    return;
-                }
-            }
+            frame.note_served();
         }
     });
 
@@ -357,4 +352,81 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
     let body = Body::from_stream(stream);
 
     (StatusCode::OK, resp_headers, body).into_response()
+}
+
+/// One record, encoded, still carrying what it is: the "served" log belongs
+/// after the send, and only the frame knows which block it holds.
+struct Frame {
+    bytes: Bytes,
+    number: u64,
+    hash: String,
+    source: &'static str,
+}
+
+impl Frame {
+    fn note_served(&self) {
+        tracing::debug!(
+            stage = "block-served",
+            source = self.source,
+            block_number = self.number,
+            block_hash = %self.hash,
+            "block served {}#{}", self.number, self.hash
+        );
+    }
+}
+
+/// The body as a sequence of whole frames, one per record (REQ-6): the
+/// backfill prefix first, then the snapshot tail it splices onto.
+fn frame_stream(
+    head: Option<futures::stream::BoxStream<'static, anyhow::Result<Vec<Block>>>>,
+    tail: Vec<Block>,
+    use_zstd: bool,
+) -> futures::stream::BoxStream<'static, anyhow::Result<Frame>> {
+    Box::pin(async_stream::try_stream! {
+        if let Some(mut head) = head {
+            while let Some(batch) = head.next().await {
+                for block in batch? {
+                    yield encode_frame(&block, use_zstd, "head").await?;
+                }
+            }
+        }
+        for block in tail {
+            yield encode_frame(&block, use_zstd, "tail").await?;
+        }
+    })
+}
+
+async fn encode_frame(
+    block: &Block,
+    use_zstd: bool,
+    source: &'static str,
+) -> anyhow::Result<Frame> {
+    Ok(Frame {
+        bytes: encode_block(block, use_zstd).await?,
+        number: block.number,
+        hash: block.hash.clone(),
+        source,
+    })
+}
+
+/// Stored zstd frames pass through; anything else is re-encoded as one gzip
+/// member, so a record is still exactly one independently decodable unit.
+async fn encode_block(block: &Block, use_zstd: bool) -> anyhow::Result<Bytes> {
+    if use_zstd {
+        return Ok(block.json_line_zstd.clone());
+    }
+    let raw = tokio::task::spawn_blocking({
+        let zstd_bytes = block.json_line_zstd.clone();
+        move || zstd::decode_all(std::io::Cursor::new(zstd_bytes.as_ref()))
+    })
+    .await??;
+
+    let gz = tokio::task::spawn_blocking(move || {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::new(1));
+        enc.write_all(&raw)?;
+        enc.finish()
+    })
+    .await??;
+
+    Ok(Bytes::from(gz))
 }

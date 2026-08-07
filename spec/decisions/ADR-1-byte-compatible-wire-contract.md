@@ -21,7 +21,10 @@ behavior not stated elsewhere. Mechanisms: JSON key order preserved to match JS
 object insertion order; serde field order matched to TS output; per-block independent
 compression frames kept because clients rely on them. Deliberate divergences are
 enumerated (welcome text fixed, `--http-retry-internal-server-errors` actually
-honored) and anything else that differs is a defect.
+honored, `sqd_hotblocks_active_workers` removed as a gauge ADR-3 left unable to move)
+and anything else that differs is a defect. The metric surface is additive beyond
+that: the OB series of IB-12 the predecessor never had cannot break a client, so
+HC-8 diffs the predecessor's families rather than the whole surface.
 
 ## Consequences
 

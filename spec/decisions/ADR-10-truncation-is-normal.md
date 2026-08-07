@@ -24,5 +24,5 @@ causes are alarmed on the observability surface instead.
 Client logic stays a single resume loop (REQ-1, RP-5, RP-12); the serving path needs
 no trailer/framing protocol. Cost: a client cannot distinguish a healthy short
 response from a server-side failure mid-stream — acceptable because the resume loop
-self-heals, but it makes server-side truncation observability mandatory (OB-5
-truncation counters; GAP-22 tracks today's alarm-less panic truncation).
+self-heals, but it makes server-side truncation observability mandatory. OB-5's
+counters split it by cause (budget, error, disconnect) since GAP-22 closed.

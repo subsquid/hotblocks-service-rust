@@ -31,7 +31,7 @@ others later) plug in as acquisition adapters whose upstream binding lives in
 | [13-conformance-tdd.md](13-conformance-tdd.md) | reference model, `CT-n`, matrix, `GAP-n`, `MG-n`, `HC-n` | **mutable** |
 | [14-interface-binding.md](14-interface-binding.md) | HTTP wire contract, CLI, upstream binding `IB-n` | yes |
 | [15-parameters.md](15-parameters.md) | parameter registry (`P-*`, `W-*` values) | **mutable** |
-| decisions/ | ADR log, one file per decision | append-only |
+| decisions/ | ADR log, one file per decision | **mutable** |
 
 ## Conventions
 
@@ -54,10 +54,13 @@ others later) plug in as acquisition adapters whose upstream binding lives in
 - **Invariant scopes**: `[state]` holds in every observable state; `[transition]`
   relates consecutive states; `[response]` holds of every response; `[recovery]` holds
   across restart.
-- **Mutability rule**: only two documents ever change without a change of intent —
-  13 (statuses, matrix, gap register) and 15 (observed/target values). `decisions/` only
-  gains files; an accepted ADR is never edited except to mark it superseded. Every other
-  document changes only when *intended behavior* changes.
+- **Mutability rule**: only these change without a change of intent — 13 (statuses,
+  matrix, gap register), 15 (observed/target values), and `decisions/`. An accepted ADR
+  keeps its decision, but its Context and Consequences are corrected in place when
+  reality moves under them: an ADR whose consequences still describe a gap that has
+  since closed misleads every later reader, and superseding the whole decision to fix
+  one sentence buries it. A change of *decision* still needs a new ADR marking the old
+  one superseded. Every other document changes only when *intended behavior* changes.
 
 ## How to use this suite
 

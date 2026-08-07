@@ -136,6 +136,7 @@ async fn test_head_endpoint() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     };
     let handle = run_data_service(opts).await.unwrap();
     let port = handle.port;
@@ -162,6 +163,7 @@ async fn test_root_endpoint() {
         block_cache_size: 100,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -187,6 +189,7 @@ async fn test_stream_zstd_response() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -245,6 +248,7 @@ async fn test_stream_gzip_response() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -304,6 +308,7 @@ async fn test_stream_409_invalid_base_block() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -337,6 +342,7 @@ async fn test_stream_400_bad_request() {
         block_cache_size: 100,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -364,6 +370,7 @@ async fn test_metrics_endpoint() {
         block_cache_size: 100,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -396,6 +403,7 @@ async fn metrics_json_endpoint_returns_structured_families() {
         block_cache_size: 100,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -437,6 +445,7 @@ async fn oversized_stream_request_returns_413() {
         block_cache_size: 100,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -465,6 +474,7 @@ async fn test_block_time_endpoint() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -571,6 +581,7 @@ async fn test_stream_500_on_backfill_error() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -610,6 +621,7 @@ async fn empty_backfill_returns_500_instead_of_an_empty_conflict() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -645,6 +657,7 @@ async fn empty_backfill_fork_returns_500_instead_of_an_empty_conflict() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -729,6 +742,7 @@ async fn test_shutdown_completes_promptly() {
         block_cache_size: 100,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -846,6 +860,7 @@ async fn test_end_to_end_fork_recovery() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();

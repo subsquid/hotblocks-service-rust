@@ -79,6 +79,7 @@ async fn assert_startup_failure(replay_seed: bool) {
         block_cache_size: 10,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -703,7 +704,10 @@ async fn buffered_root_query_does_not_open_backfill() {
 
     svc.init().await.unwrap();
     let response = svc.query(0, None).await.expect("root is cache-servable");
-    let tail = response.tail.expect("root query returns cached data");
+    let tail = response
+        .response
+        .tail
+        .expect("root query returns cached data");
 
     assert_eq!(tail.len(), 1);
     assert_eq!(tail[0].number, 0);
@@ -775,6 +779,7 @@ async fn sub_finality_fork_ends_the_run_terminally() {
         block_cache_size: 10,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();

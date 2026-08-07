@@ -120,8 +120,8 @@ conflicts and errors need not.
 head (OB-4) to the buffered head and reports true iff `buffered ≥ observed` and the
 observation is younger than `P-STALL-ALARM`; a stale view reports not-ready. The probe
 is a local read — it never calls upstream and never reports an internal error, since
-its consumers are routers (ADR-17 ⚠ pending ratification; it lands with OB-4's gauge,
-GAP-25, and until then the service still probes per request — GAP-34). Liveness is
+its consumers are routers (ADR-17 ⚠ pending ratification; OB-4's view now exists, so
+only the probe's own switch to it is left — GAP-34). Liveness is
 unconditional while the process serves at all.
 
 **RP-11 — The base check.** [MUST] When the client supplies `parentHash` and `from`

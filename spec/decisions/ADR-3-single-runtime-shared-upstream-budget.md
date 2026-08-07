@@ -26,4 +26,4 @@ teardown is by structured cancellation instead of a worker-close protocol. Trade
 accepted: backfill and head-following now compete for one budget with no priority
 mechanism — the head path can be starved by query-driven acquisition (HZ-1);
 a priority lever remains future work. The predecessor's `active_workers` gauge became
-meaningless (GAP-24).
+meaningless and was removed with GAP-24, as an enumerated ADR-1 divergence.
