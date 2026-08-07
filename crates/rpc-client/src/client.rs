@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::warn;
 
 use crate::error::{RpcError, RpcErrorInfo};
+use crate::observer::{RequestKind, RpcObserver};
 use crate::rate::RateMeter;
 use crate::transport::ws::{WsTransport, DEFAULT_POOL_SIZE};
 use crate::transport::{HttpTransport, OwnedRpcRequest, RpcResponse, RpcTransport};
@@ -106,6 +107,7 @@ pub struct RpcClient {
     semaphore: Arc<Semaphore>,
     counter: Arc<AtomicU64>,
     rate: Option<Arc<Mutex<RateState>>>,
+    observer: Option<Arc<dyn RpcObserver>>,
 }
 
 impl RpcClient {
@@ -161,7 +163,20 @@ impl RpcClient {
             counter: Arc::new(AtomicU64::new(0)),
             rate,
             config: Arc::new(config),
+            observer: None,
         })
+    }
+
+    /// Report every round trip, error and retry to `observer` (OB-4).
+    pub fn with_observer(mut self, observer: Arc<dyn RpcObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    fn observed(&self, report: impl FnOnce(&dyn RpcObserver)) {
+        if let Some(observer) = &self.observer {
+            report(observer.as_ref());
+        }
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -200,6 +215,7 @@ impl RpcClient {
                         && e.is_retryable(self.config.retry_internal_server_errors) =>
                 {
                     let pause = retry_pause(&self.config.retry_schedule, attempt);
+                    self.observed(|o| o.on_retry(&e));
                     warn!(
                         method,
                         pause_ms = pause.as_millis(),
@@ -210,6 +226,7 @@ impl RpcClient {
                     attempt += 1;
                 }
                 Err(e) => {
+                    self.observed(|o| o.on_error(&e));
                     if attempt > 0 {
                         return Err(RpcError::RetryExhausted(Box::new(e)));
                     }
@@ -271,6 +288,7 @@ impl RpcClient {
             params: params.cloned(),
         };
 
+        self.observed(|o| o.on_request(RequestKind::Single, 1));
         let resp = self.transport.send_single(req, timeout).await?;
         self.process_response(resp, options)
     }
@@ -304,6 +322,7 @@ impl RpcClient {
                         && e.is_retryable(self.config.retry_internal_server_errors) =>
                 {
                     let pause = retry_pause(&self.config.retry_schedule, attempt);
+                    self.observed(|o| o.on_retry(&e));
                     warn!(
                         pause_ms = pause.as_millis(),
                         attempt, "RPC batch failed, retrying"
@@ -312,6 +331,7 @@ impl RpcClient {
                     attempt += 1;
                 }
                 Err(e) => {
+                    self.observed(|o| o.on_error(&e));
                     if attempt > 0 {
                         return Err(RpcError::RetryExhausted(Box::new(e)));
                     }
@@ -342,14 +362,23 @@ impl RpcClient {
             })
             .collect();
 
+        self.observed(|o| o.on_request(RequestKind::Batch, count));
         // The transport returns responses in request order (HTTP reorders via an
         // id→response map + length check; WS guarantees order by construction).
         let responses = self.transport.send_batch(requests, timeout).await?;
 
-        let results = responses
+        let results: Vec<_> = responses
             .into_iter()
             .map(|resp| self.process_response(resp, options))
             .collect();
+
+        // A per-item failure never reaches the retry ladder — the request
+        // itself succeeded — so it is counted here or nowhere.
+        for result in &results {
+            if let Err(e) = result {
+                self.observed(|o| o.on_error(e));
+            }
+        }
 
         Ok(results)
     }
@@ -415,12 +444,16 @@ impl RpcClient {
         match result {
             Ok(v) => return Ok(v),
             Err(ref e) if e.is_retryable_batch(self.config.retry_internal_server_errors) => {
+                self.observed(|o| o.on_retry(e));
                 warn!(
                     batch_size = calls.len(),
                     "RPC batch failed, retrying with reduced batch"
                 );
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                self.observed(|o| o.on_error(&e));
+                return Err(e);
+            }
         }
 
         let mid = calls.len().div_ceil(2);

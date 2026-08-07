@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use data_service_core::service::{run_data_service, DataServiceOptions, RunEnd};
+use data_service_core::Metrics;
 use evm_source::fetch::{CallFrameValidationMode, RpcOptions};
+use evm_source::observability::MetricsRpcObserver;
 use evm_source::source::{EvmRpcDataSource, EvmRpcDataSourceOptions};
 use evm_source::types::DataRequest;
 use rpc_client::{RpcClient, RpcClientConfig};
@@ -243,22 +245,29 @@ async fn main() -> anyhow::Result<()> {
     let rpc_options = args.rpc_options();
     rpc_options.validate()?;
 
-    let client = Arc::new(RpcClient::new(RpcClientConfig {
-        url: args.http_rpc,
-        max_batch_call_size: args.http_rpc_max_batch_call_size,
-        capacity: usize::MAX,
-        rate_limit: args.http_rpc_rate_limit,
-        request_timeout: Duration::from_millis(args.http_rpc_timeout),
-        retry_attempts: 5,
-        retry_schedule: vec![10, 100, 500, 2000, 10000, 20000]
-            .into_iter()
-            .map(Duration::from_millis)
-            .collect(),
-        retry_internal_server_errors: args.http_retry_internal_server_errors,
-        ws_pool_size: None,
-    }));
+    // One registry per process: OB-4 counters and buffer state levels must
+    // land on the same scrape.
+    let metrics = Arc::new(Metrics::new());
 
-    let source = EvmRpcDataSource::new(
+    let client = Arc::new(
+        RpcClient::new(RpcClientConfig {
+            url: args.http_rpc,
+            max_batch_call_size: args.http_rpc_max_batch_call_size,
+            capacity: usize::MAX,
+            rate_limit: args.http_rpc_rate_limit,
+            request_timeout: Duration::from_millis(args.http_rpc_timeout),
+            retry_attempts: 5,
+            retry_schedule: vec![10, 100, 500, 2000, 10000, 20000]
+                .into_iter()
+                .map(Duration::from_millis)
+                .collect(),
+            retry_internal_server_errors: args.http_retry_internal_server_errors,
+            ws_pool_size: None,
+        })
+        .with_observer(Arc::new(MetricsRpcObserver::new(Arc::clone(&metrics)))),
+    );
+
+    let source = EvmRpcDataSource::with_metrics(
         client,
         EvmRpcDataSourceOptions {
             rpc_options,
@@ -276,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
             stride_concurrency: args.http_rpc_stride_concurrency,
             profile_block_timings: args.profile_block_timings,
         },
+        Arc::clone(&metrics),
     );
 
     let mut handle = run_data_service(DataServiceOptions {
@@ -283,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
         block_cache_size: args.block_cache_size.get(),
         port: args.port,
         auto_adjust_finalized_head: args.auto_adjust_finalized_head,
+        metrics: Some(metrics),
     })
     .await?;
 

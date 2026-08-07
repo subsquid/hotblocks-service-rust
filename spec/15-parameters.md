@@ -25,7 +25,7 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 | P-STALL-FREE-RETRIES | stalled-session restarts before backoff (WP-9) | 1 | — |
 | P-SESSION-BACKOFF | delay between stalled sessions | 30 s | — |
 | P-STALL-REINIT | stalled sessions before T1 re-seed | 6 (code gate `stalled > 5`) | — |
-| P-STALL-ALARM | zero-progress time before the stall alarm level (LIV-2); also the readiness staleness floor (RP-10) | ⊥ not implemented (GAP-4) | ⚠ 60 s |
+| P-STALL-ALARM | zero-progress time before the stall alarm level (LIV-2); also the readiness staleness floor (RP-10) | 60 s: the level flips while the observed upstream head is above the committed head, timed from whichever came later — the last commit, or the moment the upstream got ahead — so an idle stretch before the upstream moved does not count against it. Before the first commit the clock starts at process start | 60 s ⚠ |
 | P-STRIDE-SIZE | acquisition range-batch size (IB-10) | 5 (default) | — |
 | P-STRIDE-CONCURRENCY | concurrent range batches | 5 (default) | — |
 | P-FINALITY-VIEW-TTL | how long the observed upstream finalized head is reused before a background refresh; bounds how stale a stride bound and its report may be (WP-11.6, ADR-6) | 5 s | — |

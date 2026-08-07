@@ -33,6 +33,23 @@ pub enum Push {
     Absorbed,
 }
 
+/// What T5 could do about the window this time (WP-24). Both fields feed OB-6.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Compaction {
+    /// Blocks still above `max_size` — non-zero only when a lagging finalized
+    /// head blocks the trim and auto-adjust is off (INV-4).
+    pub excess: usize,
+    /// Height the finalized head was force-advanced past, if it was.
+    pub force_advanced_past: Option<u64>,
+}
+
+impl Compaction {
+    /// The buffer is inside its window bound.
+    pub fn within_window(&self) -> bool {
+        self.excess == 0
+    }
+}
+
 /// Undo log for the batch currently being applied (WP-5).
 ///
 /// Only the *originals* a truncation removed are saved — blocks the open batch
@@ -246,23 +263,19 @@ impl Chain {
 
     /// Trim old finalized blocks to keep the buffer at or below `max_size`.
     ///
-    /// Returns `true` if the buffer is within bounds (or was trimmed to fit).
-    /// Returns `false` if trimming is blocked by a lagging finalized head and
-    /// `auto_adjust_finalized_head` is disabled.
-    ///
     /// Mirrors `Chain.compact` in chain.ts.
-    pub fn compact(&mut self) -> bool {
+    pub fn compact(&mut self) -> Compaction {
         debug_assert!(
             self.undo.is_none(),
             "compaction shifts the indices an open undo log is written in"
         );
         let extra = self.blocks.len().saturating_sub(self.max_size);
         if extra == 0 {
-            return true;
+            return Compaction::default();
         }
 
-        let mut ok = self.finalized_head >= extra;
-        if !ok && self.auto_adjust_finalized_head {
+        let mut force_advanced_past = None;
+        if self.finalized_head < extra && self.auto_adjust_finalized_head {
             let new_last = &self.blocks[extra - 1];
             tracing::warn!(
                 block_number = new_last.number,
@@ -270,14 +283,17 @@ impl Chain {
                 "finalized head was adjusted automatically to block #{}",
                 new_last.number
             );
+            force_advanced_past = Some(new_last.number);
             self.finalized_head = extra;
-            ok = true;
         }
 
         let trim = extra.min(self.finalized_head);
         self.blocks.drain(..trim);
         self.finalized_head -= trim;
-        ok
+        Compaction {
+            excess: self.blocks.len().saturating_sub(self.max_size),
+            force_advanced_past,
+        }
     }
 
     // ----- queries --------------------------------------------------------
@@ -429,6 +445,11 @@ impl Chain {
 
     pub fn last_block_number(&self) -> u64 {
         self.last_block().number
+    }
+
+    /// Blocks held above the configured window (INV-4).
+    pub fn window_excess(&self) -> usize {
+        self.blocks.len().saturating_sub(self.max_size)
     }
 
     pub fn size(&self) -> usize {
@@ -850,7 +871,7 @@ mod tests {
         })
         .unwrap();
         // size is 10, max_size is 5 → need to trim 5 entries.
-        assert!(c2.compact());
+        assert!(c2.compact().within_window());
         // finalized_head was at index 7; after trimming 5 it should be at 2.
         assert_eq!(c2.first_block_number(), 5);
         let _ = c;
@@ -869,7 +890,10 @@ mod tests {
             .unwrap();
         }
         // finalized head still at 0, size=5 > max=3 → cannot trim.
-        assert!(!c.compact());
+        let compaction = c.compact();
+        assert!(!compaction.within_window());
+        assert_eq!(compaction.excess, 2);
+        assert_eq!(compaction.force_advanced_past, None);
     }
 
     #[test]
@@ -884,7 +908,10 @@ mod tests {
             ))
             .unwrap();
         }
-        assert!(c.compact());
+        let compaction = c.compact();
+        assert!(compaction.within_window());
+        // WP-24's force advance is an event OB-6 counts, naming what it moved past.
+        assert_eq!(compaction.force_advanced_past, Some(1));
         // After auto-adjust, the buffer should be within max_size.
         assert!(c.size() <= 3);
     }

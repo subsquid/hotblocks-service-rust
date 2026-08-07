@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+use data_service_core::metrics::Metrics;
 use rpc_client::{CallOptions, RpcClient, RpcError, RpcErrorInfo};
 
 use serde_json::{json, Value};
@@ -117,6 +118,9 @@ pub struct Rpc {
     chain_utils: OnceCell<ChainUtils>,
     receipts_method: OnceCell<ReceiptsMethod>,
     finalized_head: std::sync::Mutex<FinalizedHeadCache>,
+    /// Where OB-4's view and WP-11.3's exhaustion counter land; absent in the
+    /// focused fetch-layer tests, which scrape nothing.
+    metrics: Option<Arc<Metrics>>,
 }
 
 #[derive(Default)]
@@ -144,6 +148,23 @@ impl Rpc {
             chain_utils: OnceCell::new(),
             receipts_method: OnceCell::new(),
             finalized_head: std::sync::Mutex::new(FinalizedHeadCache::default()),
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn metrics(&self) -> Option<&Arc<Metrics>> {
+        self.metrics.as_ref()
+    }
+
+    /// Report an OB-4 observation of the upstream view.
+    fn observe(&self, report: impl FnOnce(&Metrics)) {
+        if let Some(metrics) = &self.metrics {
+            report(metrics);
         }
     }
 
@@ -307,8 +328,19 @@ impl Rpc {
             .as_str()
             .ok_or_else(|| anyhow!("missing block.hash"))?
             .to_string();
+        let number = qty2_u64(number_str);
 
-        Ok((qty2_u64(number_str), hash))
+        // OB-4: the only place a watermark is read from the endpoint, so both
+        // views are stamped here — a stale view must read as stale.
+        self.observe(|metrics| {
+            if commitment == "finalized" {
+                metrics.observe_upstream_finalized_head(number);
+            } else {
+                metrics.observe_upstream_head(number);
+            }
+        });
+
+        Ok((number, hash))
     }
 
     pub async fn get_height(&self) -> Result<u64> {
@@ -317,7 +349,9 @@ impl Rpc {
             .call("eth_blockNumber", None, CallOptions::default())
             .await
             .map_err(|e| anyhow!("eth_blockNumber: {e}"))?;
-        Ok(qty2_u64(height.as_str().unwrap_or("0x0")))
+        let height = qty2_u64(height.as_str().unwrap_or("0x0"));
+        self.observe(|metrics| metrics.observe_upstream_head(height));
+        Ok(height)
     }
 
     /// Fetch a single block by number (body + txs). Returns None if not yet available.
@@ -476,6 +510,7 @@ impl Rpc {
                 .unwrap_or_else(|| "block not available".to_string());
 
             if retries >= P_ENRICH_RETRIES {
+                self.observe(Metrics::record_acquisition_retry_exhausted);
                 bail!(
                     "failed to enrich block {number} after {P_ENRICH_RETRIES} retries: {err_msg}"
                 );

@@ -137,20 +137,40 @@ drain within `P-SHUTDOWN-GRACE`; a second signal → immediate exit 130.
 
 ## Metrics binding
 
-**IB-12.** Required series (OB obligations in parentheses; names pinned by ADR-1):
-`sqd_hotblocks_first_block`, `sqd_hotblocks_last_block`,
-`sqd_hotblocks_finalized_block`, `sqd_hotblocks_stored_blocks` (OB-1);
-`sqd_hotblocks_last_block_lag_ms`, `sqd_hotblocks_block_lag_ms` (OB-3; −1 is the
-pinned wire sentinel for absence on ⊥ timestamps — ADR-1, revisited at OQ-4);
-`sqd_hotblocks_processing_time_ms` (OB-5);
-`sqd_hotblocks_queries_total{type=cache|backfill|error}` (OB-5; all label values
-pre-registered). Signals this suite additionally requires but the surface lacks today:
-the OB-1 window-excess gauge, OB-2 heartbeat, OB-4 upstream head/finalized views and
-interaction counters, OB-5 wait-empty/conflict query classes and truncation counters,
-OB-6/OB-7 alarm levels, and OB-9 lifecycle timestamps — tracked by
-GAP-4/GAP-24/GAP-25. `sqd_hotblocks_active_workers` exists for
-predecessor compatibility; a series that cannot move violates INV-30 (GAP-24) and is
-removed or implemented per OQ-4.
+**IB-12.** Required series (OB obligations in parentheses; names pinned by ADR-1).
+The set is closed: a series outside it is a defect, and so is a missing one.
+
+| Series | OB |
+|---|---|
+| `sqd_hotblocks_first_block`, `sqd_hotblocks_last_block`, `sqd_hotblocks_finalized_block`, `sqd_hotblocks_stored_blocks`, `sqd_hotblocks_window_excess` | OB-1 |
+| `sqd_hotblocks_commits_total`, `sqd_hotblocks_last_commit_timestamp_ms` | OB-2 |
+| `sqd_hotblocks_last_block_lag_ms`, `sqd_hotblocks_block_lag_ms` | OB-3 |
+| `sqd_hotblocks_upstream_head`, `sqd_hotblocks_upstream_finalized_head`, each with a `_timestamp_ms` companion; `sqd_hotblocks_upstream_requests_total{kind=single\|batch}`, `sqd_hotblocks_upstream_calls_total`, `sqd_hotblocks_upstream_errors_total{class}`, `sqd_hotblocks_upstream_retries_total{class}` | OB-4 |
+| `sqd_hotblocks_processing_time_ms`; `sqd_hotblocks_query_outcomes_total{class=window\|wait_empty\|backfill\|conflict\|error}` and `sqd_hotblocks_query_duration_ms{class}`; `sqd_hotblocks_response_truncations_total{cause=budget\|error\|disconnect}` | OB-5 |
+| `sqd_hotblocks_over_window`, `sqd_hotblocks_force_advances_total`, `sqd_hotblocks_force_advanced_past` | OB-6 |
+| `sqd_hotblocks_integrity_violations_total`, `sqd_hotblocks_session_restarts_total{cause=error\|fork\|reset}`, `sqd_hotblocks_acquisition_retry_exhaustions_total`, `sqd_hotblocks_fork_rebases_total`, `sqd_hotblocks_watermark_regressions_total`, `sqd_hotblocks_terminal_state`, `sqd_hotblocks_stall_alarm` | OB-7 |
+| `sqd_hotblocks_process_start_timestamp_ms`, `sqd_hotblocks_first_acceptance_timestamp_ms`, `sqd_hotblocks_first_commit_timestamp_ms`, `sqd_hotblocks_shutdown_start_timestamp_ms` | OB-9 |
+
+`sqd_hotblocks_queries_total{type=cache|backfill|error}` is the predecessor's
+counter and keeps its three values while REQ-24 stands; OB-5's own split is
+`query_outcomes_total` beside it, and OQ-4 removes the former.
+
+Every `class`/`cause`/`kind`/`type` value above is enumerated at startup and
+pre-registered at zero (OB-8). `upstream_errors_total`/`upstream_retries_total`
+take `rpc | http | connection | disconnected | timeout | protocol |
+retry_requested`; a retry-exhausted error is classed by what actually failed,
+never by the exhaustion.
+
+Levels naming a *moment* are epoch milliseconds carrying `-1` until that moment
+happens, the same absence sentinel OB-3 uses for ⊥ timestamps (ADR-1, revisited
+at OQ-4). `force_advanced_past` follows the same convention.
+
+Process- and runtime-level metrics (CPU, memory, descriptors) are outside this
+service's scope and deliberately not exposed. The predecessor's
+`sqd_hotblocks_active_workers` is
+**removed** — ADR-3 left it naming worker threads this build does not have, and
+a level that cannot move reads as a healthy zero (INV-30). It is an enumerated
+ADR-1 divergence, and HC-8 asserts its absence rather than diffing it.
 
 ## Upstream binding (EVM) — the input-side contract
 

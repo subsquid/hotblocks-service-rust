@@ -56,6 +56,7 @@ async fn ct1_happy_path_matches_reference_model() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();
@@ -292,6 +293,7 @@ async fn ct1_gzip_and_zstd_decode_identically() {
         block_cache_size: 1000,
         port: 0,
         auto_adjust_finalized_head: false,
+        metrics: None,
     })
     .await
     .unwrap();

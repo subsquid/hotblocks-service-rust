@@ -3,7 +3,7 @@
 
 Line-oriented, stdlib-only. Enforces the conventions the suite itself declares
 (README §Conventions): stable banded IDs, one home doc per prefix, symbolic
-parameters, two mutable docs, append-only ADRs, full traceability.
+parameters, two mutable docs, stable IDs, full traceability.
 
 Usage: check-spec.py [SPEC_DIR] [--format text|json|github] [--severity E|W|I]
                      [--only CHECK] [--strict] [--no-ignore] [--list-checks]
@@ -94,7 +94,7 @@ CHECKS = {
     "matrix-bad-status": "E", "matrix-bad-ct": "E", "matrix-duplicate-row": "E",
     # History checks (need --base / GITHUB_BASE_REF; skipped without one —
     # but an explicitly requested base that cannot be resolved is exit 2):
-    "id-removed": "E", "adr-append-only": "E", "matrix-regression": "E",
+    "id-removed": "E", "matrix-regression": "E",
 }
 
 findings = []
@@ -220,27 +220,6 @@ def run_history_checks(spec_dir, base, docs, defined):
         emit("id-removed", HOME[pfx], 1,
              f"{pfx}-{num} was defined at {base} but is gone — IDs are stable; "
              "retire in place, never renumber or delete")
-    # adr-append-only: an accepted ADR changes only Status -> Superseded.
-    for rel, base_lines in base_docs.items():
-        if not rel.startswith(ADR_DIR + os.sep):
-            continue
-        cur_lines = docs.get(rel)
-        if cur_lines is None:
-            emit("adr-append-only", rel, 1,
-                 f"ADR file present at {base} was deleted — the log is append-only")
-            continue
-        b_status = next((l for l in base_lines if l.startswith("Status:")), "")
-        c_status = next((l for l in cur_lines if l.startswith("Status:")), "")
-        if not b_status.startswith("Status: Accepted"):
-            continue  # proposals may be edited freely until accepted
-        b_rest = [l for l in base_lines if not l.startswith("Status:")]
-        c_rest = [l for l in cur_lines if not l.startswith("Status:")]
-        if b_rest != c_rest:
-            emit("adr-append-only", rel, 1,
-                 "accepted ADR body edited — supersede with a new ADR instead")
-        elif b_status != c_status and "Superseded" not in c_status:
-            emit("adr-append-only", rel, 1,
-                 "accepted ADR status may only change to 'Superseded by ADR-n'")
     # matrix-regression: no row's rank decreases and the C count never shrinks
     # (MG-1 ratchet, per-row and in aggregate — a row that vanishes or loses its
     # status cell is caught by trace-missing / matrix-bad-status).

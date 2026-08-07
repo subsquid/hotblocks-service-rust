@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_stream::stream;
 use async_trait::async_trait;
 use data_service_core::source::{DataSource, StreamRequest};
-use data_service_core::{Block, BlockBatch, BlockRef, StreamError};
+use data_service_core::{Block, BlockBatch, BlockRef, Metrics, StreamError};
 use futures::stream::{BoxStream, StreamExt};
 use tracing::warn;
 
@@ -107,7 +107,28 @@ pub struct EvmRpcDataSource {
 
 impl EvmRpcDataSource {
     pub fn new(client: Arc<RpcClient>, options: EvmRpcDataSourceOptions) -> Self {
-        let rpc = Arc::new(Rpc::new(client, options.rpc_options));
+        Self::build(client, options, None)
+    }
+
+    /// Report the OB-4 view and WP-11.3 exhaustions onto the service's registry.
+    pub fn with_metrics(
+        client: Arc<RpcClient>,
+        options: EvmRpcDataSourceOptions,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self::build(client, options, Some(metrics))
+    }
+
+    fn build(
+        client: Arc<RpcClient>,
+        options: EvmRpcDataSourceOptions,
+        metrics: Option<Arc<Metrics>>,
+    ) -> Self {
+        let rpc = Rpc::new(client, options.rpc_options);
+        let rpc = Arc::new(match metrics {
+            Some(metrics) => rpc.with_metrics(metrics),
+            None => rpc,
+        });
         let data_request = Arc::new(options.data_request.clone());
         let norm_options = Arc::new(NormOptions {
             with_traces: options.data_request.traces,

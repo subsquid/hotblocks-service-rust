@@ -16,6 +16,14 @@ fn run_fixture_file(path: &Path, options: MappingOptions) {
     let content = fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
 
+    // A checkout that skipped the smudge filter leaves the pointer here, and
+    // "expected value at line 1 column 1" is a poor way to learn that.
+    assert!(
+        !content.starts_with("version https://git-lfs.github.com/"),
+        "{} is an unresolved Git LFS pointer — run `git lfs pull`",
+        path.display()
+    );
+
     let fixtures: Vec<Fixture> = serde_json::from_str(&content)
         .unwrap_or_else(|e| panic!("Failed to parse {}: {e}", path.display()));
 

@@ -10,7 +10,10 @@ finalized height, buffered block count, and window excess (INV-4). Fresh per com
 **OB-2 — Progress heartbeat.** [MUST] A signal that distinguishes *idle input* (no new
 upstream block) from *stalled service* (upstream advanced, nothing committed): the
 height and wall-time of the last commit, alongside OB-4. An observer with one scrape
-pair must be able to compute "commits are happening" independently of block content.
+pair must be able to compute "commits are happening" independently of block content —
+so the heartbeat counts *commits*, not blocks: a batch that inserts nothing because
+WP-6 absorbed it is still ingestion working, and a head height alone would read a
+redelivery stretch as a dead service.
 
 **OB-3 — Lag.** [MUST] Levels/distributions for block arrival lag (block timestamp →
 commit) where the chain family has timestamps; ⊥-timestamp chains expose the
@@ -20,9 +23,12 @@ sunset).
 
 **OB-4 — Upstream view.** [MUST] The upstream head height *and upstream finalized
 height* as last observed (LIV-7/SLI-6 are decidable only with the latter), and
-upstream interaction health: request/error/retry counts by class (REQ-16 visibility —
-GAP-25 tracks the absence of all of these). Staleness of the upstream view is itself
-visible (last-observed timestamps).
+upstream interaction health: request/error/retry counts by class (REQ-16
+visibility). Staleness of the upstream view is itself visible (last-observed
+timestamps). The head view is not owed a dedicated read: on the speculative path
+a delivered block at `N` and a null answer for `N+1` between them fix the
+upstream head exactly, and spending budget on a head tag instead would compete
+with acquisition (ADR-6, HZ-1).
 
 **OB-5 — Operation metrics.** [MUST] Per query class (window / wait-empty / backfill /
 conflict / error): counts and duration distributions; truncations (RP-12) counted
@@ -39,7 +45,9 @@ T1), acquisition retry exhaustion (WP-11.3), fork rebases, and the terminal FM-3
 state. The stall alarm (LIV-2) is a level that flips at `P-STALL-ALARM`.
 
 **OB-8 — Bounded cardinality & volume.** [MUST] All label sets are closed and
-enumerable at startup (no per-block/per-client labels); log volume per REQ-31.
+enumerable at startup (no per-block/per-client labels), and every value is
+registered at zero before its first event — a series that appears when it first
+moves cannot be alerted on beforehand. Log volume per REQ-31.
 
 **OB-9 — Lifecycle.** [MUST] Timestamps (as levels) for: process start, first
 acceptance, first commit, last commit (OB-2), shutdown start. Readiness semantics per

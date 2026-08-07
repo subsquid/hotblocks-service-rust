@@ -359,11 +359,25 @@ async fn compare_http(manifest: &Value) {
             .expect("Rust metrics content type"),
     );
     let rust_metrics: Value = metrics.json().await.expect("parse Rust JSON metrics");
-    assert_eq!(
-        metric_families(&manifest["http"]["metrics"]["families"]),
-        metric_families(&rust_metrics),
-        "structured metric families diverged from the predecessor"
-    );
+    let oracle = metric_families(&manifest["http"]["metrics"]["families"]);
+    let rust = metric_families(&rust_metrics);
+    // REQ-24 binds the predecessor's series, not the whole surface: the OB
+    // signals it never had are additive and cannot break a client, and the
+    // series ADR-3 made meaningless is enumerated as a divergence (GAP-24).
+    for (name, family) in &oracle {
+        if RETIRED_FAMILIES.contains(&name.as_str()) {
+            assert!(
+                !rust.contains_key(name),
+                "{name} is enumerated as retired but is still exposed"
+            );
+            continue;
+        }
+        assert_eq!(
+            Some(family),
+            rust.get(name),
+            "metric family {name} diverged from the predecessor"
+        );
+    }
 
     let oversized = client
         .post(format!("http://127.0.0.1:{port}/stream"))
@@ -392,6 +406,10 @@ async fn compare_http(manifest: &Value) {
     server.abort();
     let _ = server.await;
 }
+
+/// Predecessor series this build deliberately does not expose (ADR-1's
+/// enumerated divergences).
+const RETIRED_FAMILIES: &[&str] = &["sqd_hotblocks_active_workers"];
 
 fn metric_families(value: &Value) -> BTreeMap<String, Value> {
     value
