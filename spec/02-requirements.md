@@ -160,7 +160,8 @@ schedule; non-transient errors surface immediately.
 *Acceptance:* under a metered fake upstream, aggregate request rate never exceeds the
 configured limit by more than `P-RATE-TOLERANCE`; retry counts per call are bounded by
 `P-RPC-RETRY-ATTEMPTS`; within one logical RPC batch operation, an item is never
-submitted again after its successful response is observed.
+submitted again after its successful response is observed. Startup rejects a zero
+batch cap and any batch/rate combination for which one batch can never be admitted.
 *Trace:* WP-11, FM-20..; ADR-3; GAP-20, GAP-21.
 
 **REQ-17 — Multi-VM extensibility.** [MUST]

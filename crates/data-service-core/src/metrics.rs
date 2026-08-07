@@ -10,8 +10,8 @@ use prometheus::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// `P-STALL-ALARM`: zero commit progress against an advancing upstream head
@@ -20,6 +20,22 @@ pub const P_STALL_ALARM: Duration = Duration::from_secs(60);
 
 /// The value every "moment" level holds until the moment happens.
 const UNREACHED: f64 = -1.0;
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[derive(Clone, Copy)]
+struct UpstreamHeadObservation {
+    number_observed_at: Instant,
+    explicitly_observed_at: Option<Instant>,
+    number: u64,
+}
+
+struct StallClock {
+    last_commit_at: Option<Instant>,
+    behind_since: Option<Instant>,
+}
 
 // ---------------------------------------------------------------------------
 // Block ingestion timestamp cache (port of `BlockTimestampCache` in metrics.ts)
@@ -280,14 +296,11 @@ pub fn now_ms() -> u64 {
 /// a batch publishes its observables only after committing, but each block
 /// still owns the moment it landed rather than the moment the batch ended.
 pub fn record_block_ingestion(block_number: u64, ingested_at_ms: u64) {
-    block_timestamp_cache()
-        .lock()
-        .unwrap()
-        .set(&block_number.to_string(), ingested_at_ms);
+    lock_unpoisoned(block_timestamp_cache()).set(&block_number.to_string(), ingested_at_ms);
 }
 
 pub fn get_block_ingestion_timestamp(height: &str) -> Option<u64> {
-    block_timestamp_cache().lock().unwrap().get(height)
+    lock_unpoisoned(block_timestamp_cache()).get(height)
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +409,10 @@ pub struct Metrics {
     // OB-4 upstream view and interaction health.
     upstream_head: Gauge,
     upstream_head_timestamp_ms: Gauge,
+    /// Typed copy of the OB-4 head observation for local readiness decisions.
+    /// Prometheus gauges are `f64`, so they are not a sound state store for a
+    /// `u64` chain coordinate.
+    upstream_head_observation: Mutex<Option<UpstreamHeadObservation>>,
     upstream_finalized_head: Gauge,
     upstream_finalized_head_timestamp_ms: Gauge,
     upstream_requests_total: CounterVec,
@@ -418,19 +435,20 @@ pub struct Metrics {
     stall_alarm: Gauge,
 
     // OB-9 lifecycle.
-    process_start_timestamp_ms: Gauge,
     first_acceptance_timestamp_ms: Gauge,
     first_commit_timestamp_ms: Gauge,
     shutdown_start_timestamp_ms: Gauge,
 
     /// `P-STALL-ALARM` for this instance; a test shortens it.
     stall_after: Duration,
+    /// Monotonic origin for the pre-first-commit stall bound.
+    process_started_at: Instant,
     /// Debounces the OB-10 capture so it fires once per flip, whichever caller
     /// (scrape or ticker) observes the edge first.
     stall_active: AtomicBool,
-    /// Epoch ms when the upstream first got ahead of the buffer, 0 while it is
-    /// not — the LIV-2 bound runs from here, not from the last commit.
-    behind_since: AtomicU64,
+    /// Monotonic progress state shared by the stall decision. Wall-clock gauges
+    /// remain presentation-only and cannot change readiness/alarm ordering.
+    stall_clock: Mutex<StallClock>,
     /// WP-9 ladder position and the error that put it there. Not exposed as
     /// series — an error string has no bounded label set (OB-8) — but OB-10's
     /// capture owes both, and only the ingestion loop knows them.
@@ -444,6 +462,7 @@ impl Metrics {
 
     /// Shortened `P-STALL-ALARM`, so a test can drive the LIV-2 level.
     pub fn with_stall_alarm(stall_after: Duration) -> Self {
+        let process_started_at = Instant::now();
         let registry = Registry::new();
 
         let last_block = Gauge::with_opts(Opts::new(
@@ -560,13 +579,13 @@ impl Metrics {
 
         let upstream_head = Gauge::with_opts(Opts::new(
             "sqd_hotblocks_upstream_head",
-            "Upstream head height as last observed",
+            "Upstream head height from the last read or committed source progress",
         ))
         .unwrap();
 
         let upstream_head_timestamp_ms = Gauge::with_opts(Opts::new(
             "sqd_hotblocks_upstream_head_timestamp_ms",
-            "When the upstream head was last observed, epoch ms, -1 if never",
+            "When the upstream head was last read successfully, epoch ms, -1 if never",
         ))
         .unwrap();
 
@@ -788,6 +807,7 @@ impl Metrics {
             truncations_total,
             upstream_head,
             upstream_head_timestamp_ms,
+            upstream_head_observation: Mutex::new(None),
             upstream_finalized_head,
             upstream_finalized_head_timestamp_ms,
             upstream_requests_total,
@@ -804,13 +824,16 @@ impl Metrics {
             watermark_regressions_total,
             terminal_state,
             stall_alarm,
-            process_start_timestamp_ms,
             first_acceptance_timestamp_ms,
             first_commit_timestamp_ms,
             shutdown_start_timestamp_ms,
             stall_after,
+            process_started_at,
             stall_active: AtomicBool::new(false),
-            behind_since: AtomicU64::new(0),
+            stall_clock: Mutex::new(StallClock {
+                last_commit_at: None,
+                behind_since: None,
+            }),
             ladder: Mutex::new((0, None)),
         }
     }
@@ -854,6 +877,7 @@ impl Metrics {
     /// happening" without reading block content.
     pub fn record_commit(&self) {
         self.commits_total.inc();
+        lock_unpoisoned(&self.stall_clock).last_commit_at = Some(Instant::now());
         let now = now_ms() as f64;
         self.last_commit_timestamp_ms.set(now);
         if self.first_commit_timestamp_ms.get() < 0.0 {
@@ -906,8 +930,54 @@ impl Metrics {
     // ----- OB-4 upstream ---------------------------------------------------
 
     pub fn observe_upstream_head(&self, number: u64) {
+        let observed_at = Instant::now();
+        *lock_unpoisoned(&self.upstream_head_observation) = Some(UpstreamHeadObservation {
+            number_observed_at: observed_at,
+            explicitly_observed_at: Some(observed_at),
+            number,
+        });
         self.upstream_head.set(number as f64);
         self.upstream_head_timestamp_ms.set(now_ms() as f64);
+    }
+
+    /// Record progress proved by a committed source batch without regressing a
+    /// newer explicit head read. Progress improves the local height but cannot
+    /// make a failed `DataSource::get_head` refresh look fresh.
+    pub(crate) fn observe_upstream_progress(&self, number: u64) {
+        let mut observation = lock_unpoisoned(&self.upstream_head_observation);
+        if observation.is_some_and(|current| current.number >= number) {
+            return;
+        }
+        let explicitly_observed_at = observation
+            .as_ref()
+            .and_then(|current| current.explicitly_observed_at);
+        *observation = Some(UpstreamHeadObservation {
+            number_observed_at: Instant::now(),
+            explicitly_observed_at,
+            number,
+        });
+        drop(observation);
+        self.upstream_head.set(number as f64);
+    }
+
+    /// Return the last observed upstream head while it is younger than the
+    /// configured `P-STALL-ALARM` bound. Only a successful core-managed
+    /// `DataSource::get_head` read refreshes that age; committed batches may
+    /// improve the height without masking loss of upstream visibility.
+    pub fn fresh_upstream_head(&self) -> Option<u64> {
+        let observation = lock_unpoisoned(&self.upstream_head_observation)
+            .as_ref()
+            .copied()?;
+        let explicitly_observed_at = observation.explicitly_observed_at?;
+        (explicitly_observed_at.elapsed() < self.stall_after).then_some(observation.number)
+    }
+
+    pub(crate) fn upstream_head_refresh_interval(&self) -> Duration {
+        (self.stall_after / 2).max(Duration::from_millis(1))
+    }
+
+    pub(crate) fn upstream_head_refresh_timeout(&self) -> Duration {
+        (self.upstream_head_refresh_interval() / 4).max(Duration::from_millis(1))
     }
 
     pub fn observe_upstream_finalized_head(&self, number: u64) {
@@ -972,7 +1042,7 @@ impl Metrics {
     /// Where the WP-9 ladder stands and what ended the last session, for
     /// OB-10's capture to name when the stall alarm flips.
     pub fn note_session_end(&self, ladder_position: i32, error: Option<&str>) {
-        *self.ladder.lock().expect("ladder state") = (ladder_position, error.map(str::to_string));
+        *lock_unpoisoned(&self.ladder) = (ladder_position, error.map(str::to_string));
     }
 
     // ----- OB-9 lifecycle --------------------------------------------------
@@ -1000,28 +1070,31 @@ impl Metrics {
     fn refresh_stall_alarm(&self) {
         // LIV-2 is about the upstream *advancing* past us; an idle chain
         // leaves the two equal however long it sits there.
-        let now = now_ms();
-        let behind = self.upstream_head.get() > self.last_block.get();
-        if behind {
-            // Only the first observation starts the clock; later ones keep it.
-            let _ =
-                self.behind_since
-                    .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
-        } else {
-            self.behind_since.store(0, Ordering::Relaxed);
-        }
+        let observation = *lock_unpoisoned(&self.upstream_head_observation);
+        let behind =
+            observation.is_some_and(|current| current.number as f64 > self.last_block.get());
+        let now = Instant::now();
+        let (stalled, quiet_ms) = {
+            let mut clock = lock_unpoisoned(&self.stall_clock);
+            if !behind {
+                clock.behind_since = None;
+                (false, 0.0)
+            } else {
+                // Only the observation that first puts the upstream ahead
+                // starts this clock; later observations preserve it.
+                let observed_at = observation
+                    .expect("behind requires an observation")
+                    .number_observed_at;
+                let behind_since = *clock.behind_since.get_or_insert(observed_at);
 
-        // The bound runs from whichever came later: the moment the upstream got
-        // ahead, or the last commit. Measuring from the commit alone would let
-        // a chain that idled longer than the threshold alarm on the very first
-        // block it then produces, before ingestion could possibly have it.
-        let committed = match self.last_commit_timestamp_ms.get() {
-            commit if commit >= 0.0 => commit,
-            _ => self.process_start_timestamp_ms.get(),
+                // The bound runs from whichever came later: the moment the
+                // upstream got ahead, or the last commit. Both are monotonic.
+                let committed_at = clock.last_commit_at.unwrap_or(self.process_started_at);
+                let since = committed_at.max(behind_since);
+                let quiet = now.saturating_duration_since(since);
+                (quiet >= self.stall_after, quiet.as_secs_f64() * 1000.0)
+            }
         };
-        let since = committed.max(self.behind_since.load(Ordering::Relaxed) as f64);
-        let quiet_ms = now as f64 - since;
-        let stalled = behind && quiet_ms >= self.stall_after.as_millis() as f64;
 
         self.stall_alarm.set(if stalled { 1.0 } else { 0.0 });
         if self.stall_active.swap(stalled, Ordering::Relaxed) == stalled {
@@ -1030,7 +1103,7 @@ impl Metrics {
         if stalled {
             // OB-10: one capture per flip, not one per evaluation.
             let (ladder_position, last_error) = {
-                let ladder = self.ladder.lock().expect("ladder state");
+                let ladder = lock_unpoisoned(&self.ladder);
                 (ladder.0, ladder.1.clone())
             };
             tracing::error!(
@@ -1103,5 +1176,93 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn poisoned_upstream_observation_does_not_break_readiness() {
+        let metrics = Arc::new(Metrics::new());
+        let poison_target = Arc::clone(&metrics);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = poison_target.upstream_head_observation.lock().unwrap();
+            panic!("poison upstream observation for the regression");
+        })
+        .join();
+        assert!(poisoned.is_err());
+
+        metrics.observe_upstream_head(7);
+        assert_eq!(metrics.fresh_upstream_head(), Some(7));
+    }
+
+    #[test]
+    fn committed_progress_does_not_refresh_explicit_head_freshness() {
+        let stall_after = Duration::from_millis(20);
+        let metrics = Metrics::with_stall_alarm(stall_after);
+        metrics.observe_upstream_head(2);
+        assert_eq!(metrics.fresh_upstream_head(), Some(2));
+        let explicit_timestamp_ms = metrics.upstream_head_timestamp_ms.get();
+
+        {
+            let mut observation = lock_unpoisoned(&metrics.upstream_head_observation);
+            observation
+                .as_mut()
+                .expect("explicit observation")
+                .explicitly_observed_at = Instant::now().checked_sub(stall_after * 2);
+        }
+        metrics.observe_upstream_progress(3);
+        assert_eq!(metrics.fresh_upstream_head(), None);
+
+        let observation =
+            lock_unpoisoned(&metrics.upstream_head_observation).expect("progress observation");
+        assert_eq!(observation.number, 3);
+        assert!(observation.explicitly_observed_at.is_some());
+        assert_eq!(
+            metrics.upstream_head_timestamp_ms.get(),
+            explicit_timestamp_ms,
+            "committed progress must not rewrite the explicit-read timestamp"
+        );
+    }
+
+    #[test]
+    fn progress_without_an_explicit_read_is_not_fresh() {
+        let metrics = Metrics::with_stall_alarm(Duration::from_secs(1));
+        metrics.observe_upstream_progress(3);
+        assert_eq!(metrics.fresh_upstream_head(), None);
+    }
+
+    #[test]
+    fn stale_explicit_observation_still_drives_the_stall_alarm() {
+        let stall_after = Duration::from_millis(20);
+        let metrics = Metrics::with_stall_alarm(stall_after);
+        metrics.set_last_block(1);
+        metrics.observe_upstream_head(2);
+
+        {
+            let mut observation = lock_unpoisoned(&metrics.upstream_head_observation);
+            let observation = observation.as_mut().expect("explicit observation");
+            let stale_at = Instant::now()
+                .checked_sub(stall_after * 2)
+                .expect("test instant");
+            observation.number_observed_at = stale_at;
+            observation.explicitly_observed_at = Some(stale_at);
+            lock_unpoisoned(&metrics.stall_clock).last_commit_at = Some(stale_at);
+        }
+        metrics.refresh_derived_levels();
+        assert_eq!(metrics.fresh_upstream_head(), None);
+        assert_eq!(metrics.stall_alarm.get(), 1.0);
+    }
+
+    #[test]
+    fn head_refresh_timeout_leaves_headroom_before_the_next_observation() {
+        let metrics = Metrics::with_stall_alarm(Duration::from_secs(60));
+        let interval = metrics.upstream_head_refresh_interval();
+        let timeout = metrics.upstream_head_refresh_timeout();
+        assert!(timeout < interval);
+        assert!(interval + timeout < metrics.stall_after);
     }
 }

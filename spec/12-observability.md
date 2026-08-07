@@ -25,10 +25,10 @@ sunset).
 height* as last observed (LIV-7/SLI-6 are decidable only with the latter), and
 upstream interaction health: request/error/retry counts by class (REQ-16
 visibility). Staleness of the upstream view is itself visible (last-observed
-timestamps). The head view is not owed a dedicated read: on the speculative path
-a delivered block at `N` and a null answer for `N+1` between them fix the
-upstream head exactly, and spending budget on a head tag instead would compete
-with acquisition (ADR-6, HZ-1).
+timestamps). The head timestamp records the last successful explicit head read used
+for readiness. A committed source batch may advance the displayed height without
+refreshing that timestamp; the core supplies the bounded periodic read, while
+adapter-specific acquisition may improve the number between reads (ADR-6/17, HZ-1).
 
 **OB-5 — Operation metrics.** [MUST] Per query class (window / wait-empty / backfill /
 conflict / error): counts and duration distributions; truncations (RP-12) counted

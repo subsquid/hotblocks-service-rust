@@ -23,6 +23,26 @@ impl RateMeter {
         }
     }
 
+    /// Build the meter shape used for a configured item-per-second limit.
+    pub fn for_rate_limit(window_size: usize, limit: f64) -> Self {
+        let slot_time = if limit < 1.0 {
+            (1000.0 / (limit * window_size as f64)).ceil() as u64
+        } else {
+            100
+        };
+        Self::new(window_size, slot_time)
+    }
+
+    /// Rate contributed by `count` items within this meter's window.
+    pub fn contribution(&self, count: u64) -> f64 {
+        1000.0 * count as f64 / (self.window_size as f64 * self.slot_time as f64)
+    }
+
+    /// Maximum whole-item reservation an otherwise empty window can admit.
+    pub fn calls_per_window(&self, limit: f64) -> usize {
+        (limit / self.contribution(1)).floor() as usize
+    }
+
     fn to_time(&self, now_ms: u64) -> i64 {
         let t = now_ms.div_ceil(self.slot_time) as i64;
         t.max(self.time)
@@ -59,7 +79,7 @@ impl RateMeter {
             time -= 1;
         }
 
-        1000.0 * rate as f64 / (self.window_size as f64 * self.slot_time as f64)
+        self.contribution(rate)
     }
 }
 
@@ -107,5 +127,18 @@ mod tests {
         }
         // total 10 in window of 1000ms = 10 rps
         assert!((m.get_rate(t + 499) - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn configured_meter_owns_reservation_math() {
+        let whole = RateMeter::for_rate_limit(10, 10.0);
+        assert_eq!(whole.slot_time, 100);
+        assert_eq!(whole.calls_per_window(10.0), 10);
+        assert_eq!(whole.contribution(4), 4.0);
+
+        let fractional = RateMeter::for_rate_limit(10, 0.5);
+        assert_eq!(fractional.slot_time, 200);
+        assert_eq!(fractional.calls_per_window(0.5), 1);
+        assert_eq!(fractional.contribution(1), 0.5);
     }
 }

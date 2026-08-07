@@ -13,6 +13,10 @@ pub struct RpcErrorInfo {
 /// All errors that can come out of `RpcClient`
 #[derive(Debug, Error)]
 pub enum RpcError {
+    /// Client configuration cannot produce valid or bounded requests.
+    #[error("invalid RPC client configuration: {0}")]
+    InvalidConfig(String),
+
     /// Server returned a JSON-RPC error object
     #[error("RPC error {code}: {message}")]
     Rpc {
@@ -64,6 +68,7 @@ impl RpcError {
     /// Mirrors TS `RpcClient.isConnectionError` + evm `isRetryableError`.
     pub fn is_retryable(&self, retry_internal_server_errors: bool) -> bool {
         match self {
+            RpcError::InvalidConfig(_) => false,
             RpcError::RetryRequested(_) => true,
             RpcError::Timeout => true,
             RpcError::Connection(_) => true,

@@ -277,6 +277,7 @@ async fn the_stall_level_separates_idle_input_from_a_stalled_service() {
     let stall_after = Duration::from_millis(150);
     let metrics = Arc::new(Metrics::with_stall_alarm(stall_after));
     let source = Scripted::new(seed(), vec![Step::batch(vec![linked(SEED + 1)])]);
+    let head_control = source.clone();
     let service = Service::start_with(source, 100, false, Some(Arc::clone(&metrics))).await;
 
     let committed = service
@@ -287,7 +288,7 @@ async fn the_stall_level_separates_idle_input_from_a_stalled_service() {
     assert!(committed.get("sqd_hotblocks_commits_total") >= 1.0);
 
     // Idle input: the upstream is level with us and stays there.
-    metrics.observe_upstream_head(101);
+    head_control.reseed(linked(101));
     tokio::time::sleep(stall_after * 3).await;
     let idle = Scrape::read(service.port()).await;
     assert_eq!(
@@ -298,7 +299,7 @@ async fn the_stall_level_separates_idle_input_from_a_stalled_service() {
 
     // The bound starts when the upstream gets ahead, not at the last commit:
     // the first block after a long idle stretch must not alarm on arrival.
-    metrics.observe_upstream_head(150);
+    head_control.reseed(linked(150));
     assert_eq!(
         Scrape::read(service.port())
             .await
@@ -317,7 +318,7 @@ async fn the_stall_level_separates_idle_input_from_a_stalled_service() {
     assert!(stalled.get("sqd_hotblocks_upstream_head_timestamp_ms") > 0.0);
 
     // And it clears on its own once the upstream is level again.
-    metrics.observe_upstream_head(101);
+    head_control.reseed(linked(101));
     service
         .until("the stall alarm clearing", |s| {
             s.get("sqd_hotblocks_stall_alarm") == 0.0

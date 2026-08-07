@@ -2,10 +2,12 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use data_service_core::metrics::Metrics;
 use data_service_core::source::{BlockBatch, DataSource, StreamError, StreamRequest};
 use data_service_core::types::{Block, BlockRef};
 use data_service_core::{run_data_service, DataServiceOptions};
 use futures::stream::BoxStream;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -115,6 +117,53 @@ impl DataSource for MockSource {
     }
 }
 
+/// A source whose head reads are counted independently from its idle stream.
+/// The core refreshes this view on its own cadence, never per readiness probe.
+#[derive(Clone)]
+struct ReadinessSource {
+    seed: Block,
+    head_reads: Arc<AtomicUsize>,
+    fail_head_reads: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl DataSource for ReadinessSource {
+    async fn get_head(&self) -> anyhow::Result<BlockRef> {
+        self.head_reads.fetch_add(1, Ordering::Relaxed);
+        if self.fail_head_reads.load(Ordering::Relaxed) {
+            anyhow::bail!("scripted head read failure");
+        }
+        Ok(self.seed.block_ref())
+    }
+
+    async fn get_finalized_head(&self) -> anyhow::Result<BlockRef> {
+        Ok(self.seed.block_ref())
+    }
+
+    fn get_finalized_stream(
+        &self,
+        _req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+        let seed = self.seed.clone();
+        Box::pin(async_stream::stream! {
+            yield Ok(BlockBatch {
+                blocks: vec![seed.clone()],
+                finalized_head: Some(seed.block_ref()),
+            });
+        })
+    }
+
+    fn get_stream(
+        &self,
+        _req: StreamRequest,
+    ) -> BoxStream<'static, Result<BlockBatch, StreamError>> {
+        Box::pin(async_stream::stream! {
+            futures::future::pending::<()>().await;
+            yield Err(StreamError::Other(anyhow::anyhow!("unreachable")));
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -175,6 +224,63 @@ async fn test_root_endpoint() {
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
     assert!(text.contains("hot block data service"), "got: {text}");
+}
+
+/// GAP-34: probe frequency is local work only, and the same observation-age
+/// bound that drives the stall signal turns a stale view not-ready.
+#[tokio::test]
+async fn readiness_reads_the_fresh_local_upstream_view() {
+    let seed = make_block(5, "h5", 4, "h4");
+    let head_reads = Arc::new(AtomicUsize::new(0));
+    let fail_head_reads = Arc::new(AtomicBool::new(false));
+    let metrics = Arc::new(Metrics::with_stall_alarm(
+        tokio::time::Duration::from_millis(500),
+    ));
+    let handle = run_data_service(DataServiceOptions {
+        source: ReadinessSource {
+            seed,
+            head_reads: Arc::clone(&head_reads),
+            fail_head_reads: Arc::clone(&fail_head_reads),
+        },
+        block_cache_size: 10,
+        port: 0,
+        auto_adjust_finalized_head: false,
+        metrics: Some(Arc::clone(&metrics)),
+    })
+    .await
+    .unwrap();
+
+    let url = format!("http://127.0.0.1:{}/readiness", handle.port);
+    let client = reqwest::Client::new();
+    tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+        while metrics.fresh_upstream_head() != Some(5) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the core did not publish DataSource::get_head");
+
+    fail_head_reads.store(true, Ordering::Relaxed);
+    let reads_before_probes = head_reads.load(Ordering::Relaxed);
+    for _ in 0..8 {
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "true");
+    }
+    let reads_during_probes = head_reads
+        .load(Ordering::Relaxed)
+        .saturating_sub(reads_before_probes);
+    assert!(
+        reads_during_probes < 8,
+        "eight readiness probes must not become eight upstream calls"
+    );
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
+    let response = client.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.text().await.unwrap(), "false");
+
+    handle.shutdown().await;
 }
 
 #[tokio::test]

@@ -38,9 +38,12 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 | Parameter | Role | Observed | Target |
 |---|---|---|---|
 | P-RPC-TIMEOUT | per-call timeout (IB-13) | 10 000 ms (default) | — |
+| P-RPC-RATE-LIMIT | aggregate upstream item rate (REQ-16) | unset; when set, finite and > 0 items/s | — |
+| P-RPC-BATCH-MAX | maximum items in one upstream batch (REQ-16) | unset means unlimited without a rate limit, otherwise `max(1, floor(P-RPC-RATE-LIMIT / 5))`; an explicit value is an integer ≥ 1 and cannot exceed one rate window's item capacity | — |
+| P-RPC-CAPACITY | aggregate concurrent upstream requests and per-logical-batch chunk fan-out (REQ-16) | 10 (fixed) | — |
 | P-RPC-RETRY-ATTEMPTS | per-call retry cap (REQ-16) | 5 (fixed) | — |
 | P-RPC-RETRY-SCHEDULE | retry pauses, indexed by attempt with the last entry repeated (IB-13) | 10, 100, 500, 2000, 10000, 20000 ms (the 6th entry is reachable only via per-call attempt overrides above the P-RPC-RETRY-ATTEMPTS default) | — |
-| P-RATE-TOLERANCE | allowed budget overshoot (REQ-16 acceptance) | **violated: unbounded overshoot race** (GAP-21) | ⚠ 10 % over 1 s windows |
+| P-RATE-TOLERANCE | allowed budget overshoot (REQ-16 acceptance) | no overshoot in the deterministic queued-waiter and metered concurrent-call regressions; full S6 unmeasured | ⚠ 10 % over 1 s windows |
 | P-DEBUG-TIMEOUT | debug-trace call timeout (IB-14) | 60 s (fixed) | — |
 
 ## Serving

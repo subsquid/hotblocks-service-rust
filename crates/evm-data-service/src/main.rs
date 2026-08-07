@@ -10,7 +10,7 @@ use evm_source::fetch::{CallFrameValidationMode, RpcOptions};
 use evm_source::observability::MetricsRpcObserver;
 use evm_source::source::{EvmRpcDataSource, EvmRpcDataSourceOptions};
 use evm_source::types::DataRequest;
-use rpc_client::{RpcClient, RpcClientConfig};
+use rpc_client::{RpcClient, RpcClientConfig, DEFAULT_REQUEST_CAPACITY};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
@@ -250,10 +250,10 @@ async fn main() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
 
     let client = Arc::new(
-        RpcClient::new(RpcClientConfig {
+        RpcClient::try_new(RpcClientConfig {
             url: args.http_rpc,
             max_batch_call_size: args.http_rpc_max_batch_call_size,
-            capacity: usize::MAX,
+            capacity: DEFAULT_REQUEST_CAPACITY,
             rate_limit: args.http_rpc_rate_limit,
             request_timeout: Duration::from_millis(args.http_rpc_timeout),
             retry_attempts: 5,
@@ -263,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
                 .collect(),
             retry_internal_server_errors: args.http_retry_internal_server_errors,
             ws_pool_size: None,
-        })
+        })?
         .with_observer(Arc::new(MetricsRpcObserver::new(Arc::clone(&metrics)))),
     );
 
