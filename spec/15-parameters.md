@@ -20,8 +20,10 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 
 | Parameter | Role | Observed | Target |
 |---|---|---|---|
-| P-ENRICH-RETRIES | whole-block/component re-acquisition attempts (WP-11.2, ADR-5/19) | 10 on the speculative head, strided backfill, and short/tail finalized-poll paths | 10 ⚠, all acquisition paths |
+| P-ENRICH-RETRIES | whole-block/component re-acquisition attempts for an *incoherent* answer (WP-11.2, ADR-5/19) | 10 on the speculative head, strided backfill, and short/tail finalized-poll paths; on the head path a not-ready answer runs under P-NOT-READY-BUDGET instead | 10 ⚠, all acquisition paths |
 | P-ENRICH-DELAY | delay between re-acquisitions | 50 ms; the first individual fetch after a short batch is immediate | — |
+| P-NOT-READY-BUDGET | wall-clock budget for a head block whose data legitimately lags its header — null/short/foreign-hash receipts, empty logs against a non-zero bloom, a block gone absent on re-fetch (GAP-40) | 30 s (`RpcOptions::not_ready_budget`, no CLI); a hard bound — an in-flight re-fetch is cancelled at the deadline; exhaustion keeps the fail-loud session error | 30 s ⚠ |
+| P-NOT-READY-DELAY | delay between not-ready re-acquisitions | 100 ms (predecessor parity) | — |
 | P-STALL-FREE-RETRIES | stalled-session restarts before backoff (WP-9) | 1 | — |
 | P-SESSION-BACKOFF | delay between stalled sessions | 30 s | — |
 | P-STALL-REINIT | stalled sessions before T1 re-seed | 6 (code gate `stalled > 5`) | — |
@@ -40,7 +42,7 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 | P-RPC-TIMEOUT | per-call timeout (IB-13) | 10 000 ms (default) | — |
 | P-RPC-RATE-LIMIT | aggregate upstream item rate (REQ-16) | unset; when set, finite and > 0 items/s | — |
 | P-RPC-BATCH-MAX | maximum items in one upstream batch (REQ-16) | unset means unlimited without a rate limit, otherwise `max(1, floor(P-RPC-RATE-LIMIT / 5))`; an explicit value is an integer ≥ 1 and cannot exceed one rate window's item capacity | — |
-| P-RPC-CAPACITY | aggregate concurrent upstream requests and per-logical-batch chunk fan-out (REQ-16) | 10 (fixed) | — |
+| P-RPC-CAPACITY | aggregate concurrent upstream requests and per-logical-batch chunk fan-out (REQ-16) | 10 (default; `--http-rpc-capacity`, ≥ 1) | — |
 | P-RPC-RETRY-ATTEMPTS | per-call retry cap (REQ-16) | 5 (fixed) | — |
 | P-RPC-RETRY-SCHEDULE | retry pauses, indexed by attempt with the last entry repeated (IB-13) | 10, 100, 500, 2000, 10000, 20000 ms (the 6th entry is reachable only via per-call attempt overrides above the P-RPC-RETRY-ATTEMPTS default) | — |
 | P-RATE-TOLERANCE | allowed budget overshoot (REQ-16 acceptance) | no overshoot in the deterministic queued-waiter and metered concurrent-call regressions; full S6 unmeasured | ⚠ 10 % over 1 s windows |
@@ -73,7 +75,7 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 
 | Parameter | Role | Observed | Target |
 |---|---|---|---|
-| P-SLO-HEAD-LATENCY | SLI-1 bound | ⊥ unmeasured; worst conforming acquisition retry ≈ P-ENRICH-RETRIES × P-ENRICH-DELAY = 500 ms | ⚠ |
+| P-SLO-HEAD-LATENCY | SLI-1 bound | ⊥ unmeasured; worst conforming incoherent retry ≈ P-ENRICH-RETRIES × P-ENRICH-DELAY = 500 ms plus re-fetch round trips; a legitimately lagging component may spend up to P-NOT-READY-BUDGET (GAP-40) | ⚠ |
 | P-SLO-COMMIT-LATENCY | SLI-2 bound | ⊥ | ⚠ |
 | P-SLO-QUERY-OVERHEAD | SLI-3 overhead bound | ⊥ unmeasured; a missing/incoherent historic block below the polled finalized head now spends up to ≈ 500 ms of adapter retry delay plus RPC-client retries before the first-byte error or mid-response truncation (ADR-19) | ⚠ |
 | P-SLO-THROUGHPUT | SLI-4 floor | ⊥ | ⚠ |

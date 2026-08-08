@@ -67,6 +67,9 @@ pub struct RpcOptions {
     /// How long the upstream finalized head may be served from cache.
     /// `None` → `FINALIZED_HEAD_TTL`.
     pub finalized_head_ttl: Option<std::time::Duration>,
+    /// Wall-clock budget for FM-16 not-ready retries on the head enrichment
+    /// path. `None` → `NOT_READY_BUDGET`.
+    pub not_ready_budget: Option<std::time::Duration>,
     pub verify_block_hash: bool,
     pub verify_tx_sender: bool,
     pub verify_tx_root: bool,
@@ -110,6 +113,14 @@ const FINALIZED_HEAD_TTL: std::time::Duration = std::time::Duration::from_secs(5
 /// budget an incoherent block gets before WP-11.3 fails the session.
 pub const P_ENRICH_RETRIES: u32 = 10;
 pub const P_ENRICH_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// `P-NOT-READY-BUDGET` / `P-NOT-READY-DELAY`: the wall-clock window a head
+/// block may keep answering "not ready" (FM-16) before WP-11.3 fails the
+/// session. Receipts lag headers by whole seconds on load-balanced fleets, so
+/// this budget counts time, not attempts; the TS predecessor waited such
+/// blocks out indefinitely at the same 100 ms cadence.
+pub const NOT_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+pub const NOT_READY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Fetch state for the Rpc layer.
 pub struct Rpc {
@@ -172,6 +183,10 @@ impl Rpc {
         self.options
             .finalized_head_ttl
             .unwrap_or(FINALIZED_HEAD_TTL)
+    }
+
+    fn not_ready_budget(&self) -> std::time::Duration {
+        self.options.not_ready_budget.unwrap_or(NOT_READY_BUDGET)
     }
 
     /// T1's read: replaces the cached view and opens a new epoch.
@@ -427,6 +442,13 @@ impl Rpc {
             match block {
                 None => break,
                 Some(b) => {
+                    // An errored/unparsable answer has no header to chain
+                    // through: keep it so its incoherence reaches the caller's
+                    // bounded budget, and cut the batch after it.
+                    if b.hash.is_empty() {
+                        chain.push(b);
+                        break;
+                    }
                     if i > 0 {
                         let prev_hash = &chain[i - 1].hash;
                         if !prev_hash.eq_ignore_ascii_case(&b.block.parent_hash) {
@@ -478,17 +500,24 @@ impl Rpc {
         // stale header across retries (the original bug) made such a mismatch
         // permanent and hung the ingestion loop forever with no error.
         //
-        // The retry is bounded; on exhaustion we surface the error so the
-        // ingestion loop logs it and restarts, like `getBlocks` throwing
-        // `_errorMessage` after its retries.
-        //
-        // Budget: 10 × 50ms = 500ms total — the same wall-clock window as the TS
-        // `getBlocks` (5 × 100ms), just polled finer. Unlike TS this runs at the
-        // chain *head* (speculative path), where receipts/logs legitimately lag
-        // the header, so the window must comfortably exceed that lag for normal
-        // head-following not to trip the (now fatal) bound.
+        // Two budgets, by the kind of invalidity (either exhaustion surfaces
+        // the error so the ingestion loop logs it and restarts, like
+        // `getBlocks` throwing `_errorMessage`):
+        // - NOT-READY (FM-16: data legitimately behind the header — this runs
+        //   at the chain *head*, where receipts/logs lag by whole seconds on
+        //   load-balanced fleets) polls every NOT_READY_DELAY against the
+        //   wall-clock NOT_READY_BUDGET, ignoring the attempt count.
+        // - INCOHERENT (WP-11.4: the answer contradicts the header) keeps
+        //   P_ENRICH_RETRIES × P_ENRICH_DELAY. The true wall window also
+        //   includes each re-fetch's round trips, so it exceeds the nominal
+        //   500 ms of sleep.
         let number = body.number;
-        let mut retries: u32 = 0;
+        let mut incoherent_retries: u32 = 0;
+        // Anchored at the first not-ready observation. The budget is a hard
+        // wall over the whole phase: the re-fetch below runs under it too, so
+        // a hung upstream (semaphore wait + the client's internal retry
+        // ladder) cannot stretch the window by its own round-trip time.
+        let mut not_ready_deadline: Option<tokio::time::Instant> = None;
 
         // First attempt: enrich the header we already fetched speculatively.
         // Network/RPC errors propagate (the client already retries transient
@@ -504,35 +533,69 @@ impl Rpc {
                 return Ok(blocks.remove(0));
             }
 
+            // A block gone absent on re-fetch is not-ready too: not produced,
+            // or not re-indexed after a reorg, yet.
+            let not_ready = blocks.first().is_none_or(|b| b.is_not_ready);
             let err_msg = blocks
                 .first()
                 .and_then(|b| b.error_message.clone())
                 .unwrap_or_else(|| "block not available".to_string());
 
-            if retries >= P_ENRICH_RETRIES {
+            let exhausted = || {
                 self.observe(Metrics::record_acquisition_retry_exhausted);
-                bail!(
-                    "failed to enrich block {number} after {P_ENRICH_RETRIES} retries: {err_msg}"
-                );
-            }
-            retries += 1;
+                anyhow!(
+                    "failed to enrich block {number}: still not ready after {:?}: {err_msg}",
+                    self.not_ready_budget()
+                )
+            };
+
+            // A not-ready answer does not reset the incoherent count: mixed
+            // upstreams may alternate a contradictory block with "not yet".
+            let (delay, deadline) = if not_ready {
+                let deadline = *not_ready_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + self.not_ready_budget());
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(exhausted());
+                }
+                (NOT_READY_DELAY, Some(deadline))
+            } else {
+                if incoherent_retries >= P_ENRICH_RETRIES {
+                    self.observe(Metrics::record_acquisition_retry_exhausted);
+                    bail!(
+                        "failed to enrich block {number} after {P_ENRICH_RETRIES} retries: \
+                         {err_msg}"
+                    );
+                }
+                incoherent_retries += 1;
+                (P_ENRICH_DELAY, None)
+            };
 
             debug!(
                 block = number,
-                attempt = retries,
-                max_retries = P_ENRICH_RETRIES,
+                not_ready,
+                incoherent_attempt = incoherent_retries,
+                max_incoherent_retries = P_ENRICH_RETRIES,
                 reason = %err_msg,
                 "block enrichment not ready, retrying whole-block fetch"
             );
 
-            tokio::time::sleep(P_ENRICH_DELAY).await;
-
             // Re-fetch the whole block (header + data) as one unit — TS
             // getBlockBatch semantics. An empty result (not produced yet / chain
             // break) leaves `blocks` empty and we keep retrying until the bound.
-            blocks = self
-                .get_block_batch(std::slice::from_ref(&number), req)
-                .await?;
+            let refetch = async {
+                tokio::time::sleep(delay).await;
+                self.get_block_batch(std::slice::from_ref(&number), req)
+                    .await
+            };
+            blocks = match deadline {
+                // Dropping the in-flight fetch at the deadline is safe: the
+                // client's capacity-semaphore permit is released on drop.
+                Some(deadline) => match tokio::time::timeout_at(deadline, refetch).await {
+                    Ok(fetched) => fetched?,
+                    Err(_elapsed) => return Err(exhausted()),
+                },
+                None => refetch.await?,
+            };
         }
     }
 
@@ -591,14 +654,26 @@ impl Rpc {
 
         for (i, result) in results.into_iter().enumerate() {
             match result {
-                Err(_) => blocks.push(None),
+                // Only a genuine null is FM-16 lag; an error or unparsable
+                // body is incoherence and must reach the bounded budget
+                // (WP-11.2), never the not-ready wall clock.
+                Err(e) => blocks.push(Some(incoherent_placeholder(
+                    numbers[i],
+                    format!("eth_getBlockByNumber failed for block {}: {e}", numbers[i]),
+                ))),
                 Ok(v) if v.is_null() => blocks.push(None),
                 Ok(v) => {
                     let rpc_block: RpcBlock = match serde_json::from_value(v.clone()) {
                         Ok(b) => b,
                         Err(e) => {
                             warn!("Failed to parse block {}: {}", numbers[i], e);
-                            blocks.push(None);
+                            blocks.push(Some(incoherent_placeholder(
+                                numbers[i],
+                                format!(
+                                    "unparsable eth_getBlockByNumber result for block {}: {e}",
+                                    numbers[i]
+                                ),
+                            )));
                             continue;
                         }
                     };
@@ -863,7 +938,7 @@ impl Rpc {
             // We mark the block invalid so the enrich retry loop will retry.
             // Note: an empty result for a block with no logs (bloom == 0x0...0) is correct.
             if block_logs.is_empty() && !is_zero_bloom(&block.block.logs_bloom) {
-                block.mark_invalid(
+                block.mark_not_ready(
                     "eth_getLogs returned empty result but logsBloom is non-zero (not ready)",
                 );
                 continue;
@@ -967,7 +1042,7 @@ impl Rpc {
                     continue;
                 }
                 Ok(v) if v.is_null() => {
-                    block.mark_invalid("eth_getBlockReceipts returned null (block not ready)");
+                    block.mark_not_ready("eth_getBlockReceipts returned null (block not ready)");
                     continue;
                 }
                 Ok(v) => {
@@ -988,12 +1063,23 @@ impl Rpc {
                              inconsistency, will retry",
                             block.hash, bad.block_hash
                         );
-                        block.mark_invalid(msg);
+                        block.mark_not_ready(msg);
                         continue;
                     }
 
                     if utils.has(Quirk::NonSequentialLogIndexes) {
                         renumber_logs(&mut receipts);
+                    }
+
+                    // A short answer is receipts still catching up, not a
+                    // contradiction (FM-16) — judged before verification, or a
+                    // partial set fails a commitment and burns the bounded
+                    // incoherent budget instead of the not-ready one (GAP-40).
+                    if block.block.transactions.len() != receipts.len() {
+                        block.mark_not_ready(
+                            "got invalid number of receipts from eth_getBlockReceipts",
+                        );
+                        continue;
                     }
 
                     // After the renumbering: the checks judge what will be served.
@@ -1005,13 +1091,6 @@ impl Rpc {
                         .and_then(|()| self.verify_receipts(block, &receipts, utils))
                     {
                         block.mark_invalid(reason);
-                        continue;
-                    }
-
-                    if block.block.transactions.len() != receipts.len() {
-                        block.mark_invalid(
-                            "got invalid number of receipts from eth_getBlockReceipts",
-                        );
                         continue;
                     }
 
@@ -1058,7 +1137,7 @@ impl Rpc {
             }
 
             if receipts.len() != tx_count {
-                block.mark_invalid("failed to get receipts for all transactions");
+                block.mark_not_ready("failed to get receipts for all transactions");
                 continue;
             }
 
@@ -1073,7 +1152,7 @@ impl Rpc {
                      inconsistency, will retry",
                     block.hash, bad.block_hash
                 );
-                block.mark_invalid(msg);
+                block.mark_not_ready(msg);
                 continue;
             }
 
@@ -1461,6 +1540,48 @@ impl Rpc {
 }
 
 // ─── Component coherence helpers (DEF-15 / IB-15) ─────────────────────────────
+
+/// An errored or unparsable `eth_getBlockByNumber` answer, kept in the batch as
+/// an incoherent block so callers route it to the bounded WP-11.2 budget. Never
+/// served: `is_invalid` holds, and the empty hash marks it unchainable.
+fn incoherent_placeholder(number: u64, reason: String) -> RawRpcBlock {
+    let block = RpcBlock {
+        number: to_qty(number),
+        hash: String::new(),
+        parent_hash: String::new(),
+        difficulty: None,
+        total_difficulty: None,
+        excess_blob_gas: None,
+        extra_data: String::new(),
+        gas_limit: String::new(),
+        gas_used: String::new(),
+        sha3_uncles: String::new(),
+        logs_bloom: String::new(),
+        transactions_root: String::new(),
+        receipts_root: String::new(),
+        state_root: String::new(),
+        miner: String::new(),
+        mix_hash: None,
+        nonce: None,
+        base_fee_per_gas: None,
+        blob_gas_used: None,
+        parent_beacon_block_root: None,
+        size: String::new(),
+        timestamp: String::new(),
+        transactions: Vec::new(),
+        uncles: Vec::new(),
+        withdrawals: None,
+        withdrawals_root: None,
+        requests_hash: None,
+        l1_block_number: None,
+        main_block_general_gas_limit: None,
+        shared_gas_limit: None,
+        timestamp_millis_part: None,
+    };
+    let mut raw = RawRpcBlock::new(number, String::new(), block);
+    raw.mark_invalid(reason);
+    raw
+}
 
 /// An error, a null, or a non-result payload leaves the block incoherent.
 fn unwrap_component(

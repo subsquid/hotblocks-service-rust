@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use futures::stream::{self, StreamExt};
+#[cfg(test)]
+use futures::stream::StreamExt;
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -139,6 +140,19 @@ async fn map_range_prefix(
 struct RangeAcquisition {
     blocks: Vec<RawRpcBlock>,
     failure: Option<anyhow::Error>,
+}
+
+/// In-order spawned stride acquisitions. Aborts still-running tasks on drop,
+/// so a dropped backfill stream cancels its in-flight strides promptly.
+#[derive(Default)]
+struct StridePipeline(std::collections::VecDeque<tokio::task::JoinHandle<(u64, RangeAcquisition)>>);
+
+impl Drop for StridePipeline {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// Describe why `candidate` cannot be emitted at `number` after `parent_hash`.
@@ -337,18 +351,35 @@ pub async fn ingest_range(
                     r
                 };
 
-                let mut strides = stream::iter(ranges.into_iter().map(|(s, e)| {
+                // Strides run as spawned tasks, not lazily buffered futures:
+                // each RPC call proceeds to completion (releasing its client
+                // permit) even while the consumer stops polling. At most
+                // `stride_concurrency` are in flight; completed results wait
+                // in their handles and emission stays ascending.
+                let spawn_stride = |s: u64, e: u64| {
                     let rpc2 = rpc.clone();
                     let req2 = req.clone();
-                    async move {
+                    tokio::spawn(async move {
                         let numbers: Vec<u64> = (s..=e).collect();
                         let acquisition = acquire_range_stride(&rpc2, &req2, &numbers).await;
                         (s, acquisition)
-                    }
-                }))
-                .buffered(stride_concurrency);
+                    })
+                };
 
-                while let Some((s, acquisition)) = strides.next().await {
+                let mut ranges = ranges.into_iter();
+                let mut pending = StridePipeline::default();
+                for (s, e) in ranges.by_ref().take(stride_concurrency.max(1)) {
+                    pending.0.push_back(spawn_stride(s, e));
+                }
+
+                while let Some(front) = pending.0.front_mut() {
+                    let joined = front.await;
+                    pending.0.pop_front();
+                    let (s, acquisition) = joined.map_err(anyhow::Error::from)?;
+                    if let Some((next_s, next_e)) = ranges.next() {
+                        pending.0.push_back(spawn_stride(next_s, next_e));
+                    }
+
                     let RangeAcquisition {
                         blocks: raw_blocks,
                         mut failure,
@@ -638,7 +669,10 @@ pub async fn ingest_range(
 mod tests {
     use super::*;
     use crate::fetch::RpcOptions;
+    use axum::{extract::State, response::IntoResponse, routing::post, Router};
     use rpc_client::{RpcClient, RpcClientConfig};
+    use serde_json::{json, Value};
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     #[should_panic(expected = "range acquisition requires at least one block number")]
@@ -651,5 +685,255 @@ mod tests {
         let rpc = Arc::new(Rpc::new(client, RpcOptions::default()));
 
         let _ = acquire_range_stride(&rpc, &DataRequest::default(), &[]).await;
+    }
+
+    fn block_hash(number: u64) -> String {
+        format!("0x{number:064x}")
+    }
+
+    fn rpc_block_json(number: u64) -> Value {
+        json!({
+            "number": format!("0x{number:x}"),
+            "hash": block_hash(number),
+            "parentHash": block_hash(number.wrapping_sub(1)),
+            "difficulty": "0x0",
+            "totalDifficulty": "0x0",
+            "extraData": "0x",
+            "gasLimit": "0x1c9c380",
+            "gasUsed": "0x0",
+            "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "receiptsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "stateRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "miner": "0x0000000000000000000000000000000000000000",
+            "mixHash": format!("0x{}", "00".repeat(32)),
+            "nonce": "0x0000000000000000",
+            "baseFeePerGas": "0x1",
+            "size": "0x220",
+            "timestamp": format!("0x{:x}", 1700000000u64 + number * 12),
+            "transactions": [],
+            "uncles": [],
+            "withdrawals": []
+        })
+    }
+
+    /// Serves a linked chain up to `top`; `missing` always answers null;
+    /// block requests at or past `delay_from` stall 150 ms per round trip.
+    #[derive(Clone)]
+    struct BackfillMock {
+        top: u64,
+        missing: Option<u64>,
+        delay_from: Option<u64>,
+    }
+
+    async fn backfill_handler(
+        State(mock): State<BackfillMock>,
+        body: axum::body::Bytes,
+    ) -> impl IntoResponse {
+        let request: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+        let batched = request.is_array();
+        let calls = request.as_array().cloned().unwrap_or_else(|| vec![request]);
+
+        let block_param = |call: &Value| -> Option<u64> {
+            if call.get("method").and_then(Value::as_str) != Some("eth_getBlockByNumber") {
+                return None;
+            }
+            let tag = call
+                .get("params")
+                .and_then(|params| params.get(0))
+                .and_then(Value::as_str)?;
+            u64::from_str_radix(tag.strip_prefix("0x")?, 16).ok()
+        };
+        if let Some(delay_from) = mock.delay_from {
+            let first = calls.iter().find_map(&block_param);
+            if first.is_some_and(|number| number >= delay_from) {
+                sleep(Duration::from_millis(150)).await;
+            }
+        }
+
+        let responses: Vec<Value> = calls
+            .iter()
+            .map(|call| {
+                let id = call.get("id").cloned().unwrap_or(json!(1));
+                let method = call.get("method").and_then(Value::as_str).unwrap_or("");
+                let tag = call
+                    .get("params")
+                    .and_then(|params| params.get(0))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let result = match method {
+                    "eth_chainId" => json!("0x1"),
+                    "eth_blockNumber" => json!(format!("0x{:x}", mock.top)),
+                    "eth_getBlockByNumber" if tag == "finalized" || tag == "latest" => {
+                        rpc_block_json(mock.top)
+                    }
+                    "eth_getBlockByNumber" => match block_param(call) {
+                        Some(number) if Some(number) != mock.missing && number <= mock.top => {
+                            rpc_block_json(number)
+                        }
+                        _ => Value::Null,
+                    },
+                    _ => Value::Null,
+                };
+                json!({"jsonrpc": "2.0", "id": id, "result": result})
+            })
+            .collect();
+
+        let response = if batched {
+            serde_json::to_vec(&responses)
+        } else {
+            serde_json::to_vec(&responses[0])
+        }
+        .expect("serialize mock response");
+        (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            response,
+        )
+    }
+
+    async fn serve_backfill_mock(mock: BackfillMock) -> String {
+        let app = Router::new()
+            .route("/", post(backfill_handler))
+            .with_state(mock);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("mock address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock");
+        });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    async fn backfill_rpc(url: &str, capacity: usize) -> Arc<Rpc> {
+        let client = Arc::new(RpcClient::new(RpcClientConfig {
+            url: url.to_string(),
+            capacity,
+            retry_attempts: 0,
+            ..Default::default()
+        }));
+        let rpc = Arc::new(Rpc::new(client, RpcOptions::default()));
+        rpc.resync_finalized_head()
+            .await
+            .expect("the finalized hint seeds backfill mode");
+        rpc
+    }
+
+    /// Blocks [1, to], stride size 2, stride concurrency 3.
+    async fn backfill_stream(
+        rpc: Arc<Rpc>,
+        to: u64,
+    ) -> impl futures::Stream<Item = Result<IngestBatch>> {
+        ingest_range(
+            rpc,
+            Arc::new(DataRequest::default()),
+            Arc::new(NormOptions {
+                with_traces: false,
+                with_state_diffs: false,
+            }),
+            1,
+            Some(to),
+            2,
+            3,
+            "finalized",
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn eager_backfill_emits_strides_in_ascending_order() {
+        let url = serve_backfill_mock(BackfillMock {
+            top: 24,
+            missing: None,
+            delay_from: None,
+        })
+        .await;
+        let rpc = backfill_rpc(&url, 5).await;
+        let mut stream = Box::pin(backfill_stream(rpc, 24).await);
+
+        let mut numbers = Vec::new();
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("backfill must keep progressing")
+        {
+            let batch = item.expect("backfill succeeds");
+            assert_eq!(
+                batch.finalized.as_ref().map(|f| f.number),
+                Some(24),
+                "backfill batches carry the finalized ref"
+            );
+            numbers.extend(batch.blocks.iter().map(|b| b.number));
+        }
+        assert_eq!(numbers, (1..=24).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn eager_backfill_fails_loud_after_the_prefix_below_a_stride_fault() {
+        let url = serve_backfill_mock(BackfillMock {
+            top: 24,
+            missing: Some(10),
+            delay_from: None,
+        })
+        .await;
+        let rpc = backfill_rpc(&url, 5).await;
+        let mut stream = Box::pin(backfill_stream(rpc, 24).await);
+
+        let mut numbers = Vec::new();
+        let failure = loop {
+            let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("the retry budget must keep the stream progressing")
+                .expect("the stream must fail loud, not end");
+            match item {
+                Ok(batch) => numbers.extend(batch.blocks.iter().map(|b| b.number)),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            numbers,
+            (1..=9).collect::<Vec<_>>(),
+            "the complete prefix below the fault is delivered"
+        );
+        assert!(
+            failure.to_string().contains(&format!(
+                "failed to acquire block 10 after {P_ENRICH_RETRIES} retries"
+            )),
+            "unexpected failure: {failure:#}"
+        );
+    }
+
+    /// Spawned strides must run their RPC calls to completion when the
+    /// consumer stops polling; lazily buffered ones froze mid-call and pinned
+    /// the client's permits, starving every co-tenant of the shared client
+    /// (head ingestion, in production).
+    #[tokio::test]
+    async fn a_stalled_backfill_consumer_frees_upstream_permits() {
+        let url = serve_backfill_mock(BackfillMock {
+            top: 24,
+            missing: None,
+            delay_from: Some(3),
+        })
+        .await;
+        // Two client permits under three-stride concurrency: two frozen
+        // strides would pin them both.
+        let rpc = backfill_rpc(&url, 2).await;
+        // Warm the chain-utils cell so no stride waits on eth_chainId.
+        rpc.get_single_block(1).await.expect("warm-up fetch");
+        let mut stream = Box::pin(backfill_stream(rpc.clone(), 24).await);
+
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the first stride is undelayed")
+            .expect("the stream yields")
+            .expect("the first stride succeeds");
+        assert_eq!(first.blocks.first().map(|b| b.number), Some(1));
+
+        // The consumer stalls here with delayed strides still in flight.
+        let height = tokio::time::timeout(Duration::from_secs(3), rpc.get_height())
+            .await
+            .expect("in-flight strides must release the shared upstream permits")
+            .expect("the height probe succeeds");
+        assert_eq!(height, 24);
     }
 }

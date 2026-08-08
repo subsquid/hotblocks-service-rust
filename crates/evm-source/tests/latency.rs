@@ -799,6 +799,9 @@ async fn head_incoherence_remains_the_primary_error_when_pending_enrichment_fail
         make_client(&format!("http://127.0.0.1:{}", addr.port())),
         RpcOptions {
             verify_withdrawals_root: true,
+            // Block 100's receipts stay null (not-ready); shrink its wall-clock
+            // budget so the drain sees the failure inside the test timeout.
+            not_ready_budget: Some(Duration::from_millis(500)),
             ..RpcOptions::default()
         },
     ));

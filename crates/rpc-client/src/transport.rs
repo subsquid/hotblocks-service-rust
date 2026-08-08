@@ -152,6 +152,13 @@ impl RpcTransport for HttpTransport {
 
         let resp_id = resp.id.as_ref().and_then(|v| v.as_u64()).unwrap_or(0);
         if resp_id != id {
+            // Endpoints/proxies answer 200 with an `id: null` error envelope
+            // for rate limits, oversized requests, gateway failures, etc.
+            // That is the real server error (retry-classifiable), not a
+            // protocol violation (mirrors TS transport/http.ts `call`).
+            if resp.error.is_some() {
+                return Ok(resp);
+            }
             return Err(RpcError::Protocol(format!(
                 "Got response for unknown request {resp_id}"
             )));
@@ -171,8 +178,24 @@ impl RpcTransport for HttpTransport {
         let body = serde_json::to_vec(&requests).expect("serialize");
         let raw = self.post_raw(body, timeout).await?;
 
-        let responses: Vec<RpcResponse> = serde_json::from_slice(&raw)
-            .map_err(|e| RpcError::Protocol(format!("invalid JSON in batch response: {e}")))?;
+        let responses: Vec<RpcResponse> = match serde_json::from_slice(&raw) {
+            Ok(responses) => responses,
+            Err(e) => {
+                // A server rejecting the whole batch (rate limit, oversized
+                // request, gateway failure) often replies with one JSON-RPC
+                // error envelope instead of an array. Surface that server
+                // error (mirrors TS transport/http.ts `batchCall`).
+                if let Ok(RpcResponse {
+                    error: Some(info), ..
+                }) = serde_json::from_slice::<RpcResponse>(&raw)
+                {
+                    return Err(RpcError::from_info(info));
+                }
+                return Err(RpcError::Protocol(format!(
+                    "invalid JSON in batch response: {e}"
+                )));
+            }
+        };
 
         if responses.len() != count {
             return Err(RpcError::Protocol(format!(

@@ -637,6 +637,11 @@ pub struct RawRpcBlock {
     pub debug_state_diffs: Option<Vec<Option<DebugStateDiffResult>>>,
     #[serde(default = "default_false")]
     pub is_invalid: bool,
+    /// The invalidity is FM-16 not-ready lag — data behind the header, healed
+    /// by waiting — rather than a WP-11.4 contradiction. Meaningful only when
+    /// `is_invalid`.
+    #[serde(default = "default_false")]
+    pub is_not_ready: bool,
     #[serde(default)]
     pub error_message: Option<String>,
 }
@@ -653,12 +658,25 @@ impl RawRpcBlock {
             trace_replays: None,
             debug_state_diffs: None,
             is_invalid: false,
+            is_not_ready: false,
             error_message: None,
         }
     }
 
     pub fn mark_invalid(&mut self, msg: impl Into<String>) {
         self.is_invalid = true;
+        self.is_not_ready = false;
+        self.error_message = Some(msg.into());
+    }
+
+    /// Waiting cannot heal a contradiction, so an incoherent mark is never
+    /// downgraded to not-ready.
+    pub fn mark_not_ready(&mut self, msg: impl Into<String>) {
+        if self.is_invalid && !self.is_not_ready {
+            return;
+        }
+        self.is_invalid = true;
+        self.is_not_ready = true;
         self.error_message = Some(msg.into());
     }
 }
