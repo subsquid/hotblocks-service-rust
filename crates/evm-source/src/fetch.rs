@@ -151,6 +151,23 @@ enum ReceiptsMethod {
     ByTx,
 }
 
+/// A receipts round trip awaiting application, tagged with the method whose
+/// positional layout its results follow.
+enum ReceiptsFetch {
+    ByBlock(Vec<std::result::Result<Value, RpcError>>),
+    ByTx(Vec<std::result::Result<Value, RpcError>>),
+}
+
+/// The trace round trips awaiting application. `traceable` holds the block
+/// indices the component vectors are positionally aligned with.
+struct TracesFetch {
+    traceable: Vec<usize>,
+    debug_frames: Option<Vec<Component<Vec<Option<DebugFrameResult>>>>>,
+    debug_diffs: Option<Vec<Component<Vec<Option<DebugStateDiffResult>>>>>,
+    trace_replays: Option<Vec<Component<Vec<TraceTransactionReplay>>>>,
+    trace_block: Option<Vec<Component<Vec<TraceTransactionReplay>>>>,
+}
+
 impl Rpc {
     pub fn new(client: Arc<RpcClient>, options: RpcOptions) -> Self {
         Rpc {
@@ -663,7 +680,7 @@ impl Rpc {
                 ))),
                 Ok(v) if v.is_null() => blocks.push(None),
                 Ok(v) => {
-                    let rpc_block: RpcBlock = match serde_json::from_value(v.clone()) {
+                    let rpc_block: RpcBlock = match serde_json::from_value(v) {
                         Ok(b) => b,
                         Err(e) => {
                             warn!("Failed to parse block {}: {}", numbers[i], e);
@@ -737,17 +754,31 @@ impl Rpc {
         }
 
         if self.options.verify_tx_sender {
-            for tx in &block.transactions {
-                let recovered = utils
-                    .recover_tx_sender(tx)
-                    .map_err(|e| format!("sender recovery failed for tx {}: {e}", tx.hash))?;
-                let Some(sender) = recovered else { continue };
-                if !sender.eq_ignore_ascii_case(&tx.from) {
-                    return Err(format!(
-                        "sender mismatch for tx {}: claimed {} recovered {sender}",
-                        tx.hash, tx.from
-                    ));
-                }
+            use rayon::prelude::*;
+            // Recovery is per-tx and order-independent; collecting keeps tx
+            // order so the earliest failure still decides the verdict, as the
+            // serial loop's did.
+            let verdicts: Vec<Result<(), String>> = block
+                .transactions
+                .par_iter()
+                .map(|tx| {
+                    let recovered = utils
+                        .recover_tx_sender(tx)
+                        .map_err(|e| format!("sender recovery failed for tx {}: {e}", tx.hash))?;
+                    let Some(sender) = recovered else {
+                        return Ok(());
+                    };
+                    if !sender.eq_ignore_ascii_case(&tx.from) {
+                        return Err(format!(
+                            "sender mismatch for tx {}: claimed {} recovered {sender}",
+                            tx.hash, tx.from
+                        ));
+                    }
+                    Ok(())
+                })
+                .collect();
+            for verdict in verdicts {
+                verdict?;
             }
         }
 
@@ -864,30 +895,51 @@ impl Rpc {
     ) -> Result<()> {
         self.options.validate_request(req)?;
 
-        let _tasks: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>> =
-            Vec::new();
+        // Each leg is one upstream round trip writing fields no other leg
+        // touches, so the fetch halves overlap; the applies then run in the
+        // legs' fixed order, which keeps error precedence and per-block marks
+        // exactly as the serial implementation left them.
+        let shared: &[RawRpcBlock] = blocks;
+        let (logs_fetch, receipts_fetch, traces_fetch) = tokio::join!(
+            async {
+                if req.logs {
+                    self.fetch_logs(shared).await.map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                if req.receipts {
+                    self.fetch_receipts(shared).await.map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                if req.traces || req.state_diffs {
+                    self.fetch_traces(shared, req).await.map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+        );
 
-        // We need to add data sequentially since we can't easily split the &mut vec
-        // across multiple concurrent futures. Run them sequentially here.
-
-        if req.logs {
-            self.add_logs(blocks).await?;
+        if let Some(logs) = logs_fetch? {
+            self.apply_logs(blocks, logs).await?;
         }
-
-        if req.receipts {
-            self.add_receipts(blocks).await?;
+        if let Some(receipts) = receipts_fetch? {
+            self.apply_receipts(blocks, receipts).await?;
         }
-
-        if req.traces || req.state_diffs {
-            self.add_traces(blocks, req).await?;
+        if let Some(traces) = traces_fetch? {
+            self.apply_traces(blocks, traces);
         }
 
         Ok(())
     }
 
-    async fn add_logs(&self, blocks: &mut [RawRpcBlock]) -> Result<()> {
+    async fn fetch_logs(&self, blocks: &[RawRpcBlock]) -> Result<Vec<RpcLog>> {
         if blocks.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let from = &blocks[0].block.number;
         let to = &blocks[blocks.len() - 1].block.number;
@@ -916,8 +968,10 @@ impl Rpc {
             )
             .await?;
 
-        let logs: Vec<RpcLog> = serde_json::from_value(result)?;
+        Ok(serde_json::from_value(result)?)
+    }
 
+    async fn apply_logs(&self, blocks: &mut [RawRpcBlock], logs: Vec<RpcLog>) -> Result<()> {
         // Group logs by block hash
         let mut logs_by_block: std::collections::HashMap<String, Vec<RpcLog>> =
             std::collections::HashMap::new();
@@ -984,15 +1038,35 @@ impl Rpc {
         Ok(method)
     }
 
-    async fn add_receipts(&self, blocks: &mut [RawRpcBlock]) -> Result<()> {
+    async fn fetch_receipts(&self, blocks: &[RawRpcBlock]) -> Result<ReceiptsFetch> {
         let method = self.get_receipts_method().await?;
         match method {
-            ReceiptsMethod::ByBlock => self.add_receipts_by_block(blocks).await,
-            ReceiptsMethod::ByTx => self.add_receipts_by_tx(blocks).await,
+            ReceiptsMethod::ByBlock => self
+                .fetch_receipts_by_block(blocks)
+                .await
+                .map(ReceiptsFetch::ByBlock),
+            ReceiptsMethod::ByTx => self
+                .fetch_receipts_by_tx(blocks)
+                .await
+                .map(ReceiptsFetch::ByTx),
         }
     }
 
-    async fn add_receipts_by_block(&self, blocks: &mut [RawRpcBlock]) -> Result<()> {
+    async fn apply_receipts(
+        &self,
+        blocks: &mut [RawRpcBlock],
+        fetched: ReceiptsFetch,
+    ) -> Result<()> {
+        match fetched {
+            ReceiptsFetch::ByBlock(results) => self.apply_receipts_by_block(blocks, results).await,
+            ReceiptsFetch::ByTx(results) => self.apply_receipts_by_tx(blocks, results).await,
+        }
+    }
+
+    async fn fetch_receipts_by_block(
+        &self,
+        blocks: &[RawRpcBlock],
+    ) -> Result<Vec<std::result::Result<Value, RpcError>>> {
         let calls: Vec<(String, Option<Value>)> = blocks
             .iter()
             .map(|b| {
@@ -1027,11 +1101,17 @@ impl Rpc {
             ..Default::default()
         };
 
-        let results = self
+        Ok(self
             .client
             .batch_call_reduce_on_retry(calls, &options)
-            .await?;
+            .await?)
+    }
 
+    async fn apply_receipts_by_block(
+        &self,
+        blocks: &mut [RawRpcBlock],
+        results: Vec<std::result::Result<Value, RpcError>>,
+    ) -> Result<()> {
         let utils = self.get_chain_utils().await?;
 
         for (i, result) in results.into_iter().enumerate() {
@@ -1102,7 +1182,10 @@ impl Rpc {
         Ok(())
     }
 
-    async fn add_receipts_by_tx(&self, blocks: &mut [RawRpcBlock]) -> Result<()> {
+    async fn fetch_receipts_by_tx(
+        &self,
+        blocks: &[RawRpcBlock],
+    ) -> Result<Vec<std::result::Result<Value, RpcError>>> {
         let mut calls: Vec<(String, Option<Value>)> = Vec::new();
         for block in blocks.iter() {
             for tx in &block.block.transactions {
@@ -1113,11 +1196,17 @@ impl Rpc {
             }
         }
 
-        let results = self
+        Ok(self
             .client
             .batch_call_reduce_on_retry(calls, &CallOptions::default())
-            .await?;
+            .await?)
+    }
 
+    async fn apply_receipts_by_tx(
+        &self,
+        blocks: &mut [RawRpcBlock],
+        results: Vec<std::result::Result<Value, RpcError>>,
+    ) -> Result<()> {
         let mut result_iter = results.into_iter();
         let utils = self.get_chain_utils().await?;
 
@@ -1175,11 +1264,11 @@ impl Rpc {
         Ok(())
     }
 
-    async fn add_traces(
+    async fn fetch_traces(
         &self,
-        blocks: &mut Vec<RawRpcBlock>,
+        blocks: &[RawRpcBlock],
         req: &crate::types::DataRequest,
-    ) -> Result<()> {
+    ) -> Result<TracesFetch> {
         // Skip genesis block (not traceable)
         let traceable: Vec<usize> = blocks
             .iter()
@@ -1189,7 +1278,13 @@ impl Rpc {
             .collect();
 
         if traceable.is_empty() {
-            return Ok(());
+            return Ok(TracesFetch {
+                traceable,
+                debug_frames: None,
+                debug_diffs: None,
+                trace_replays: None,
+                trace_block: None,
+            });
         }
 
         // One trace method per selection (GAP-17): the replay call carries
@@ -1199,47 +1294,76 @@ impl Rpc {
         let need_replay_trace = req.traces && req.use_trace_api && need_replay_statediff;
         let need_replay = need_replay_trace || need_replay_statediff;
 
-        // Debug frames (callTracer)
-        let debug_frames_opt = if req.traces && !req.use_trace_api {
-            let trace_blocks: Vec<&RawRpcBlock> = traceable.iter().map(|&i| &blocks[i]).collect();
-            Some(self.fetch_debug_frames(&trace_blocks, req).await?)
-        } else {
-            None
-        };
+        let trace_blocks: Vec<&RawRpcBlock> = traceable.iter().map(|&i| &blocks[i]).collect();
 
-        // Debug state diffs (prestateTracer)
-        let debug_diffs_opt = if req.state_diffs && req.use_debug_api_for_state_diffs {
-            let trace_blocks: Vec<&RawRpcBlock> = traceable.iter().map(|&i| &blocks[i]).collect();
-            Some(self.fetch_debug_state_diffs(&trace_blocks, req).await?)
-        } else {
-            None
-        };
+        // The enabled sub-legs are independent round trips too; results are
+        // still handled in the serial order, so the first sub-leg's transport
+        // error stays the one reported.
+        let (debug_frames_res, debug_diffs_res, trace_replay_res, trace_block_res) = tokio::join!(
+            async {
+                // Debug frames (callTracer)
+                if req.traces && !req.use_trace_api {
+                    self.fetch_debug_frames(&trace_blocks, req).await.map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                // Debug state diffs (prestateTracer)
+                if req.state_diffs && req.use_debug_api_for_state_diffs {
+                    self.fetch_debug_state_diffs(&trace_blocks, req)
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                // Trace replay
+                if need_replay {
+                    let mut tracers = Vec::new();
+                    if need_replay_trace {
+                        tracers.push("trace");
+                    }
+                    if need_replay_statediff {
+                        tracers.push("stateDiff");
+                    }
+                    self.fetch_trace_replays(&trace_blocks, &tracers)
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                // trace_block (use_trace_api without statediff)
+                if req.traces && req.use_trace_api && !need_replay_statediff {
+                    self.fetch_trace_block(&trace_blocks).await.map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+        );
 
-        // Trace replay
-        let trace_replay_opt = if need_replay {
-            let trace_blocks: Vec<&RawRpcBlock> = traceable.iter().map(|&i| &blocks[i]).collect();
-            let mut tracers = Vec::new();
-            if need_replay_trace {
-                tracers.push("trace");
-            }
-            if need_replay_statediff {
-                tracers.push("stateDiff");
-            }
-            Some(self.fetch_trace_replays(&trace_blocks, &tracers).await?)
-        } else {
-            None
-        };
+        Ok(TracesFetch {
+            traceable,
+            debug_frames: debug_frames_res?,
+            debug_diffs: debug_diffs_res?,
+            trace_replays: trace_replay_res?,
+            trace_block: trace_block_res?,
+        })
+    }
 
-        // trace_block (use_trace_api without statediff)
-        let trace_block_opt = if req.traces && req.use_trace_api && !need_replay_statediff {
-            let trace_blocks: Vec<&RawRpcBlock> = traceable.iter().map(|&i| &blocks[i]).collect();
-            Some(self.fetch_trace_block(&trace_blocks).await?)
-        } else {
-            None
-        };
+    fn apply_traces(&self, blocks: &mut [RawRpcBlock], fetched: TracesFetch) {
+        let TracesFetch {
+            traceable,
+            debug_frames,
+            debug_diffs,
+            trace_replays,
+            trace_block,
+        } = fetched;
 
-        // Now assign results (no more borrows of blocks elements)
-        if let Some(debug_frames) = debug_frames_opt {
+        if let Some(debug_frames) = debug_frames {
             for (i, frames) in traceable.iter().zip(debug_frames.into_iter()) {
                 match frames {
                     Ok(f) => blocks[*i].debug_frames = Some(f),
@@ -1247,7 +1371,7 @@ impl Rpc {
                 }
             }
         }
-        if let Some(debug_diffs) = debug_diffs_opt {
+        if let Some(debug_diffs) = debug_diffs {
             for (i, diffs) in traceable.iter().zip(debug_diffs.into_iter()) {
                 match diffs {
                     Ok(d) => blocks[*i].debug_state_diffs = Some(d),
@@ -1255,7 +1379,7 @@ impl Rpc {
                 }
             }
         }
-        if let Some(replays) = trace_replay_opt {
+        if let Some(replays) = trace_replays {
             for (i, replay) in traceable.iter().zip(replays.into_iter()) {
                 match replay {
                     Ok(r) => blocks[*i].trace_replays = Some(r),
@@ -1263,7 +1387,7 @@ impl Rpc {
                 }
             }
         }
-        if let Some(replays) = trace_block_opt {
+        if let Some(replays) = trace_block {
             for (i, replay) in traceable.iter().zip(replays.into_iter()) {
                 match replay {
                     Ok(r) => blocks[*i].trace_replays = Some(r),
@@ -1271,8 +1395,6 @@ impl Rpc {
                 }
             }
         }
-
-        Ok(())
     }
 
     async fn fetch_debug_frames(

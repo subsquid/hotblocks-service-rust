@@ -19,13 +19,24 @@ pub fn map_raw_block(
     timings_in: Option<(std::time::Instant, std::time::Instant)>,
 ) -> Result<Block> {
     let normalized = map_rpc_block(raw, options);
-    let json_line = serde_json::to_string(&normalized)? + "\n";
-    let json_line_bytes = json_line.into_bytes();
 
     let normalize_done = timings_in.map(|_| std::time::Instant::now());
 
+    // Serialize straight into the zstd stream: the uncompressed line (up to
+    // several MB) never exists as one buffer. Buffered, so serde's small
+    // writes don't each cross into the compressor. The zstd frame bytes are
+    // identical to the two-pass encode's — the compressor is agnostic to
+    // write granularity. Serialization time moves from the normalize bucket
+    // to the compress bucket of the block_timing log.
     let compress_start = std::time::Instant::now();
-    let compressed = zstd::encode_all(std::io::Cursor::new(&json_line_bytes), 1)?;
+    let mut writer =
+        std::io::BufWriter::with_capacity(64 * 1024, zstd::Encoder::new(Vec::new(), 1)?);
+    serde_json::to_writer(&mut writer, &normalized)?;
+    std::io::Write::write_all(&mut writer, b"\n")?;
+    let compressed = writer
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("flush into zstd encoder: {e}"))?
+        .finish()?;
     let compress_duration = compress_start.elapsed();
     let json_line_zstd = Bytes::from(compressed);
 

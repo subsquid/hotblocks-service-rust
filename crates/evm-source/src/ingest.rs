@@ -64,7 +64,9 @@ impl CadencePredictor {
     /// load-balanced nodes), so a single long sleep until the predicted
     /// arrival risks sleeping through an early block. Instead we only stay
     /// quiet while we're more than 600ms away from the predicted arrival,
-    /// and poll every 25ms inside that window.
+    /// and poll every 25ms inside that window. A tighter grain shaves the
+    /// detection tail but multiplies provider traffic (~24 → ~60 polls per
+    /// hot window at 10ms), so 25ms stands.
     pub fn next_poll_delay(&self, now: Instant) -> Duration {
         const HOT_WINDOW_MS: f64 = 600.0;
         const HOT_POLL_MS: f64 = 25.0;
