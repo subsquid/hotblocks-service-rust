@@ -231,3 +231,98 @@ async fn acquisition_retry_exhaustion_is_an_event() {
         1.0
     );
 }
+
+/// OB-3's detection half. Arrival lag as one number cannot say whether a block
+/// was produced late or merely noticed late, and a poller can only do something
+/// about the second. The gap is the wait preceding the poll that found the
+/// block — the interval it may have sat unnoticed in — and the interval beside
+/// it is what the cadence predictor is fed, so a mispredicting poller and a
+/// chain with spread-out arrivals read differently.
+#[tokio::test]
+async fn head_detection_gap_and_interval_are_observed() {
+    let upstream = Upstream::start(Chain::linear(FIRST, COUNT, 1)).await;
+    // Above FIRST+1 the upstream answers "not produced yet", so the poller has
+    // to wait for the head to move instead of walking a chain already there.
+    upstream.set_head(FIRST + 1);
+    let wired = wire(&upstream, 0);
+
+    assert!(drive(&wired.source, FIRST + 1, 1).await.is_none());
+    assert_eq!(
+        sample(&wired.metrics, "sqd_hotblocks_head_detection_gap_ms_count"),
+        0.0,
+        "a block that was already there was not waited for"
+    );
+
+    // Same session, two arrivals: the second only exists after the head moves,
+    // so the poller parks on it and discovers it a poll interval later.
+    let (error, ()) = tokio::join!(drive(&wired.source, FIRST + 1, 2), async {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        upstream.set_head(FIRST + 2);
+    });
+    assert!(error.is_none(), "the head moved, the session must not fail");
+
+    assert_eq!(
+        sample(&wired.metrics, "sqd_hotblocks_head_detection_gap_ms_count"),
+        1.0,
+        "exactly the one discovery that ended a wait is charged"
+    );
+    let gap = sample(&wired.metrics, "sqd_hotblocks_head_detection_gap_ms_sum");
+    assert!(
+        (25.0..1000.0).contains(&gap),
+        "the gap is the poll interval that hid the block, not the whole wait: {gap} ms"
+    );
+
+    assert_eq!(
+        sample(&wired.metrics, "sqd_hotblocks_head_interval_ms_count"),
+        1.0,
+        "one interval per consecutive pair of arrivals"
+    );
+    let interval = sample(&wired.metrics, "sqd_hotblocks_head_interval_ms_sum");
+    assert!(
+        interval >= 200.0,
+        "the arrival interval spans the wait for the head to move: {interval} ms"
+    );
+}
+
+/// The same gap, with the consumer holding the handoff. A stream parked on its
+/// reader is not a poller that mispredicted the cadence, and charging one as
+/// the other would make the histogram read like a prediction problem in exactly
+/// the incident where downstream is the problem.
+#[tokio::test]
+async fn consumer_backpressure_is_not_charged_to_detection() {
+    const STALL: Duration = Duration::from_millis(600);
+
+    let upstream = Upstream::start(Chain::linear(FIRST, COUNT, 1)).await;
+    upstream.set_head(FIRST + 1);
+    let wired = wire(&upstream, 0);
+
+    let mut stream = wired.source.get_stream(StreamRequest {
+        from: FIRST + 1,
+        to: None,
+        parent_hash: None,
+    });
+
+    // First batch in hand, the stream is parked at the handoff and the next
+    // height only appears while the reader is away.
+    let first = tokio::time::timeout(BUDGET, stream.next())
+        .await
+        .expect("first batch");
+    assert!(first.is_some_and(|batch| batch.is_ok()));
+    upstream.set_head(FIRST + 2);
+    tokio::time::sleep(STALL).await;
+
+    let second = tokio::time::timeout(BUDGET, stream.next())
+        .await
+        .expect("second batch");
+    assert!(second.is_some_and(|batch| batch.is_ok()));
+
+    assert!(
+        sample(&wired.metrics, "sqd_hotblocks_head_detection_gap_ms_count") >= 1.0,
+        "the discovery this pins has to be charged at all"
+    );
+    let gap = sample(&wired.metrics, "sqd_hotblocks_head_detection_gap_ms_sum");
+    assert!(
+        gap < STALL.as_millis() as f64,
+        "the reader's {STALL:?} stall must not read as detection delay: {gap} ms"
+    );
+}

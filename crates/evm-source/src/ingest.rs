@@ -314,6 +314,13 @@ pub async fn ingest_range(
 
         // Cadence predictor for speculative ("latest") poll mode
         let mut cadence = CadencePredictor::new();
+        // OB-3 detection half: the last fruitless poll, and the last arrival the
+        // predictor was fed. Both are per-session, like the predictor itself.
+        let mut last_empty_poll: Option<Instant> = None;
+        let mut last_arrival: Option<Instant> = None;
+        // Handing a batch over parks this loop for as long as the consumer takes,
+        // which is not the poller's to answer for: charged to nobody.
+        let mut consumer_blocked = Duration::ZERO;
 
         // Speculative height: the block number we're currently waiting for
         // in speculative mode. Reset on break-out from that mode.
@@ -466,7 +473,9 @@ pub async fn ingest_range(
                     {
                         let (_, task) = pending.pop_front().unwrap();
                         let mapped = task.await.map_err(anyhow::Error::from)??;
+                        let handoff = Instant::now();
                         yield IngestBatch { blocks: mapped, finalized: None };
+                        consumer_blocked += handoff.elapsed();
                     }
 
                     if next_num > end {
@@ -482,6 +491,7 @@ pub async fn ingest_range(
                         break;
                     }
 
+                    let poll_at = Instant::now();
                     match rpc.get_single_block(next_num).await? {
                         Some(body) if !body.is_invalid => {
                             let now = Instant::now();
@@ -492,7 +502,23 @@ pub async fn ingest_range(
                             // delivered N proves the upstream reached N.
                             if let Some(metrics) = rpc.metrics() {
                                 metrics.observe_upstream_head(next_num);
+                                // Only a poll that ended a wait bounds when the
+                                // block could have appeared; catching up does not.
+                                if let Some(empty_at) = last_empty_poll.take() {
+                                    metrics.observe_head_detection_gap(
+                                        poll_at
+                                            .duration_since(empty_at)
+                                            .saturating_sub(consumer_blocked),
+                                    );
+                                }
+                                // The predictor's own input, detection error
+                                // included — which is what makes it readable
+                                // against the gap above.
+                                if let Some(prev) = last_arrival {
+                                    metrics.observe_head_interval(now.duration_since(prev));
+                                }
                             }
+                            last_arrival = Some(now);
                             let body_received = if profile_block_timings { Some(now) } else { None };
                             pending.push_back((next_num, spawn_enrich(body, body_received)));
                             next_num += 1;
@@ -504,6 +530,8 @@ pub async fn ingest_range(
                             // over). A missing block is the arm below, and stays
                             // unbounded — that one is ordinary head-following.
                             hot_streak = 0;
+                            // Re-acquisition delay is not poll cadence.
+                            last_empty_poll = None;
                             let reason = body
                                 .error_message
                                 .unwrap_or_else(|| "incoherent block".to_string());
@@ -559,6 +587,8 @@ pub async fn ingest_range(
                             // Not produced yet. While waiting, opportunistically
                             // drain a completed front task.
                             hot_streak = 0;
+                            last_empty_poll = Some(poll_at);
+                            consumer_blocked = Duration::ZERO;
                             // An exact OB-4 observation, not an absence of one:
                             // N does not exist and N-1 was delivered, so the
                             // upstream head is N-1. LIV-2 needs it to tell an
@@ -574,7 +604,9 @@ pub async fn ingest_range(
                                     Ok(res) => {
                                         pending.pop_front();
                                         let mapped = res.map_err(anyhow::Error::from)??;
+                                        let handoff = Instant::now();
                                         yield IngestBatch { blocks: mapped, finalized: None };
+                                        consumer_blocked += handoff.elapsed();
                                     }
                                     Err(_elapsed) => {}
                                 }
