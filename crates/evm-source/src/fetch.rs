@@ -1,9 +1,11 @@
 //! RPC fetch layer — ports evm-rpc/src/rpc.ts (minus Cronos phantom-tx).
 #![allow(clippy::ptr_arg)]
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use data_service_core::metrics::Metrics;
+use futures::future::Either;
 use rpc_client::{CallOptions, RpcClient, RpcError, RpcErrorInfo};
 
 use serde_json::{json, Value};
@@ -166,6 +168,22 @@ struct TracesFetch {
     debug_diffs: Option<Vec<Component<Vec<Option<DebugStateDiffResult>>>>>,
     trace_replays: Option<Vec<Component<Vec<TraceTransactionReplay>>>>,
     trace_block: Option<Vec<Component<Vec<TraceTransactionReplay>>>>,
+}
+
+/// Runs `hi` and `lo` concurrently, dropping `lo` the moment `hi` fails. `lo`'s
+/// value is only readable after `hi`'s error would already have propagated, so
+/// awaiting it just lets a slow (or, with the request timeout disabled, endless)
+/// call hold back an error the batch has already decided. Nest to extend the
+/// ladder: priority is nesting order.
+async fn join_or_err<T, U, E>(
+    hi: impl Future<Output = std::result::Result<T, E>>,
+    lo: impl Future<Output = U>,
+) -> std::result::Result<(T, U), E> {
+    futures::pin_mut!(hi, lo);
+    match futures::future::select(hi, lo).await {
+        Either::Left((hi_out, lo)) => Ok((hi_out?, lo.await)),
+        Either::Right((lo_out, hi)) => Ok((hi.await?, lo_out)),
+    }
 }
 
 impl Rpc {
@@ -898,9 +916,11 @@ impl Rpc {
         // Each leg is one upstream round trip writing fields no other leg
         // touches, so the fetch halves overlap; the applies then run in the
         // legs' fixed order, which keeps error precedence and per-block marks
-        // exactly as the serial implementation left them.
+        // exactly as the serial implementation left them. A failing leg drops
+        // the ones below it (`join_or_err`) — their answers can no longer be
+        // read, so waiting them out would only delay the error.
         let shared: &[RawRpcBlock] = blocks;
-        let (logs_fetch, receipts_fetch, traces_fetch) = tokio::join!(
+        let (logs_fetch, rest) = join_or_err(
             async {
                 if req.logs {
                     self.fetch_logs(shared).await.map(Some)
@@ -908,26 +928,30 @@ impl Rpc {
                     Ok(None)
                 }
             },
-            async {
-                if req.receipts {
-                    self.fetch_receipts(shared).await.map(Some)
-                } else {
-                    Ok(None)
-                }
-            },
-            async {
-                if req.traces || req.state_diffs {
-                    self.fetch_traces(shared, req).await.map(Some)
-                } else {
-                    Ok(None)
-                }
-            },
-        );
+            join_or_err(
+                async {
+                    if req.receipts {
+                        self.fetch_receipts(shared).await.map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                },
+                async {
+                    if req.traces || req.state_diffs {
+                        self.fetch_traces(shared, req).await.map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                },
+            ),
+        )
+        .await?;
 
-        if let Some(logs) = logs_fetch? {
+        if let Some(logs) = logs_fetch {
             self.apply_logs(blocks, logs).await?;
         }
-        if let Some(receipts) = receipts_fetch? {
+        let (receipts_fetch, traces_fetch) = rest?;
+        if let Some(receipts) = receipts_fetch {
             self.apply_receipts(blocks, receipts).await?;
         }
         if let Some(traces) = traces_fetch? {
@@ -1298,8 +1322,9 @@ impl Rpc {
 
         // The enabled sub-legs are independent round trips too; results are
         // still handled in the serial order, so the first sub-leg's transport
-        // error stays the one reported.
-        let (debug_frames_res, debug_diffs_res, trace_replay_res, trace_block_res) = tokio::join!(
+        // error stays the one reported — and, as above, drops the sub-legs
+        // below it rather than waiting them out.
+        let (debug_frames, rest) = join_or_err(
             async {
                 // Debug frames (callTracer)
                 if req.traces && !req.use_trace_api {
@@ -1308,49 +1333,56 @@ impl Rpc {
                     Ok(None)
                 }
             },
-            async {
-                // Debug state diffs (prestateTracer)
-                if req.state_diffs && req.use_debug_api_for_state_diffs {
-                    self.fetch_debug_state_diffs(&trace_blocks, req)
-                        .await
-                        .map(Some)
-                } else {
-                    Ok(None)
-                }
-            },
-            async {
-                // Trace replay
-                if need_replay {
-                    let mut tracers = Vec::new();
-                    if need_replay_trace {
-                        tracers.push("trace");
+            join_or_err(
+                async {
+                    // Debug state diffs (prestateTracer)
+                    if req.state_diffs && req.use_debug_api_for_state_diffs {
+                        self.fetch_debug_state_diffs(&trace_blocks, req)
+                            .await
+                            .map(Some)
+                    } else {
+                        Ok(None)
                     }
-                    if need_replay_statediff {
-                        tracers.push("stateDiff");
-                    }
-                    self.fetch_trace_replays(&trace_blocks, &tracers)
-                        .await
-                        .map(Some)
-                } else {
-                    Ok(None)
-                }
-            },
-            async {
-                // trace_block (use_trace_api without statediff)
-                if req.traces && req.use_trace_api && !need_replay_statediff {
-                    self.fetch_trace_block(&trace_blocks).await.map(Some)
-                } else {
-                    Ok(None)
-                }
-            },
-        );
+                },
+                join_or_err(
+                    async {
+                        // Trace replay
+                        if need_replay {
+                            let mut tracers = Vec::new();
+                            if need_replay_trace {
+                                tracers.push("trace");
+                            }
+                            if need_replay_statediff {
+                                tracers.push("stateDiff");
+                            }
+                            self.fetch_trace_replays(&trace_blocks, &tracers)
+                                .await
+                                .map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                    async {
+                        // trace_block (use_trace_api without statediff)
+                        if req.traces && req.use_trace_api && !need_replay_statediff {
+                            self.fetch_trace_block(&trace_blocks).await.map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                ),
+            ),
+        )
+        .await?;
+        let (debug_diffs, rest) = rest?;
+        let (trace_replays, trace_block) = rest?;
 
         Ok(TracesFetch {
             traceable,
-            debug_frames: debug_frames_res?,
-            debug_diffs: debug_diffs_res?,
-            trace_replays: trace_replay_res?,
-            trace_block: trace_block_res?,
+            debug_frames,
+            debug_diffs,
+            trace_replays,
+            trace_block: trace_block?,
         })
     }
 

@@ -114,6 +114,11 @@ impl Active {
 
     /// Drop registrations for these ids (e.g. on send failure / timeout) so the
     /// pending map doesn't leak entries that will never be answered.
+    ///
+    /// Not for a caller that was cancelled (dropped mid-await): its id must stay
+    /// registered so a late-but-valid answer is absorbed into the dead receiver.
+    /// Unregistered, that answer reads as an unknown id and resets the
+    /// connection, taking every sibling request down with it.
     fn unregister(&self, ids: &[u64]) {
         let mut st = self.pending.lock().unwrap();
         for id in ids {
