@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{extract::State, response::IntoResponse, routing::post, Router};
 use serde_json::{json, Value};
@@ -154,6 +155,9 @@ pub enum Fault {
     /// One header field replaced by a value the block's own contents do not
     /// commit to — the forged input REQ-14's switches exist to catch.
     ForgedField { key: String, value: Value },
+    /// The truthful answer, but only after this much silence: the slow or
+    /// hung provider a caller's wall-clock budget must cut off.
+    Delay(Duration),
 }
 
 impl Fault {
@@ -339,19 +343,25 @@ async fn handle(
     };
 
     let mut responses = Vec::with_capacity(calls.len());
+    let mut delay = Duration::ZERO;
     {
         let mut inner = inner.lock().expect("upstream lock");
         for call in &calls {
             let id = call.get("id").cloned().unwrap_or(json!(1));
             let method = call.get("method").and_then(|v| v.as_str()).unwrap_or("");
             let params = call.get("params").cloned().unwrap_or(json!([]));
-            responses.push(match inner.answer(method, &params) {
+            responses.push(match inner.answer(method, &params, &mut delay) {
                 Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
                 Err((code, message)) => {
                     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
                 }
             });
         }
+    }
+    // One HTTP response per batch, so the whole batch waits out the longest
+    // injected delay; slept here, after the state lock is released.
+    if delay > Duration::ZERO {
+        tokio::time::sleep(delay).await;
     }
 
     let out = match responses.first() {
@@ -368,7 +378,12 @@ async fn handle(
 }
 
 impl Inner {
-    fn answer(&mut self, method: &str, params: &Value) -> Result<Value, (i64, String)> {
+    fn answer(
+        &mut self,
+        method: &str,
+        params: &Value,
+        delay: &mut Duration,
+    ) -> Result<Value, (i64, String)> {
         let p0 = params.get(0).cloned().unwrap_or(Value::Null);
         let tracer = tracer_of(method, params);
         let block = self.addressed_block(method, &p0);
@@ -383,6 +398,9 @@ impl Inner {
             *self.calls.entry(key).or_insert(0) += 1;
 
             if let Some(fault) = self.take_fault(method, tracer.as_deref(), number) {
+                if let Fault::Delay(d) = &fault {
+                    *delay = (*delay).max(*d);
+                }
                 return self.faulted(method, params, tracer.as_deref(), number, &fault);
             }
         }
@@ -535,6 +553,12 @@ impl Inner {
                     );
                 }
                 Ok(value)
+            }
+            // The answer stays truthful, whatever the method; the sleep lives
+            // in `handle`, outside the state lock.
+            Fault::Delay(_) => {
+                let p0 = params.get(0).cloned().unwrap_or(Value::Null);
+                self.truth(method, params, &p0, tracer, Some(block))
             }
             Fault::ForgedField { key, value } => {
                 let full = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);

@@ -120,6 +120,23 @@ impl RpcError {
             _ => false,
         }
     }
+
+    /// Batch-shape failure: shrinks only by splitting the batch, regardless
+    /// of retry-internal-server-errors (which may also tag it retryable).
+    pub fn is_batch_shape(&self) -> bool {
+        match self {
+            RpcError::Protocol(_) => true,
+            RpcError::Rpc { message, .. } => message == "response too large",
+            _ => false,
+        }
+    }
+
+    /// Batch-retryable but not plain-retryable under the current flag
+    /// (`is_retryable_batch` minus `is_retryable`).
+    pub fn is_retryable_batch_only(&self, retry_internal_server_errors: bool) -> bool {
+        self.is_retryable_batch(retry_internal_server_errors)
+            && !self.is_retryable(retry_internal_server_errors)
+    }
 }
 
 fn message_matches_rate_limit(msg: &str) -> bool {

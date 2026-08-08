@@ -106,7 +106,10 @@ livelock of GAP-5).
    re-fetching *all* components including the header (so a superseded block heals to
    its replacement) — at most `P-ENRICH-RETRIES` times with `P-ENRICH-DELAY` between
    attempts, in every acquisition mode (head-following, strided range, and finalized
-   poll — GAP-11/ADR-19);
+   poll — GAP-11/ADR-19). Exception (GAP-40): in head-following mode a *not-ready*
+   answer — data legitimately lagging its header, never a contradiction — retries
+   every `P-NOT-READY-DELAY` under the `P-NOT-READY-BUDGET` wall clock instead of
+   the attempt count; incoherence is never downgraded to not-ready;
 3. [MUST] on retry exhaustion, emit a stream error naming the block (fail-loud; the
    loop's WP-9 ladder takes over) — never emit the block with defaulted, emptied, or
    partial components (GAP-3);

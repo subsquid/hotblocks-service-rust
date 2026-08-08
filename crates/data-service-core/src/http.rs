@@ -205,14 +205,29 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
     };
 
     let start = Instant::now();
-    let max_duration = std::time::Duration::from_secs(60);
+    let max_duration = state.response_budget();
 
-    let result = state
-        .query(
+    // GAP-31: the verdict wait itself is bounded — a source that never yields
+    // its first batch must not hold the request open past the budget. Nothing
+    // was produced, so an expiry here is RP-12's empty form; dropping the
+    // query future releases the acquisition stream.
+    let result = match tokio::time::timeout(
+        max_duration,
+        state.query(
             stream_req.from_block,
             stream_req.parent_block_hash.as_deref(),
-        )
-        .await;
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            state.record_query_outcome(QueryClass::WaitEmpty, start.elapsed());
+            let mut resp_headers = HeaderMap::new();
+            insert_finalized_head(&mut resp_headers, &state.get_finalized_head());
+            return (StatusCode::NO_CONTENT, resp_headers).into_response();
+        }
+    };
 
     // Settling the outcome only where the request actually ends keeps a query
     // that 500s off the success counters (OB-5) and puts the whole admission
@@ -246,14 +261,7 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
     let mut resp_headers = HeaderMap::new();
 
     if let Some(fh) = &data_response.finalized_head {
-        resp_headers.insert(
-            "x-sqd-finalized-head-number",
-            HeaderValue::from_str(&fh.number.to_string()).unwrap(),
-        );
-        resp_headers.insert(
-            "x-sqd-finalized-head-hash",
-            HeaderValue::from_str(&fh.hash).unwrap(),
-        );
+        insert_finalized_head(&mut resp_headers, fh);
     }
 
     let has_content = data_response.head.is_some()
@@ -269,19 +277,17 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
     }
 
     let use_zstd = accept_encoding.contains("zstd");
-    let mut frames = frame_stream(
-        data_response.head,
-        data_response.tail.unwrap_or_default(),
-        use_zstd,
-    );
+    let mut blocks = block_stream(data_response.head, data_response.tail.unwrap_or_default());
 
     // RP-13 owes INTERNAL for a failure before the first record, and once 200
-    // is on the wire that can no longer be said — so the first frame is
+    // is on the wire that can no longer be said — so the first record is
     // produced before the status is chosen. RP-20 keeps the budget out of it:
-    // a bound reached before any record is the empty form, not a failure.
+    // a bound reached before any record is the empty form, not a failure. The
+    // budget bounds waiting for data only — a record in hand is encoded
+    // outside it, so a slow transcode cannot turn acquired data into a 204.
     let budget = max_duration.saturating_sub(start.elapsed());
-    let first = match tokio::time::timeout(budget, frames.next()).await {
-        Ok(Some(Ok(frame))) => Some(frame),
+    let first_block = match tokio::time::timeout(budget, blocks.next()).await {
+        Ok(Some(Ok(block))) => Some(block),
         Ok(Some(Err(e))) => {
             settle(QueryClass::Error);
             tracing::error!(%e, "query failed before its first record");
@@ -293,11 +299,23 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
         }
         Ok(None) | Err(_) => None,
     };
-    let Some(first) = first else {
+    let Some((first_block, first_source)) = first_block else {
         // Nothing was produced, so whatever the path, the outcome is RP-12's
         // empty form rather than the class that path would have served.
         settle(QueryClass::WaitEmpty);
         return (StatusCode::NO_CONTENT, resp_headers).into_response();
+    };
+    let first = match encode_frame(&first_block, use_zstd, first_source).await {
+        Ok(frame) => frame,
+        Err(e) => {
+            settle(QueryClass::Error);
+            tracing::error!(%e, "query failed before its first record");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Internal server error\n\n{e:#}"),
+            )
+                .into_response();
+        }
     };
     settle(class);
 
@@ -327,23 +345,41 @@ async fn handle_stream<S: DataSource>(state: State<SharedService<S>>, req: Reque
             let frame = match pending.take() {
                 Some(frame) => frame,
                 None => {
-                    if start.elapsed() > max_duration {
+                    // The budget bounds waiting for data (RP-20); a record in
+                    // hand is still encoded and sent past it (GAP-41).
+                    let remaining = max_duration.saturating_sub(start.elapsed());
+                    if remaining.is_zero() {
                         return truncate(TruncationCause::Budget);
                     }
-                    match frames.next().await {
-                        None => return,
-                        Some(Err(e)) => {
+                    let (block, source) = match tokio::time::timeout(remaining, blocks.next()).await
+                    {
+                        Err(_) => return truncate(TruncationCause::Budget),
+                        Ok(None) => return,
+                        Ok(Some(Err(e))) => {
                             tracing::error!(%e, "query failed after its first record");
                             return truncate(TruncationCause::Error);
                         }
-                        Some(Ok(frame)) => frame,
+                        Ok(Some(Ok(next))) => next,
+                    };
+                    match encode_frame(&block, use_zstd, source).await {
+                        Ok(frame) => frame,
+                        Err(e) => {
+                            tracing::error!(%e, "query failed after its first record");
+                            return truncate(TruncationCause::Error);
+                        }
                     }
                 }
             };
-            if tx.send(Ok(frame.bytes.clone())).await.is_err() {
-                return truncate(TruncationCause::Disconnect);
+            // The budget bounds waiting on the reader too: a send still parked
+            // when it runs out ends the body at the last record boundary. The
+            // send is polled before the deadline, so a ready channel always
+            // takes the frame — the first frame in particular is never cut.
+            let send_bound = max_duration.saturating_sub(start.elapsed());
+            match tokio::time::timeout(send_bound, tx.send(Ok(frame.bytes.clone()))).await {
+                Err(_) => return truncate(TruncationCause::Budget),
+                Ok(Err(_)) => return truncate(TruncationCause::Disconnect),
+                Ok(Ok(())) => frame.note_served(),
             }
-            frame.note_served();
         }
     });
 
@@ -375,25 +411,36 @@ impl Frame {
     }
 }
 
-/// The body as a sequence of whole frames, one per record (REQ-6): the
-/// backfill prefix first, then the snapshot tail it splices onto.
-fn frame_stream(
+/// The body's records in order (REQ-6): the backfill prefix first, then the
+/// snapshot tail it splices onto. Encoding happens at the consumer, so the
+/// budget can bound waiting for data without cutting a record already in hand.
+fn block_stream(
     head: Option<futures::stream::BoxStream<'static, anyhow::Result<Vec<Block>>>>,
     tail: Vec<Block>,
-    use_zstd: bool,
-) -> futures::stream::BoxStream<'static, anyhow::Result<Frame>> {
+) -> futures::stream::BoxStream<'static, anyhow::Result<(Block, &'static str)>> {
     Box::pin(async_stream::try_stream! {
         if let Some(mut head) = head {
             while let Some(batch) = head.next().await {
                 for block in batch? {
-                    yield encode_frame(&block, use_zstd, "head").await?;
+                    yield (block, "head");
                 }
             }
         }
         for block in tail {
-            yield encode_frame(&block, use_zstd, "tail").await?;
+            yield (block, "tail");
         }
     })
+}
+
+fn insert_finalized_head(headers: &mut HeaderMap, fh: &crate::types::BlockRef) {
+    headers.insert(
+        "x-sqd-finalized-head-number",
+        HeaderValue::from_str(&fh.number.to_string()).unwrap(),
+    );
+    headers.insert(
+        "x-sqd-finalized-head-hash",
+        HeaderValue::from_str(&fh.hash).unwrap(),
+    );
 }
 
 async fn encode_frame(

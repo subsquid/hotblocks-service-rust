@@ -298,9 +298,10 @@ impl RpcClient {
         Ok(results)
     }
 
-    /// Batch call with reduce-on-retry: on a batch-retryable failure, split
-    /// the batch in half recursively down to single calls (mirrors
-    /// `reduceBatchOnRetry` in evm-rpc/src/rpc.ts).
+    /// Batch call with reduce-on-retry: ordinary-retryable errors (rate limits,
+    /// timeouts) retry the whole batch through the standard ladder; only
+    /// batch-shape failures split in half recursively down to single calls
+    /// (mirrors `reduceBatchOnRetry` in evm-rpc/src/rpc.ts).
     pub async fn batch_call_reduce_on_retry(
         &self,
         calls: Vec<(String, Option<Value>)>,
@@ -493,21 +494,56 @@ impl RpcClient {
             return self.batch_chunk(&calls, options).await;
         }
 
+        let retry_attempts = options.retry_attempts.unwrap_or(self.config.retry_attempts);
         let timeout = options.timeout.unwrap_or(self.config.request_timeout);
-        let result = self.execute_batch(&calls, timeout, options).await;
 
-        match result {
-            Ok(v) => return Ok(v),
-            Err(ref e) if e.is_retryable_batch(self.config.retry_internal_server_errors) => {
-                self.observed(|o| o.on_retry(e));
-                warn!(
-                    batch_size = calls.len(),
-                    "RPC batch failed, retrying with reduced batch"
-                );
-            }
-            Err(e) => {
-                self.observed(|o| o.on_error(&e));
-                return Err(e);
+        // Splitting cannot help a throttled provider: ordinary-retryable errors
+        // go through the whole-batch retry ladder. But batch-shape failures
+        // (protocol, "response too large") shrink only by splitting, even when
+        // retry-internal-server-errors also tags them retryable — shape wins.
+        let mut attempt = 0usize;
+        loop {
+            let result = self.execute_batch(&calls, timeout, options).await;
+            match result {
+                Ok(v) => return Ok(v),
+                Err(ref e) if e.is_batch_shape() => {
+                    self.observed(|o| o.on_retry(e));
+                    warn!(
+                        batch_size = calls.len(),
+                        "RPC batch failed, retrying with reduced batch"
+                    );
+                    break;
+                }
+                Err(e)
+                    if attempt < retry_attempts
+                        && e.is_retryable(self.config.retry_internal_server_errors) =>
+                {
+                    let pause = retry_pause(&self.config.retry_schedule, attempt);
+                    self.observed(|o| o.on_retry(&e));
+                    warn!(
+                        pause_ms = pause.as_millis(),
+                        attempt, "RPC batch failed, retrying"
+                    );
+                    tokio::time::sleep(pause).await;
+                    attempt += 1;
+                }
+                Err(ref e)
+                    if e.is_retryable_batch_only(self.config.retry_internal_server_errors) =>
+                {
+                    self.observed(|o| o.on_retry(e));
+                    warn!(
+                        batch_size = calls.len(),
+                        "RPC batch failed, retrying with reduced batch"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    self.observed(|o| o.on_error(&e));
+                    if attempt > 0 {
+                        return Err(RpcError::RetryExhausted(Box::new(e)));
+                    }
+                    return Err(e);
+                }
             }
         }
 
@@ -672,6 +708,26 @@ mod tests {
         let too_large = make_rpc_error(-32000, "response too large");
         assert!(!too_large.is_retryable(false));
         assert!(too_large.is_retryable_batch(false));
+    }
+
+    #[test]
+    fn batch_only_excludes_ordinary_retryable_errors() {
+        assert!(!make_rpc_error(-32005, "limit").is_retryable_batch_only(false));
+        assert!(RpcError::Protocol("oops".into()).is_retryable_batch_only(false));
+        assert!(make_rpc_error(-32000, "response too large").is_retryable_batch_only(false));
+        // With internal-error retries on, -32000 drops out of batch-only;
+        // "response too large" still splits via is_batch_shape.
+        assert!(!make_rpc_error(-32000, "response too large").is_retryable_batch_only(true));
+    }
+
+    #[test]
+    fn batch_shape_is_flag_independent() {
+        assert!(RpcError::Protocol("oops".into()).is_batch_shape());
+        assert!(make_rpc_error(-32000, "response too large").is_batch_shape());
+        assert!(make_rpc_error(-32005, "response too large").is_batch_shape());
+        assert!(!make_rpc_error(-32005, "rate limit").is_batch_shape());
+        assert!(!make_rpc_error(-32000, "internal error").is_batch_shape());
+        assert!(!RpcError::Timeout.is_batch_shape());
     }
 
     // ── Batch splitting ───────────────────────────────────────────────────────

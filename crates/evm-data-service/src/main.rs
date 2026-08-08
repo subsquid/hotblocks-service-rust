@@ -76,6 +76,10 @@ struct Args {
     #[arg(long, value_name = "rps")]
     http_rpc_rate_limit: Option<f64>,
 
+    /// Max number of concurrent RPC requests
+    #[arg(long, value_name = "number", default_value_t = default_rpc_capacity())]
+    http_rpc_capacity: NonZeroUsize,
+
     /// RPC client request timeout in ms
     #[arg(long, value_name = "ms", default_value_t = 10000)]
     http_rpc_timeout: u64,
@@ -190,11 +194,33 @@ impl From<CallFrameValidationArg> for CallFrameValidationMode {
     }
 }
 
+fn default_rpc_capacity() -> NonZeroUsize {
+    NonZeroUsize::new(DEFAULT_REQUEST_CAPACITY).expect("non-zero default capacity")
+}
+
 impl Args {
+    fn rpc_client_config(&self) -> RpcClientConfig {
+        RpcClientConfig {
+            url: self.http_rpc.clone(),
+            max_batch_call_size: self.http_rpc_max_batch_call_size,
+            capacity: self.http_rpc_capacity.get(),
+            rate_limit: self.http_rpc_rate_limit,
+            request_timeout: Duration::from_millis(self.http_rpc_timeout),
+            retry_attempts: 5,
+            retry_schedule: vec![10, 100, 500, 2000, 10000, 20000]
+                .into_iter()
+                .map(Duration::from_millis)
+                .collect(),
+            retry_internal_server_errors: self.http_retry_internal_server_errors,
+            ws_pool_size: None,
+        }
+    }
+
     fn rpc_options(&self) -> RpcOptions {
         RpcOptions {
             finality_confirmation: self.finality_confirmation,
             finalized_head_ttl: None,
+            not_ready_budget: None,
             verify_block_hash: self.verify_block_hash,
             verify_tx_sender: self.verify_tx_sender,
             verify_tx_root: self.verify_tx_root,
@@ -250,21 +276,8 @@ async fn main() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
 
     let client = Arc::new(
-        RpcClient::try_new(RpcClientConfig {
-            url: args.http_rpc,
-            max_batch_call_size: args.http_rpc_max_batch_call_size,
-            capacity: DEFAULT_REQUEST_CAPACITY,
-            rate_limit: args.http_rpc_rate_limit,
-            request_timeout: Duration::from_millis(args.http_rpc_timeout),
-            retry_attempts: 5,
-            retry_schedule: vec![10, 100, 500, 2000, 10000, 20000]
-                .into_iter()
-                .map(Duration::from_millis)
-                .collect(),
-            retry_internal_server_errors: args.http_retry_internal_server_errors,
-            ws_pool_size: None,
-        })?
-        .with_observer(Arc::new(MetricsRpcObserver::new(Arc::clone(&metrics)))),
+        RpcClient::try_new(args.rpc_client_config())?
+            .with_observer(Arc::new(MetricsRpcObserver::new(Arc::clone(&metrics)))),
     );
 
     let source = EvmRpcDataSource::with_metrics(
@@ -474,6 +487,17 @@ mod tests {
             .map(|value| value.get_name().to_string())
             .collect();
         assert_eq!(possible_values, ["off", "observe", "reject"]);
+    }
+
+    #[test]
+    fn rpc_capacity_flag_defaults_validates_and_reaches_the_client_config() {
+        let default = parse_with(&[]).expect("default capacity");
+        assert_eq!(default.rpc_client_config().capacity, 10);
+
+        assert!(parse_with(&["--http-rpc-capacity", "0"]).is_err());
+
+        let custom = parse_with(&["--http-rpc-capacity", "25"]).expect("custom capacity");
+        assert_eq!(custom.rpc_client_config().capacity, 25);
     }
 
     #[tokio::test]

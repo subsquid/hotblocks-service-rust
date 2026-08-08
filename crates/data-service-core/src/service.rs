@@ -7,7 +7,7 @@ use crate::types::{Block, BlockHeader, BlockRef, DataResponse, InvalidBaseBlock,
 use anyhow::Context;
 use futures::StreamExt;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
@@ -21,6 +21,9 @@ pub struct DataServiceOptions<S> {
     /// private registry; the core still maintains the upstream-head view.
     pub metrics: Option<Arc<Metrics>>,
 }
+
+/// RP-20: the wall-clock bound one `/stream` response may run for.
+const DEFAULT_RESPONSE_BUDGET: Duration = Duration::from_secs(60);
 
 /// FM-30: a T1 re-seed named a height the buffer it would discard holds under
 /// a different ref *or* a different parent link (WP-20/INV-12, DEF-8) —
@@ -165,6 +168,8 @@ pub struct DataServiceHandle {
     /// Resolves when the ingestion run ends; `RunEnd` says how (IB-11).
     pub ended: tokio::sync::oneshot::Receiver<RunEnd>,
     pub metrics: Arc<Metrics>,
+    /// Shared with the service so the budget can shrink after startup.
+    response_budget_ms: Arc<std::sync::atomic::AtomicU64>,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     cancel_tx: watch::Sender<bool>,
     server_task: tokio::task::JoinHandle<()>,
@@ -174,6 +179,15 @@ pub struct DataServiceHandle {
 }
 
 impl DataServiceHandle {
+    /// Override the RP-20 response budget (default 60 s) — tests must not
+    /// wait it out in wall-clock time.
+    pub fn set_response_budget(&self, budget: Duration) {
+        self.response_budget_ms.store(
+            budget.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     pub async fn shutdown(self) {
         self.metrics.record_shutdown_start();
         // Signal the HTTP server to stop accepting new connections.
@@ -279,6 +293,7 @@ pub async fn run_data_service<S: DataSource>(
         started: started_rx,
         ended: ended_rx,
         metrics: Arc::clone(&service.metrics),
+        response_budget_ms: Arc::clone(&service.response_budget_ms),
         shutdown_tx,
         cancel_tx,
         server_task,
@@ -309,6 +324,8 @@ pub struct DataService<S> {
     stopped: std::sync::atomic::AtomicBool,
     /// Fires `true` when shutdown has been requested.
     cancel_rx: watch::Receiver<bool>,
+    /// RP-20 response budget in ms; injectable through the run handle.
+    response_budget_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<S: DataSource> DataService<S> {
@@ -350,7 +367,18 @@ impl<S: DataSource> DataService<S> {
             started_rx,
             stopped: std::sync::atomic::AtomicBool::new(false),
             cancel_rx,
+            response_budget_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                DEFAULT_RESPONSE_BUDGET.as_millis() as u64,
+            )),
         }
+    }
+
+    /// RP-20: the wall-clock bound one `/stream` response may run for.
+    pub fn response_budget(&self) -> Duration {
+        Duration::from_millis(
+            self.response_budget_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn chain_read(&self) -> std::sync::RwLockReadGuard<'_, Option<Chain>> {
@@ -1055,53 +1083,98 @@ impl<S: DataSource> DataService<S> {
             Some(Ok(batch)) => batch,
         };
 
-        // Build the streaming head.
+        // Build the streaming head. The source stream is driven by its own
+        // task, not by response polling. Acquisition look-ahead lives in the
+        // source now (spawned strides bounded by stride_concurrency), not
+        // here: this producer forwards each batch and parks on send when the
+        // channel fills, holding no in-flight upstream capacity — and once
+        // the receiver drops the task ends, dropping the source stream (with
+        // its in-flight strides).
         let tail_arc = tail;
         let ph_clone = parent_hash_owned;
 
-        let head_stream: futures::stream::BoxStream<'static, anyhow::Result<Vec<Block>>> = {
-            let tail_for_stream = tail_arc.clone();
-            // Convert the remaining stream into an owned stream.
-            let remaining: futures::stream::BoxStream<'static, Result<crate::source::BlockBatch, StreamError>> =
-                // We already consumed the first element from `stream`; the remaining items come next.
-                stream;
+        // Small on purpose: unsent batches buffered on this side count
+        // against P-RESP-BUFFER.
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<anyhow::Result<Vec<Block>>>(2);
+        let tail_for_producer = tail_arc.clone();
+        tokio::spawn(async move {
+            let mut prev: Option<Block> = None;
+            // Option so an error can drop the source (and its in-flight
+            // strides) at once, before the final error is delivered.
+            let mut source =
+                Some(futures::stream::once(std::future::ready(Ok(first_batch))).chain(stream));
 
-            Box::pin(async_stream::try_stream! {
-                let mut prev: Option<Block> = None;
-
-                // Yield first batch.
-                for block in first_batch.blocks.iter() {
-                    check_chain_continuity(ph_clone.as_deref(), prev.as_ref(), block)?;
-                    prev = Some(block.clone());
-                }
-                yield first_batch.blocks.clone();
-
-                // Yield remaining batches.
-                let mut remaining = remaining;
-                while let Some(item) = remaining.next().await {
-                    let batch = item.map_err(|e| anyhow::anyhow!("{e}"))?;
-                    for block in batch.blocks.iter() {
-                        check_chain_continuity(ph_clone.as_deref(), prev.as_ref(), block)?;
-                        prev = Some(block.clone());
+            while source.is_some() {
+                let pulled = {
+                    let src = source.as_mut().expect("source checked above");
+                    tokio::select! {
+                        biased;
+                        // A receiver gone while the source is parked (stalled
+                        // upstream) must still end the task, or it leaks with
+                        // its in-flight strides past disconnect and shutdown
+                        // (RP-21).
+                        _ = batch_tx.closed() => return,
+                        item = src.next() => item,
                     }
-                    yield batch.blocks;
+                };
+                let item = match pulled {
+                    None => {
+                        source = None;
+                        continue;
+                    }
+                    Some(Err(e)) => {
+                        source = None;
+                        Err(anyhow::anyhow!("{e}"))
+                    }
+                    Some(Ok(batch)) => {
+                        let mut continuity = Ok(());
+                        for block in batch.blocks.iter() {
+                            continuity =
+                                check_chain_continuity(ph_clone.as_deref(), prev.as_ref(), block);
+                            if continuity.is_err() {
+                                break;
+                            }
+                            prev = Some(block.clone());
+                        }
+                        match continuity {
+                            Ok(()) => Ok(batch.blocks),
+                            Err(e) => {
+                                source = None;
+                                Err(e)
+                            }
+                        }
+                    }
+                };
+                // An error is final: the source is already gone, and the task
+                // ends once the error is delivered.
+                let failed = item.is_err();
+                if batch_tx.send(item).await.is_err() || failed {
+                    return;
                 }
+            }
 
-                // Continuity with the snapshot tail closes the splice.
-                if prev.is_none() {
-                    Err(anyhow::anyhow!(
-                        "below-query stream ended without delivering a block"
-                    ))?;
+            // Continuity with the snapshot tail closes the splice; the source
+            // is gone, so parking on send here holds nothing upstream.
+            let splice = if prev.is_none() {
+                anyhow::anyhow!("below-query stream ended without delivering a block")
+            } else if let Some(first_tail) = tail_for_producer.first() {
+                match check_chain_continuity(ph_clone.as_deref(), prev.as_ref(), first_tail) {
+                    Ok(()) => return,
+                    Err(e) => e,
                 }
-                if let Some(first_tail) = tail_for_stream.first() {
-                    check_chain_continuity(
-                        ph_clone.as_deref(),
-                        prev.as_ref(),
-                        first_tail,
-                    )?;
+            } else {
+                return;
+            };
+            let _ = batch_tx.send(Err(splice)).await;
+        });
+
+        let head_stream: futures::stream::BoxStream<'static, anyhow::Result<Vec<Block>>> =
+            Box::pin(async_stream::try_stream! {
+                let mut batch_rx = batch_rx;
+                while let Some(item) = batch_rx.recv().await {
+                    yield item?;
                 }
-            })
-        };
+            });
 
         Ok(DataResponse {
             finalized_head: Some(finalized_head),

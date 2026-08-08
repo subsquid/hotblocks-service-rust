@@ -18,7 +18,8 @@ struct Case {
     chain: &'static str,
     number: u64,
     chain_id: u64,
-    /// Cosmos/Tendermint-derived chains hash headers with a different tree.
+    /// Cosmos/Tendermint- and Substrate-derived chains hash headers with a
+    /// different tree.
     verifiable_header: bool,
     receipts: bool,
 }
@@ -87,6 +88,23 @@ const CORPUS: &[Case] = &[
         chain_id: 0x899,
         verifiable_header: false,
         receipts: false,
+    },
+    // Post-Pectra header (requests hash) with six 0x3 blob transactions; the
+    // predecessor recorded no receipts for it.
+    Case {
+        chain: "ethereum-sepolia",
+        number: 11319411,
+        chain_id: 0xaa36a7,
+        verifiable_header: true,
+        receipts: false,
+    },
+    // Frontier 0x4 setCode transaction with a snake_case authorization list.
+    Case {
+        chain: "bittensor-testnet",
+        number: 6646068,
+        chain_id: 0x3b1,
+        verifiable_header: false,
+        receipts: true,
     },
 ];
 
@@ -321,6 +339,35 @@ fn tempo_native_transactions_verify_their_root_and_senders() {
 }
 
 #[test]
+fn sepolia_blob_transactions_verify_their_root_and_senders() {
+    let case = CORPUS
+        .iter()
+        .find(|case| case.chain == "ethereum-sepolia")
+        .expect("Sepolia fixture is in the corpus");
+    let block = load_block(case);
+    let blobs: Vec<&RpcTransaction> = block
+        .transactions
+        .iter()
+        .filter(|tx| tx.tx_type.as_deref() == Some("0x3"))
+        .collect();
+    assert!(!blobs.is_empty(), "fixture contains 0x3 blob transactions");
+
+    let root = utils(case)
+        .calculate_transactions_root(&block)
+        .expect("root computes")
+        .expect("EIP-4844 is encodable");
+    assert_eq!(root, block.transactions_root);
+
+    for tx in blobs {
+        let sender = utils(case)
+            .recover_tx_sender(tx)
+            .unwrap_or_else(|e| panic!("blob tx {}: {e}", tx.hash))
+            .expect("a blob transaction carries a recoverable sender");
+        assert_eq!(sender.to_lowercase(), tx.from.to_lowercase(), "{}", tx.hash);
+    }
+}
+
+#[test]
 fn unknown_transaction_type_is_not_treated_as_unsigned() {
     let case = modern();
     let mut tx = load_block(case).transactions[0].clone();
@@ -535,6 +582,36 @@ fn a_forged_transaction_fails_the_transactions_root() {
     let case = modern();
     let mut block = load_block(case);
     block.transactions[0].nonce = "0xdead".to_string();
+
+    let computed = utils(case)
+        .calculate_transactions_root(&block)
+        .expect("root computes")
+        .expect("verifiable");
+    assert_ne!(computed, block.transactions_root);
+}
+
+/// Pins that the 0x4 coverage bites: one tampered authorization field must
+/// change the wire bytes the trie commits to.
+#[test]
+fn a_forged_authorization_fails_the_transactions_root() {
+    let case = CORPUS
+        .iter()
+        .find(|case| case.chain == "bittensor-testnet")
+        .expect("Bittensor testnet fixture is in the corpus");
+    let mut block = load_block(case);
+    let tx = block
+        .transactions
+        .iter_mut()
+        .find(|tx| tx.tx_type.as_deref() == Some("0x4"))
+        .expect("fixture contains a setCode transaction");
+    let Some(EIP7702AuthorizationItem::Frontier(auth)) = tx
+        .authorization_list
+        .as_mut()
+        .and_then(|items| items.first_mut())
+    else {
+        panic!("frontier authorization");
+    };
+    auth.nonce = "0xdead".to_string();
 
     let computed = utils(case)
         .calculate_transactions_root(&block)

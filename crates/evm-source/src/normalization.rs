@@ -726,36 +726,44 @@ fn map_trace_result(src: Option<&TraceResult>) -> Option<NormalizedTraceResult> 
     }
 }
 
+// `Buffer.from(s, 'hex')` semantics: decode pairs until the first invalid one,
+// ignore a trailing lone nibble, never error.
+fn decode_hex_node_style(s: &str) -> Vec<u8> {
+    let s = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i + 1 < s.len() {
+        match ((s[i] as char).to_digit(16), (s[i + 1] as char).to_digit(16)) {
+            (Some(hi), Some(lo)) => out.push((hi * 16 + lo) as u8),
+            _ => break,
+        }
+        i += 2;
+    }
+    out
+}
+
+// Mirrors the predecessor's extractRevertReason byte-for-byte (ADR-1): length is
+// the low byte of the ABI length word (mod 256), UTF-8 is lossy, and any
+// malformed/short/non-Error(string) output degrades to Some("") rather than None.
 fn extract_revert_reason(result: Option<&TraceResult>) -> Option<String> {
     let result = result?;
     let output = match result {
         TraceResult::Call(c) => &c.output,
         TraceResult::Create(_) => return None,
     };
-    // ABI-encoded revert reason: keccak4("Error(string)") + offset + length + string
-    // Output starts with 0x (offset 136 chars for hex with 0x prefix, or 134 without)
-    let output_str = output.strip_prefix("0x").unwrap_or(output);
-    // minimum: 4 bytes selector + 32 bytes offset + 32 bytes length = 68 bytes = 136 hex chars
-    if output_str.len() < 136 {
-        return None;
-    }
-    // skip 4-byte selector + 32-byte offset = 36 bytes = 72 hex chars
-    let after_selector = &output_str[72..];
-    // read length (32 bytes = 64 hex chars)
-    if after_selector.len() < 64 {
-        return None;
-    }
-    let len = u32::from_str_radix(&after_selector[..64], 16).ok()? as usize;
-    let data_hex = &after_selector[64..];
-    if data_hex.len() < len * 2 {
-        return None;
-    }
-    let bytes = hex::decode(&data_hex[..len * 2]).ok()?;
-    String::from_utf8(bytes).ok()
+    // skip selector (8) + offset word (64) + all but the last byte of the length word (62)
+    let tail = output.strip_prefix("0x").unwrap_or(output);
+    let tail = tail.get(134..).unwrap_or("");
+    let buff = decode_hex_node_style(tail);
+    let len = buff.first().copied().unwrap_or(0) as usize;
+    let end = (1 + len).min(buff.len());
+    let reason = buff.get(1..end).unwrap_or(&[]);
+    Some(String::from_utf8_lossy(reason).into_owned())
 }
 
 pub fn map_trace_frame(src: &TraceFrame, transaction_index: u64) -> NormalizedTrace {
-    let revert_reason = if src.error.is_some() {
+    // JS truthiness at the TS call site: an empty error string emits no key.
+    let revert_reason = if src.error.as_deref().is_some_and(|e| !e.is_empty()) {
         extract_revert_reason(src.result.as_ref())
     } else {
         None

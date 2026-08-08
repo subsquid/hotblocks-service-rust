@@ -106,6 +106,7 @@ symbols in 15.
 | `--http-rpc-rate-limit` | unset | `P-RPC-RATE-LIMIT`, upstream budget in items/s (REQ-16) |
 | `--http-rpc-timeout` | `P-RPC-TIMEOUT` | per-call timeout |
 | `--http-rpc-max-batch-call-size` | `P-RPC-BATCH-MAX` | upstream call-batch cap (GAP-20) |
+| `--http-rpc-capacity` | `P-RPC-CAPACITY` | concurrent upstream request cap; additive — the predecessor has no equivalent flag (its per-backfill workers were uncapped, ADR-3) |
 | `--http-retry-internal-server-errors` | off | widen retryable classification (FM-23) |
 | `--finality-confirmation <n>` | unset | finality policy `offset(n)` (DEF-23) |
 | `--auto-adjust-finalized-head` | off | DEF-24, WP-24 |
