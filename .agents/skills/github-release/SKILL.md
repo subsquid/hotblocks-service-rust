@@ -17,12 +17,20 @@ standardized notes.
 Confirm before starting:
 
 - `git status` is clean on `master` (or the user has staged the version bump deliberately).
+- The work being released is **on master**. A release asked for right after a
+  feature branch was pushed usually means "merge that first" — but merging
+  someone's PR is their call, so ask rather than assume. `master` has no merge
+  commits, so merge with `gh pr merge <n> --rebase` to keep it linear.
 - The user named a target version, e.g. `0.1.6`. If not, ask.
 - The `version` under `[workspace.package]` is the previous release. Mismatched
   bumps that landed silently in earlier commits happen — verify before tagging.
 - Tests are green on the commit being tagged. `.github/workflows/tests.yaml`
   runs on pushes to `master`, so check the run for that commit rather than
   assuming; the docker workflow does **not** gate on tests.
+  `gh pr checks` serves a cached view that can report `pending` for minutes
+  after a job finished — confirm with
+  `gh run view <run-id> --json jobs --jq '.jobs[] | {name, status, conclusion}'`
+  before concluding anything is stuck.
 - For RCs use a suffix: `v0.1.6-rc1`. The CI trigger is `tags: ['v**']` so both
   release and rc tags fire it.
 
@@ -45,7 +53,7 @@ versions. Don't ship a bump without the matching lockfile change.
 
 ```sh
 git add Cargo.toml Cargo.lock
-git commit -m "Bump version"
+git commit -m "Bump version to X.Y.Z"
 git tag vX.Y.Z
 git push origin master
 git push origin vX.Y.Z
@@ -116,7 +124,8 @@ See [release-template.md](release-template.md). Hard rules learned the hard way:
   fix in enough detail to reconstruct the failure is how a hardening change turns
   into a disclosure — say what improved, not what was exposed.
 - **Doc + PR ref** as a one-liner at the end of the prose, before the compare
-  link: `See [`spec/X.md`](url) for ... (#PR)`.
+  link: `See [`spec/X.md`](url) for ... (#PR)`. Drop the `(#PR)` when the
+  release spans many PRs — naming one of them misrepresents the rest.
 - **Compare link.** Always end with
   `**Full Changelog**: https://github.com/subsquid/hotblocks-service-rust/compare/vPREV...vNEW`.
   Resolve `vPREV` with `git merge-base vPREV vNEW` when branching is
