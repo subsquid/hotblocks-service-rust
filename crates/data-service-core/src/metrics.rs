@@ -397,6 +397,8 @@ pub struct Metrics {
 
     // OB-3 arrival lag / OB-5 ingestion cost.
     block_lag_ms: Histogram,
+    head_detection_gap_ms: Histogram,
+    head_interval_ms: Histogram,
     processing_time_ms: Histogram,
 
     // `queries_total` is the predecessor's series, frozen at three values
@@ -503,6 +505,38 @@ impl Metrics {
             .buckets(vec![
                 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 15000.0, 20000.0, 30000.0,
                 60000.0, 300000.0, 600000.0, 1200000.0, 3600000.0,
+            ]),
+        )
+        .unwrap();
+
+        // The wait that preceded a detecting poll: the block may have been
+        // available at any point inside it, so this is the detection half of
+        // OB-3's lag, and the only half a poller can shrink.
+        let head_detection_gap_ms = Histogram::with_opts(
+            HistogramOpts::new(
+                "sqd_hotblocks_head_detection_gap_ms",
+                "Wait before the poll that discovered a new head block in ms",
+            )
+            .buckets(vec![
+                25.0, 50.0, 100.0, 200.0, 300.0, 500.0, 750.0, 1000.0, 1500.0, 3000.0,
+            ]),
+        )
+        .unwrap();
+
+        // Every cadence the service is pointed at needs two boundaries: one
+        // bracketing its mode and one bracketing a slot-late arrival, or a
+        // skipped slot and a wide spread land in the same bucket and the two
+        // causes of a wide detection gap stop being distinguishable. These
+        // cover sub-second rollups through 12 s slots and their skipped twins.
+        let head_interval_ms = Histogram::with_opts(
+            HistogramOpts::new(
+                "sqd_hotblocks_head_interval_ms",
+                "Observed interval between head block arrivals in ms",
+            )
+            .buckets(vec![
+                100.0, 200.0, 300.0, 500.0, 750.0, 1000.0, 1300.0, 2000.0, 2600.0, 3000.0, 4000.0,
+                5000.0, 6000.0, 8000.0, 10000.0, 12000.0, 13000.0, 16000.0, 20000.0, 24000.0,
+                36000.0, 60000.0,
             ]),
         )
         .unwrap();
@@ -735,6 +769,8 @@ impl Metrics {
             Box::new(commits_total.clone()),
             Box::new(last_commit_timestamp_ms.clone()),
             Box::new(block_lag_ms.clone()),
+            Box::new(head_detection_gap_ms.clone()),
+            Box::new(head_interval_ms.clone()),
             Box::new(processing_time_ms.clone()),
             Box::new(queries_total.clone()),
             Box::new(query_outcomes_total.clone()),
@@ -800,6 +836,8 @@ impl Metrics {
             commits_total,
             last_commit_timestamp_ms,
             block_lag_ms,
+            head_detection_gap_ms,
+            head_interval_ms,
             processing_time_ms,
             queries_total,
             query_outcomes_total,
@@ -896,6 +934,20 @@ impl Metrics {
         }
         self.block_lag_ms
             .observe(observed_at_ms as f64 - block_timestamp_ms as f64);
+    }
+
+    /// Only a poll that ended a wait carries information: while catching up,
+    /// consecutive polls say nothing about when a block became available. The
+    /// caller nets out any time it spent parked on its own consumer — that is
+    /// backpressure, and no poll cadence would have shortened it.
+    pub fn observe_head_detection_gap(&self, gap: Duration) {
+        self.head_detection_gap_ms
+            .observe(gap.as_secs_f64() * 1000.0);
+    }
+
+    pub fn observe_head_interval(&self, interval: Duration) {
+        self.head_interval_ms
+            .observe(interval.as_secs_f64() * 1000.0);
     }
 
     pub fn track_processing_time(&self, start: Instant) {

@@ -21,6 +21,14 @@ distribution as absent, never zero. While REQ-24 stands, the pinned wire
 representation of absence is the −1 sentinel of IB-12 (ADR-1; revisited at OQ-4
 sunset).
 
+[SHOULD] Where the adapter discovers the head by polling, that lag is decomposable
+without a second time source: the wait preceding a poll that discovered a block —
+the interval the block may have gone unnoticed in, less any part of it the adapter
+spent parked on its consumer, which no cadence would have shortened — and the
+observed arrival interval feeding the poll cadence are both distributions. Neither
+needs the true production time, and together they separate a poller mispredicting
+the cadence from a chain whose arrivals are simply spread out.
+
 **OB-4 — Upstream view.** [MUST] The upstream head height *and upstream finalized
 height* as last observed (LIV-7/SLI-6 are decidable only with the latter), and
 upstream interaction health: request/error/retry counts by class (REQ-16

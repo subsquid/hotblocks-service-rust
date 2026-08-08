@@ -27,6 +27,8 @@ const REQUIRED_SERIES: &[&str] = &[
     // OB-3 lag
     "sqd_hotblocks_last_block_lag_ms",
     "sqd_hotblocks_block_lag_ms",
+    "sqd_hotblocks_head_detection_gap_ms",
+    "sqd_hotblocks_head_interval_ms",
     // OB-4 upstream
     "sqd_hotblocks_upstream_head",
     "sqd_hotblocks_upstream_head_timestamp_ms",
