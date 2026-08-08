@@ -1,0 +1,93 @@
+{
+  "iters": 30,
+  "results": [
+    {
+      "name": "dom_parse(bytes→Value)",
+      "n": 30,
+      "min_ms": 0.344,
+      "median_ms": 0.3585,
+      "p90_ms": 0.379,
+      "max_ms": 0.415
+    },
+    {
+      "name": "from_value(v.clone())",
+      "n": 30,
+      "min_ms": 0.256,
+      "median_ms": 0.2735,
+      "p90_ms": 0.293,
+      "max_ms": 0.333
+    },
+    {
+      "name": "from_value(v) move",
+      "n": 30,
+      "min_ms": 0.118,
+      "median_ms": 0.1205,
+      "p90_ms": 0.127,
+      "max_ms": 0.159
+    },
+    {
+      "name": "verify_block_hash",
+      "n": 30,
+      "min_ms": 0.005,
+      "median_ms": 0.005,
+      "p90_ms": 0.007,
+      "max_ms": 0.009
+    },
+    {
+      "name": "verify_tx_root",
+      "n": 30,
+      "min_ms": 0.384,
+      "median_ms": 0.446,
+      "p90_ms": 0.509,
+      "max_ms": 0.804
+    },
+    {
+      "name": "sender_recovery(all txs)",
+      "n": 30,
+      "min_ms": 21.926,
+      "median_ms": 22.269,
+      "p90_ms": 22.387,
+      "max_ms": 22.465
+    },
+    {
+      "name": "verify_receipts_root",
+      "n": 30,
+      "min_ms": 0.502,
+      "median_ms": 0.5974999999999999,
+      "p90_ms": 0.723,
+      "max_ms": 0.974
+    },
+    {
+      "name": "verify_logs_bloom",
+      "n": 30,
+      "min_ms": 0.104,
+      "median_ms": 0.1435,
+      "p90_ms": 0.203,
+      "max_ms": 0.27
+    },
+    {
+      "name": "verify_withdrawals_root",
+      "n": 30,
+      "min_ms": 0.012,
+      "median_ms": 0.012,
+      "p90_ms": 0.013,
+      "max_ms": 0.016
+    },
+    {
+      "name": "map_raw_block(norm+zstd)",
+      "n": 30,
+      "min_ms": 0.896,
+      "median_ms": 0.948,
+      "p90_ms": 1.023,
+      "max_ms": 1.103
+    },
+    {
+      "name": "gzip_transcode(serve path)",
+      "n": 30,
+      "min_ms": 1.298,
+      "median_ms": 1.335,
+      "p90_ms": 1.384,
+      "max_ms": 1.458
+    }
+  ]
+}

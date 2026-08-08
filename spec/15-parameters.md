@@ -75,8 +75,8 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 
 | Parameter | Role | Observed | Target |
 |---|---|---|---|
-| P-SLO-HEAD-LATENCY | SLI-1 bound | ⊥ unmeasured; worst conforming incoherent retry ≈ P-ENRICH-RETRIES × P-ENRICH-DELAY = 500 ms plus re-fetch round trips; a legitimately lagging component may spend up to P-NOT-READY-BUDGET (GAP-40) | ⚠ |
-| P-SLO-COMMIT-LATENCY | SLI-2 bound | ⊥ | ⚠ |
+| P-SLO-HEAD-LATENCY | SLI-1 bound | bench-measured (HC-12, 157-tx mainnet-block fixture, 25 ms simulated RTT, receipts + all verify switches): release→first-byte ≈ 95 ms median / ≈ 110 ms p90; worst conforming incoherent retry ≈ P-ENRICH-RETRIES × P-ENRICH-DELAY = 500 ms plus re-fetch round trips; a legitimately lagging component may spend up to P-NOT-READY-BUDGET (GAP-40) | ⚠ |
+| P-SLO-COMMIT-LATENCY | SLI-2 bound | bench-measured (HC-12, same setup): release→commit ≈ 93 ms median, of which detect→commit ≈ 43 ms | ⚠ |
 | P-SLO-QUERY-OVERHEAD | SLI-3 overhead bound | ⊥ unmeasured; a missing/incoherent historic block below the polled finalized head now spends up to ≈ 500 ms of adapter retry delay plus RPC-client retries before the first-byte error or mid-response truncation (ADR-19) | ⚠ |
 | P-SLO-THROUGHPUT | SLI-4 floor | ⊥ | ⚠ |
 | P-SLO-CATCHUP-RATE | SLI-5 multiple of head rate | ⊥ | ⚠ |
@@ -84,7 +84,7 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 | P-SLO-READY-AVAIL | SLI-7 floor | ⊥ | ⚠ |
 | P-SLO-MEM-FACTOR | SLI-8 bound | ⊥ | ⚠ |
 | P-SLO-REORG-CONVERGE | LIV-8 bound (function of depth) | one fork signal + session per depth unit observed | ⚠ |
-| P-PERF-NOISE | benchmark noise band (MG-5) | ⊥ | ⚠ |
+| P-PERF-NOISE | benchmark noise band (MG-5) | observed ≈ ±5 ms on the HC-12 detect→commit median across idle-host runs | ⚠ |
 | P-LOG-RATE-STEADY | log records per ingested block (REQ-31) | **violated: ≥ 1 status line per block, unthrottled** (GAP-23) | ⚠ 0.1 |
 
 ## Process gates (13)

@@ -1,0 +1,245 @@
+{
+  "config": {
+    "blocks": 20,
+    "cadence_ms": 3000,
+    "rtt_ms": 25,
+    "warmup": 3,
+    "verify": "all",
+    "receipts": true,
+    "encoding": "gzip",
+    "clients": 2
+  },
+  "summary": {
+    "detect": {
+      "n": 17,
+      "min": 12.0,
+      "median": 21.0,
+      "p90": 46.0,
+      "max": 47.0
+    },
+    "pipeline": {
+      "n": 17,
+      "min": 41.0,
+      "median": 45.0,
+      "p90": 52.0,
+      "max": 53.0
+    },
+    "commit": {
+      "n": 17,
+      "min": 54.0,
+      "median": 68.0,
+      "p90": 92.0,
+      "max": 92.0
+    },
+    "first_byte": {
+      "n": 17,
+      "min": 56.0,
+      "median": 70.0,
+      "p90": 95.0,
+      "max": 95.0
+    },
+    "serve": {
+      "n": 17,
+      "min": 1.0,
+      "median": 2.0,
+      "p90": 3.0,
+      "max": 3.0
+    },
+    "serve_client_0": {
+      "n": 17,
+      "min": 1.0,
+      "median": 2.0,
+      "p90": 3.0,
+      "max": 3.0
+    },
+    "serve_client_1": {
+      "n": 17,
+      "min": 1.0,
+      "median": 2.0,
+      "p90": 3.0,
+      "max": 3.0
+    }
+  },
+  "rows": [
+    {
+      "height": 18500001,
+      "warmup": true,
+      "detect_ms": 66.0,
+      "pipeline_ms": 48.0,
+      "commit_ms": 114.0,
+      "first_byte_ms": 116.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500002,
+      "warmup": true,
+      "detect_ms": 21.0,
+      "pipeline_ms": 42.0,
+      "commit_ms": 63.0,
+      "first_byte_ms": 65.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500003,
+      "warmup": true,
+      "detect_ms": 24.0,
+      "pipeline_ms": 48.0,
+      "commit_ms": 72.0,
+      "first_byte_ms": 75.0,
+      "serve_ms": 3.0
+    },
+    {
+      "height": 18500004,
+      "warmup": false,
+      "detect_ms": 37.0,
+      "pipeline_ms": 45.0,
+      "commit_ms": 82.0,
+      "first_byte_ms": 84.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500005,
+      "warmup": false,
+      "detect_ms": 28.0,
+      "pipeline_ms": 42.0,
+      "commit_ms": 70.0,
+      "first_byte_ms": 72.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500006,
+      "warmup": false,
+      "detect_ms": 14.0,
+      "pipeline_ms": 45.0,
+      "commit_ms": 59.0,
+      "first_byte_ms": 61.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500007,
+      "warmup": false,
+      "detect_ms": 47.0,
+      "pipeline_ms": 45.0,
+      "commit_ms": 92.0,
+      "first_byte_ms": 95.0,
+      "serve_ms": 3.0
+    },
+    {
+      "height": 18500008,
+      "warmup": false,
+      "detect_ms": 14.0,
+      "pipeline_ms": 47.0,
+      "commit_ms": 61.0,
+      "first_byte_ms": 64.0,
+      "serve_ms": 3.0
+    },
+    {
+      "height": 18500009,
+      "warmup": false,
+      "detect_ms": 12.0,
+      "pipeline_ms": 47.0,
+      "commit_ms": 59.0,
+      "first_byte_ms": 62.0,
+      "serve_ms": 3.0
+    },
+    {
+      "height": 18500010,
+      "warmup": false,
+      "detect_ms": 12.0,
+      "pipeline_ms": 42.0,
+      "commit_ms": 54.0,
+      "first_byte_ms": 56.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500011,
+      "warmup": false,
+      "detect_ms": 12.0,
+      "pipeline_ms": 45.0,
+      "commit_ms": 57.0,
+      "first_byte_ms": 59.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500012,
+      "warmup": false,
+      "detect_ms": 21.0,
+      "pipeline_ms": 43.0,
+      "commit_ms": 64.0,
+      "first_byte_ms": 66.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500013,
+      "warmup": false,
+      "detect_ms": 25.0,
+      "pipeline_ms": 43.0,
+      "commit_ms": 68.0,
+      "first_byte_ms": 70.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500014,
+      "warmup": false,
+      "detect_ms": 35.0,
+      "pipeline_ms": 44.0,
+      "commit_ms": 79.0,
+      "first_byte_ms": 81.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500015,
+      "warmup": false,
+      "detect_ms": 12.0,
+      "pipeline_ms": 47.0,
+      "commit_ms": 59.0,
+      "first_byte_ms": 61.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500016,
+      "warmup": false,
+      "detect_ms": 17.0,
+      "pipeline_ms": 41.0,
+      "commit_ms": 58.0,
+      "first_byte_ms": 60.0,
+      "serve_ms": 2.0
+    },
+    {
+      "height": 18500017,
+      "warmup": false,
+      "detect_ms": 26.0,
+      "pipeline_ms": 45.0,
+      "commit_ms": 71.0,
+      "first_byte_ms": 72.0,
+      "serve_ms": 1.0
+    },
+    {
+      "height": 18500018,
+      "warmup": false,
+      "detect_ms": 46.0,
+      "pipeline_ms": 46.0,
+      "commit_ms": 92.0,
+      "first_byte_ms": 95.0,
+      "serve_ms": 3.0
+    },
+    {
+      "height": 18500019,
+      "warmup": false,
+      "detect_ms": 36.0,
+      "pipeline_ms": 52.0,
+      "commit_ms": 88.0,
+      "first_byte_ms": 91.0,
+      "serve_ms": 3.0
+    },
+    {
+      "height": 18500020,
+      "warmup": false,
+      "detect_ms": 19.0,
+      "pipeline_ms": 53.0,
+      "commit_ms": 72.0,
+      "first_byte_ms": 75.0,
+      "serve_ms": 3.0
+    }
+  ]
+}

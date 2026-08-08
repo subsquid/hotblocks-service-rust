@@ -6,6 +6,7 @@ members = [
     "crates/evm-source",
     "crates/evm-data-service",
     "crates/harness",
+    "crates/latency-bench",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ zstd = "0.13"
 flate2 = "1"
 prometheus = "0.14"
 clap = { version = "4", features = ["derive"] }
+rayon = "1"
 alloy-primitives = "1"
 alloy-rlp = "0.3"
 alloy-trie = "0.9"

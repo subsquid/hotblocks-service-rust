@@ -238,13 +238,29 @@ fn ethereum_header_fields(block: &RpcBlock) -> anyhow::Result<Vec<RlpField>> {
 // ─── Logs bloom ───────────────────────────────────────────────────────────────
 
 pub fn logs_bloom(logs: &[&RpcLog]) -> String {
-    let mut bloom = [0u8; 256];
-    for log in logs {
-        add_to_bloom(&mut bloom, decode_hex_or_empty(&log.address).as_slice());
-        for topic in &log.topics {
-            add_to_bloom(&mut bloom, decode_hex_or_empty(topic).as_slice());
-        }
-    }
+    use rayon::prelude::*;
+    // The bloom is an OR-accumulator, so any fold/merge order is byte-exact.
+    let bloom = logs
+        .par_iter()
+        .fold(
+            || [0u8; 256],
+            |mut bloom, log| {
+                add_to_bloom(&mut bloom, decode_hex_or_empty(&log.address).as_slice());
+                for topic in &log.topics {
+                    add_to_bloom(&mut bloom, decode_hex_or_empty(topic).as_slice());
+                }
+                bloom
+            },
+        )
+        .reduce(
+            || [0u8; 256],
+            |mut a, b| {
+                for (a, b) in a.iter_mut().zip(b) {
+                    *a |= b;
+                }
+                a
+            },
+        );
     to_hex(&bloom)
 }
 
@@ -290,8 +306,12 @@ pub fn verify_logs_bloom(block: &RpcBlock, logs: &[&RpcLog]) -> anyhow::Result<(
 // ─── Transactions root ────────────────────────────────────────────────────────
 
 pub fn transactions_root(txs: &[&RpcTransaction]) -> anyhow::Result<String> {
+    use rayon::prelude::*;
+    // Leaf encodes are independent; only the trie build below needs order.
+    // Collecting keeps index order so the earliest failure decides, as the
+    // serial map's did.
     let mut keys_values: Vec<(Vec<u8>, Vec<u8>)> = txs
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(idx, tx)| {
             // A transaction that will not encode makes the root unknowable; an
@@ -301,6 +321,8 @@ pub fn transactions_root(txs: &[&RpcTransaction]) -> anyhow::Result<String> {
                 .map_err(|e| anyhow!("transaction {} ({idx}): {e}", tx.hash))?;
             Ok((rlp_index(idx), value))
         })
+        .collect::<Vec<anyhow::Result<_>>>()
+        .into_iter()
         .collect::<anyhow::Result<_>>()?;
     keys_values.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -315,14 +337,18 @@ pub fn transactions_root(txs: &[&RpcTransaction]) -> anyhow::Result<String> {
 }
 
 pub fn receipts_root(receipts: &[&RpcReceipt], use_gas_used: bool) -> anyhow::Result<String> {
+    use rayon::prelude::*;
+    // Same shape as transactions_root: parallel leaf encodes, ordered errors.
     let mut keys_values: Vec<(Vec<u8>, Vec<u8>)> = receipts
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(idx, r)| {
             let value = encode_receipt(r, use_gas_used)
                 .map_err(|e| anyhow!("receipt {} ({idx}): {e}", r.transaction_hash))?;
             Ok((rlp_index(idx), value))
         })
+        .collect::<Vec<anyhow::Result<_>>>()
+        .into_iter()
         .collect::<anyhow::Result<_>>()?;
     keys_values.sort_by(|a, b| a.0.cmp(&b.0));
 

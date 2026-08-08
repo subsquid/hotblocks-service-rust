@@ -45,7 +45,7 @@ fn cadence_predicts_reasonable_sleep() {
 }
 
 #[test]
-fn cadence_clamps_minimum_to_20ms() {
+fn cadence_clamps_minimum_to_hot_poll() {
     let mut pred = CadencePredictor::new();
     let t0 = Instant::now();
 

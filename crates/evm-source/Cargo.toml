@@ -23,6 +23,7 @@ alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 alloy-trie.workspace = true
 k256.workspace = true
+rayon.workspace = true
 sha3.workspace = true
 hex.workspace = true
 
