@@ -363,6 +363,16 @@ closed_set! {
 }
 
 closed_set! {
+    /// Why a block had to be enriched again. Only `data_lagging` can be healed
+    /// by re-acquiring the missing legs; the others need the header back.
+    EnrichmentRetry {
+        DataLagging => "data_lagging",
+        HeaderContested => "header_contested",
+        Incoherent => "incoherent",
+    }
+}
+
+closed_set! {
     /// OB-4 failure classes. Transport-shaped, not per-method: a per-method
     /// set would not be enumerable at startup (OB-8).
     UpstreamErrorClass {
@@ -430,6 +440,7 @@ pub struct Metrics {
     // OB-7 ingestion alarms.
     integrity_violations_total: Counter,
     session_restarts_total: CounterVec,
+    enrichment_retries_total: CounterVec,
     acquisition_retry_exhaustions_total: Counter,
     fork_rebases_total: Counter,
     watermark_regressions_total: Counter,
@@ -701,6 +712,17 @@ impl Metrics {
         )
         .unwrap();
 
+        // Re-acquisitions, not blocks: divide by ingested blocks for the share
+        // of the head that pays a retry.
+        let enrichment_retries_total = CounterVec::new(
+            Opts::new(
+                "sqd_hotblocks_enrichment_retries_total",
+                "Block enrichment re-acquisitions by reason (FM-16 / WP-11.4)",
+            ),
+            &["reason"],
+        )
+        .unwrap();
+
         let acquisition_retry_exhaustions_total = Counter::with_opts(Opts::new(
             "sqd_hotblocks_acquisition_retry_exhaustions_total",
             "Blocks that exhausted their whole-block re-acquisition budget (WP-11.3)",
@@ -789,6 +811,7 @@ impl Metrics {
             Box::new(force_advanced_past.clone()),
             Box::new(integrity_violations_total.clone()),
             Box::new(session_restarts_total.clone()),
+            Box::new(enrichment_retries_total.clone()),
             Box::new(acquisition_retry_exhaustions_total.clone()),
             Box::new(fork_rebases_total.clone()),
             Box::new(watermark_regressions_total.clone()),
@@ -816,6 +839,9 @@ impl Metrics {
         }
         for cause in SessionRestart::ALL {
             session_restarts_total.with_label_values(&[cause.as_str()]);
+        }
+        for reason in EnrichmentRetry::ALL {
+            enrichment_retries_total.with_label_values(&[reason.as_str()]);
         }
         for kind in UpstreamRequestKind::ALL {
             upstream_requests_total.with_label_values(&[kind.as_str()]);
@@ -857,6 +883,7 @@ impl Metrics {
             force_advanced_past,
             integrity_violations_total,
             session_restarts_total,
+            enrichment_retries_total,
             acquisition_retry_exhaustions_total,
             fork_rebases_total,
             watermark_regressions_total,
@@ -1071,6 +1098,12 @@ impl Metrics {
     pub fn record_session_restart(&self, cause: SessionRestart) {
         self.session_restarts_total
             .with_label_values(&[cause.as_str()])
+            .inc();
+    }
+
+    pub fn record_enrichment_retry(&self, reason: EnrichmentRetry) {
+        self.enrichment_retries_total
+            .with_label_values(&[reason.as_str()])
             .inc();
     }
 
