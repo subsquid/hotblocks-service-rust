@@ -59,7 +59,7 @@ impl CadencePredictor {
         }
     }
 
-    /// Record that a new block arrived now.
+    /// Record a known block-arrival observation.
     pub fn record_block(&mut self, now: Instant) {
         if let Some(last) = self.last_arrival {
             if self.intervals.len() == INTERVAL_WINDOW {
@@ -68,6 +68,18 @@ impl CadencePredictor {
             self.intervals.push_back(millis_since(now, last));
         }
         self.last_arrival = Some(now);
+    }
+
+    /// Record a successful numbered poll when it represents a block arrival.
+    ///
+    /// A block fetched immediately after the preceding hit is catch-up, not an
+    /// arrival observation: the interval between those responses measures RPC
+    /// throughput rather than chain cadence. Feeding it to a minimum estimator
+    /// would keep a slow chain on the hot polling grain for the whole window.
+    pub fn record_polled_block(&mut self, now: Instant, followed_empty_poll: bool) {
+        if followed_empty_poll {
+            self.record_block(now);
+        }
     }
 
     /// How long to sleep before the next poll attempt.
@@ -505,7 +517,12 @@ pub async fn ingest_range(
                     match rpc.get_single_block(next_num).await? {
                         Some(body) if !body.is_invalid => {
                             let now = Instant::now();
-                            cadence.record_block(now);
+                            // A hit without a preceding null is catch-up. Its
+                            // response spacing is RPC cadence, not block cadence,
+                            // and must not become the rolling minimum.
+                            let empty_at = last_empty_poll.take();
+                            let followed_empty_poll = empty_at.is_some();
+                            cadence.record_polled_block(now, followed_empty_poll);
                             hot_streak += 1;
                             incoherent_attempts = 0;
                             // OB-4: this path never reads the head tag, but a
@@ -514,21 +531,25 @@ pub async fn ingest_range(
                                 metrics.observe_upstream_head(next_num);
                                 // Only a poll that ended a wait bounds when the
                                 // block could have appeared; catching up does not.
-                                if let Some(empty_at) = last_empty_poll.take() {
+                                if let Some(empty_at) = empty_at {
                                     metrics.observe_head_detection_gap(
                                         poll_at
                                             .duration_since(empty_at)
                                             .saturating_sub(consumer_blocked),
                                     );
                                 }
-                                // The predictor's own input, detection error
-                                // included — which is what makes it readable
-                                // against the gap above.
-                                if let Some(prev) = last_arrival {
-                                    metrics.observe_head_interval(now.duration_since(prev));
+                                if followed_empty_poll {
+                                    // The predictor's own input, detection error
+                                    // included — which is what makes it readable
+                                    // against the gap above.
+                                    if let Some(prev) = last_arrival {
+                                        metrics.observe_head_interval(now.duration_since(prev));
+                                    }
                                 }
                             }
-                            last_arrival = Some(now);
+                            if followed_empty_poll {
+                                last_arrival = Some(now);
+                            }
                             let body_received = if profile_block_timings { Some(now) } else { None };
                             pending.push_back((next_num, spawn_enrich(body, body_received)));
                             next_num += 1;

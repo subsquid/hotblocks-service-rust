@@ -117,6 +117,25 @@ fn cadence_floor_ages_out_a_stale_minimum() {
     );
 }
 
+#[test]
+fn cadence_ignores_rpc_spaced_catch_up_hits() {
+    let mut pred = CadencePredictor::new();
+    let mut t = Instant::now();
+    pred.record_block(t);
+    for _ in 0..8 {
+        t += Duration::from_secs(12);
+        pred.record_block(t);
+    }
+
+    // An already-available successor lands one RPC round trip later. This is
+    // catch-up throughput, not a 28 ms chain interval.
+    t += Duration::from_millis(28);
+    pred.record_polled_block(t, false);
+
+    let delay = pred.next_poll_delay(t + Duration::from_millis(100));
+    assert_eq!(delay, Duration::from_millis(1000));
+}
+
 // ─── Mock JSON-RPC server helpers ─────────────────────────────────────────────
 
 fn make_rpc_block(number: u64, hash: &str, parent_hash: &str) -> Value {

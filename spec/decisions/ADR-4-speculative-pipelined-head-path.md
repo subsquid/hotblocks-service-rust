@@ -26,9 +26,11 @@ arrivals: on a chain skipping 2.5% of slots this cost 200–600 ms on each of th
 blocks after a gap, and jitter alone exceeded the hot window besides. It is now the
 floor of the last N intervals, which cannot be dragged upward by a late arrival.
 Under-prediction costs polls, over-prediction costs latency; the estimator now errs in
-the cheap direction. Candidates — including the rejected ones — are scored by
-`crates/latency-bench` (`cadence`) against arrival traces collected with
-`trace-collect`.
+the cheap direction. Only hits that follow an absent-block response train it;
+already-available catch-up blocks measure request throughput rather than chain
+cadence. Candidates — including the rejected ones — are scored by
+`crates/latency-bench` (`cadence`) against consecutive numbered arrival traces
+collected with the same full-block request shape as the production poller.
 
 ## Consequences
 

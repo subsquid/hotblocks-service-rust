@@ -11,12 +11,12 @@
 //! floor. Everything but `real` is a copy on purpose: they do not exist in the
 //! source, and `ema` is kept so the regression stays reproducible.
 //!
-//! Trace, in preference order: `TRACE_JSON` holding `[[block_ts_s,
-//! arrival_lag_ms], ...]` from `trace-collect` — real arrivals, replayed as
-//! measured; the same variable holding a bare `[block_ts_s, ...]`, whose
-//! arrivals are synthesised as `PROP_MS` + `U(0, JITTER_MS)`; or a synthetic
-//! slot grid with `MISS_RATE` slots dropped. Every poll costs `RTT_MS` before
-//! its answer is in hand.
+//! Trace, in preference order: `TRACE_JSON` holding `[[block_number,
+//! block_ts_s, arrival_lag_ms], ...]` from `trace-collect` — exact consecutive
+//! arrivals, replayed as measured; the legacy two-field format remains readable.
+//! A bare `[block_ts_s, ...]` synthesises arrivals as
+//! `PROP_MS + U(0, JITTER_MS)`; with no file, a synthetic slot grid is used.
+//! Every poll costs `RTT_MS` before its answer is in hand.
 //!
 //! Prefer a collected trace. Under a uniform jitter model every candidate looks
 //! fine — they separate only once the jitter approaches the hot window, and real
@@ -30,6 +30,7 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 use evm_source::ingest::CadencePredictor;
@@ -214,12 +215,15 @@ impl Poller {
         }
     }
 
-    fn record(&mut self, now: Instant) {
+    fn record(&mut self, now: Instant, followed_empty_poll: bool) {
         match self {
-            Poller::Real(p) => p.record_block(now),
+            Poller::Real(p) => p.record_polled_block(now, followed_empty_poll),
+            // These mirror the pre-fix implementations, which sampled every
+            // successful response including catch-up hits.
             Poller::Ema(p) => p.record_block(now),
             Poller::Clamped(p) => p.record_block(now),
-            Poller::MinOfN(p) => p.record_block(now),
+            Poller::MinOfN(p) if followed_empty_poll => p.record_block(now),
+            Poller::MinOfN(_) => {}
             Poller::Fixed(_) => {}
         }
     }
@@ -324,6 +328,86 @@ fn from_measured(samples: &[(f64, f64)], slot_ms: u64) -> Trace {
     }
 }
 
+fn trace_number(value: &Value, row: usize) -> Result<u64> {
+    value
+        .as_u64()
+        .ok_or_else(|| anyhow!("measured trace row {row} has an invalid block number"))
+}
+
+fn trace_float(value: &Value, row: usize, field: &str) -> Result<f64> {
+    value
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow!("measured trace row {row} has an invalid {field}"))
+}
+
+/// Parse the numbered format emitted by `trace-collect`, retaining support for
+/// legacy `[block_ts_s, arrival_lag_ms]` rows. A trace must use one format
+/// throughout, and numbered rows must be consecutive so collector gaps cannot
+/// masquerade as skipped chain slots.
+fn parse_measured_trace(raw: &[Value]) -> Result<Vec<(f64, f64)>> {
+    let mut samples = Vec::with_capacity(raw.len());
+    let mut numbered_format = None;
+    let mut previous_number: Option<u64> = None;
+
+    for (index, value) in raw.iter().enumerate() {
+        let row = index + 1;
+        let fields = value
+            .as_array()
+            .ok_or_else(|| anyhow!("measured trace row {row} is not an array"))?;
+        let (number, timestamp, lag) = match fields.as_slice() {
+            [timestamp, lag] => (None, timestamp, lag),
+            [number, timestamp, lag] => (Some(trace_number(number, row)?), timestamp, lag),
+            _ => {
+                bail!(
+                    "measured trace row {row} has {} fields; expected 2 or 3",
+                    fields.len()
+                )
+            }
+        };
+
+        let is_numbered = number.is_some();
+        if let Some(expected_format) = numbered_format {
+            if expected_format != is_numbered {
+                bail!("measured trace mixes numbered and legacy rows at row {row}");
+            }
+        } else {
+            numbered_format = Some(is_numbered);
+        }
+
+        if let Some(number) = number {
+            if let Some(previous) = previous_number {
+                let expected = previous
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("measured trace block number overflows at row {row}"))?;
+                if number != expected {
+                    bail!("measured trace jumps from block {previous} to {number} at row {row}");
+                }
+            }
+            previous_number = Some(number);
+        }
+
+        samples.push((
+            trace_float(timestamp, row, "block timestamp")?,
+            trace_float(lag, row, "arrival lag")?,
+        ));
+    }
+
+    Ok(samples)
+}
+
+fn parse_timestamp_trace(raw: &[Value]) -> Result<Vec<f64>> {
+    raw.iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| anyhow!("timestamp trace row {} is not a number", index + 1))
+        })
+        .collect()
+}
+
 struct Sim {
     delays: Vec<f64>,
     polls: u64,
@@ -340,17 +424,19 @@ fn simulate(mut poller: Poller, trace: &Trace, rtt_ms: u64) -> Sim {
     let mut delays = Vec::with_capacity(trace.arrivals.len());
     let (mut clock, mut polls) = (0u64, 0u64);
     for &arrival in &trace.arrivals {
+        let mut followed_empty_poll = false;
         loop {
             let issued = clock;
-            clock = issued + rtt_ms;
-            polls += 1;
+            clock = issued.saturating_add(rtt_ms);
+            polls = polls.saturating_add(1);
             if issued >= arrival {
                 break;
             }
-            clock += poller.next_delay_ms(base + Duration::from_millis(clock));
+            followed_empty_poll = true;
+            clock = clock.saturating_add(poller.next_delay_ms(base + Duration::from_millis(clock)));
         }
         delays.push((clock - arrival) as f64);
-        poller.record(base + Duration::from_millis(clock));
+        poller.record(base + Duration::from_millis(clock), followed_empty_poll);
     }
     Sim { delays, polls }
 }
@@ -443,7 +529,7 @@ fn env<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let blocks: usize = env("BENCH_BLOCKS", 5000);
     let miss_rate: f64 = env("MISS_RATE", 0.01);
     let slot_ms: u64 = env("SLOT_MS", 12000);
@@ -454,32 +540,17 @@ fn main() -> anyhow::Result<()> {
 
     let trace = match std::env::var("TRACE_JSON") {
         Ok(path) => {
-            let raw: Vec<Value> = serde_json::from_slice(&std::fs::read(&path)?)?;
-            // `[[block_ts_s, arrival_lag_ms], ...]` from `trace-collect`, or a
-            // bare `[block_ts_s, ...]` whose arrivals have to be synthesised.
+            let bytes = std::fs::read(&path).with_context(|| format!("reading trace {path}"))?;
+            let raw: Vec<Value> =
+                serde_json::from_slice(&bytes).with_context(|| format!("parsing trace {path}"))?;
+            // Numbered rows from `trace-collect`, legacy two-field rows, or a
+            // bare timestamp list whose arrivals have to be synthesised.
             if raw.first().is_some_and(Value::is_array) {
-                let samples: Vec<(f64, f64)> = raw
-                    .iter()
-                    .map(|v| {
-                        let pair = v.as_array().ok_or_else(|| {
-                            anyhow::anyhow!("mixed trace: expected [ts, lag_ms] pairs throughout")
-                        })?;
-                        match pair.as_slice() {
-                            [t, lag] => Ok((
-                                t.as_f64().unwrap_or_default(),
-                                lag.as_f64().unwrap_or_default(),
-                            )),
-                            _ => Err(anyhow::anyhow!(
-                                "expected [ts, lag_ms] pairs, got {} fields",
-                                pair.len()
-                            )),
-                        }
-                    })
-                    .collect::<anyhow::Result<_>>()?;
+                let samples = parse_measured_trace(&raw)?;
                 println!("measured trace {path}: {} blocks", samples.len());
                 from_measured(&samples, slot_ms)
             } else {
-                let ts: Vec<f64> = raw.iter().filter_map(Value::as_f64).collect();
+                let ts = parse_timestamp_trace(&raw)?;
                 println!(
                     "trace {path}: {} blocks, arrivals synthesised at {prop_ms}+U(0,{jitter_ms}) ms",
                     ts.len()
@@ -553,4 +624,95 @@ fn main() -> anyhow::Result<()> {
         println!("\nwrote {path}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbered_measured_trace_accepts_consecutive_blocks() {
+        let raw = vec![
+            json!([40, 1_700_000_000, 425.0]),
+            json!([41, 1_700_000_005, 510.0]),
+        ];
+
+        let samples = parse_measured_trace(&raw).expect("consecutive trace should parse");
+
+        assert_eq!(
+            samples,
+            vec![(1_700_000_000.0, 425.0), (1_700_000_005.0, 510.0)]
+        );
+    }
+
+    #[test]
+    fn numbered_measured_trace_rejects_a_collector_gap() {
+        let raw = vec![
+            json!([40, 1_700_000_000, 425.0]),
+            json!([42, 1_700_000_010, 510.0]),
+        ];
+
+        let error = parse_measured_trace(&raw)
+            .expect_err("a missing observed height must not look like a skipped slot");
+
+        assert_eq!(
+            error.to_string(),
+            "measured trace jumps from block 40 to 42 at row 2"
+        );
+    }
+
+    #[test]
+    fn measured_trace_rejects_mixed_row_formats() {
+        let raw = vec![
+            json!([40, 1_700_000_000, 425.0]),
+            json!([1_700_000_005, 510.0]),
+        ];
+
+        let error =
+            parse_measured_trace(&raw).expect_err("numbered and legacy rows must not be mixed");
+
+        assert_eq!(
+            error.to_string(),
+            "measured trace mixes numbered and legacy rows at row 2"
+        );
+    }
+
+    #[test]
+    fn measured_trace_rejects_non_numeric_values() {
+        let raw = vec![json!([40, "not-a-timestamp", 425.0])];
+
+        let error =
+            parse_measured_trace(&raw).expect_err("malformed values must not silently become zero");
+
+        assert_eq!(
+            error.to_string(),
+            "measured trace row 1 has an invalid block timestamp"
+        );
+    }
+
+    #[test]
+    fn timestamp_trace_rejects_non_numeric_rows() {
+        let raw = vec![json!(1_700_000_000), json!("bad")];
+
+        let error = parse_timestamp_trace(&raw)
+            .expect_err("malformed timestamps must not be silently dropped");
+
+        assert_eq!(error.to_string(), "timestamp trace row 2 is not a number");
+    }
+
+    #[test]
+    fn real_poller_does_not_train_on_an_immediate_catch_up_hit() {
+        let base = Instant::now();
+        let mut poller = Poller::Real(CadencePredictor::new());
+        poller.record(base, true);
+        for step in 1..=8 {
+            poller.record(base + Duration::from_secs(step * 12), true);
+        }
+        let catch_up = base + Duration::from_secs(96) + Duration::from_millis(28);
+
+        poller.record(catch_up, false);
+        let delay = poller.next_delay_ms(catch_up + Duration::from_millis(100));
+
+        assert_eq!(delay, 1000);
+    }
 }
