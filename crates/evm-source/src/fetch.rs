@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
-use data_service_core::metrics::Metrics;
+use data_service_core::metrics::{EnrichmentRetry, Metrics};
 use futures::future::Either;
 use rpc_client::{CallOptions, RpcClient, RpcError, RpcErrorInfo};
 
@@ -123,6 +123,42 @@ pub const P_ENRICH_DELAY: std::time::Duration = std::time::Duration::from_millis
 /// blocks out indefinitely at the same 100 ms cadence.
 pub const NOT_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 pub const NOT_READY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Consecutive legs-only re-acquisitions before falling back to the whole
+/// block. Bounds how long an unrecognised stale header can go unrefreshed.
+const LEGS_ONLY_RETRIES: u32 = 3;
+
+/// The legs of `req` a block still lacks. The traces leg is kept or dropped
+/// whole: its sub-legs share one method selection — the replay carries traces
+/// only where it already runs for state diffs — so dropping half of it would
+/// switch the other half to a different tracer.
+fn missing_legs(block: &RawRpcBlock, req: &crate::types::DataRequest) -> crate::types::DataRequest {
+    let traces_in_hand = traces_leg_in_hand(block, req);
+    crate::types::DataRequest {
+        logs: req.logs && block.logs.is_none(),
+        receipts: req.receipts && block.receipts.is_none(),
+        traces: req.traces && !traces_in_hand,
+        state_diffs: req.state_diffs && !traces_in_hand,
+        ..req.clone()
+    }
+}
+
+/// Mirrors `fetch_traces`' sub-leg selection: genesis is never traced, and every
+/// enabled sub-leg must have landed its output.
+fn traces_leg_in_hand(block: &RawRpcBlock, req: &crate::types::DataRequest) -> bool {
+    if block.number == 0 {
+        return true;
+    }
+    let replay_statediff = req.state_diffs && !req.use_debug_api_for_state_diffs;
+    let wants_debug_frames = req.traces && !req.use_trace_api;
+    let wants_debug_diffs = req.state_diffs && req.use_debug_api_for_state_diffs;
+    // Both the replay and `trace_block` land in `trace_replays`.
+    let wants_replays = replay_statediff || (req.traces && req.use_trace_api);
+
+    (!wants_debug_frames || block.debug_frames.is_some())
+        && (!wants_debug_diffs || block.debug_state_diffs.is_some())
+        && (!wants_replays || block.trace_replays.is_some())
+}
 
 /// Fetch state for the Rpc layer.
 pub struct Rpc {
@@ -526,14 +562,19 @@ impl Rpc {
             return Ok(body);
         }
 
-        // Retry by re-fetching the WHOLE block (header + data) as one unit,
-        // mirroring the TS `getBlocks` retry (evm-rpc/src/data-source/get-blocks.ts).
-        // The first attempt reuses the speculatively-fetched header (`body`) so
-        // a block that's ready immediately costs no extra eth_getBlockByNumber;
-        // every retry re-fetches via `get_block_batch`, so a reorg / load-balanced
-        // hash mismatch heals as soon as the canonical header arrives. Reusing a
-        // stale header across retries (the original bug) made such a mismatch
-        // permanent and hung the ingestion loop forever with no error.
+        // The first attempt reuses the speculatively-fetched header (`body`), so
+        // a block that's ready immediately costs no extra eth_getBlockByNumber.
+        //
+        // A retry re-acquires by what the failure could have been:
+        // - data lagging behind an uncontested header — re-run only the legs
+        //   still missing. Traces never mark not-ready (`apply_traces` marks
+        //   only incoherence), so the whole-block re-fetch this replaces was
+        //   re-issuing the heavy replay call for data already in hand.
+        // - anything else — the WHOLE block as one unit, mirroring the TS
+        //   `getBlocks` retry (evm-rpc/src/data-source/get-blocks.ts), so a
+        //   reorg / load-balanced hash mismatch heals as soon as the canonical
+        //   header arrives. Reusing a stale header across retries (the original
+        //   bug) made such a mismatch permanent and hung ingestion with no error.
         //
         // Two budgets, by the kind of invalidity (either exhaustion surfaces
         // the error so the ingestion loop logs it and restarts, like
@@ -553,6 +594,11 @@ impl Rpc {
         // a hung upstream (semaphore wait + the client's internal retry
         // ladder) cannot stretch the window by its own round-trip time.
         let mut not_ready_deadline: Option<tokio::time::Instant> = None;
+        // A stale header can read as plain data lag — a reorged-away block
+        // returns empty logs against a non-zero bloom — so the cheap path
+        // escalates instead of spending the whole budget on a header it never
+        // refreshes.
+        let mut legs_only_streak: u32 = 0;
 
         // First attempt: enrich the header we already fetched speculatively.
         // Network/RPC errors propagate (the client already retries transient
@@ -605,31 +651,63 @@ impl Rpc {
                 (P_ENRICH_DELAY, None)
             };
 
+            let contested = blocks.first().is_some_and(|b| b.header_contested);
+            self.observe(|m| {
+                m.record_enrichment_retry(match (not_ready, contested) {
+                    (false, _) => EnrichmentRetry::Incoherent,
+                    (true, true) => EnrichmentRetry::HeaderContested,
+                    (true, false) => EnrichmentRetry::DataLagging,
+                })
+            });
+
+            let residual = (not_ready && !contested && legs_only_streak < LEGS_ONLY_RETRIES)
+                .then(|| blocks.first().map(|b| missing_legs(b, req)))
+                .flatten()
+                .filter(|r| r.logs || r.receipts || r.traces || r.state_diffs);
+
+            match &residual {
+                Some(_) => legs_only_streak += 1,
+                None => legs_only_streak = 0,
+            }
+
             debug!(
                 block = number,
                 not_ready,
+                contested,
+                legs_only = residual.is_some(),
                 incoherent_attempt = incoherent_retries,
                 max_incoherent_retries = P_ENRICH_RETRIES,
                 reason = %err_msg,
-                "block enrichment not ready, retrying whole-block fetch"
+                "block enrichment not ready, re-acquiring"
             );
 
-            // Re-fetch the whole block (header + data) as one unit — TS
-            // getBlockBatch semantics. An empty result (not produced yet / chain
-            // break) leaves `blocks` empty and we keep retrying until the bound.
-            let refetch = async {
+            // An empty whole-block result (not produced yet / chain break)
+            // leaves `blocks` empty and we keep retrying until the bound.
+            let acquire = async move {
                 tokio::time::sleep(delay).await;
-                self.get_block_batch(std::slice::from_ref(&number), req)
-                    .await
+                match residual {
+                    Some(residual) => {
+                        let mut retained = blocks;
+                        if let Some(head) = retained.first_mut() {
+                            head.clear_invalid();
+                        }
+                        self.fetch_and_apply(&mut retained, &residual).await?;
+                        Ok(retained)
+                    }
+                    None => {
+                        self.get_block_batch(std::slice::from_ref(&number), req)
+                            .await
+                    }
+                }
             };
             blocks = match deadline {
                 // Dropping the in-flight fetch at the deadline is safe: the
                 // client's capacity-semaphore permit is released on drop.
-                Some(deadline) => match tokio::time::timeout_at(deadline, refetch).await {
+                Some(deadline) => match tokio::time::timeout_at(deadline, acquire).await {
                     Ok(fetched) => fetched?,
                     Err(_elapsed) => return Err(exhausted()),
                 },
-                None => refetch.await?,
+                None => acquire.await?,
             };
         }
     }
@@ -912,7 +990,17 @@ impl Rpc {
         req: &crate::types::DataRequest,
     ) -> Result<()> {
         self.options.validate_request(req)?;
+        self.fetch_and_apply(blocks, req).await
+    }
 
+    /// The legs themselves. A retry's residual request is not valid standalone
+    /// — `verify_receipts_root` demands `receipts`, which a block that already
+    /// has them no longer asks for — so the check stays with the caller's own.
+    async fn fetch_and_apply(
+        &self,
+        blocks: &mut Vec<RawRpcBlock>,
+        req: &crate::types::DataRequest,
+    ) -> Result<()> {
         // Each leg is one upstream round trip writing fields no other leg
         // touches, so the fetch halves overlap; the applies then run in the
         // legs' fixed order, which keeps error precedence and per-block marks
@@ -1167,7 +1255,7 @@ impl Rpc {
                              inconsistency, will retry",
                             block.hash, bad.block_hash
                         );
-                        block.mark_not_ready(msg);
+                        block.mark_header_contested(msg);
                         continue;
                     }
 
@@ -1265,7 +1353,7 @@ impl Rpc {
                      inconsistency, will retry",
                     block.hash, bad.block_hash
                 );
-                block.mark_not_ready(msg);
+                block.mark_header_contested(msg);
                 continue;
             }
 

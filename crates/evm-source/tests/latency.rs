@@ -374,6 +374,142 @@ async fn test_enrich_retry_on_receipt_hash_mismatch() {
     assert!(total >= 2, "expected at least 2 receipt calls, got {total}");
 }
 
+/// Receipts lagging their header is the common head condition, and the retry it
+/// costs must re-acquire only the receipts: the header is uncontested and the
+/// replay — the expensive leg — already answered.
+#[tokio::test]
+async fn not_ready_receipts_retry_without_refetching_header_or_traces() {
+    use evm_source::fetch::{Rpc, RpcOptions};
+    use evm_source::types::DataRequest;
+
+    let block_hash: &'static str =
+        "0xaaaa000000000000000000000000000000000000000000000000000000000042";
+
+    #[derive(Clone)]
+    struct Counters {
+        headers: Arc<AtomicUsize>,
+        receipts: Arc<AtomicUsize>,
+        replays: Arc<AtomicUsize>,
+    }
+
+    async fn handler(State(s): State<Counters>, body: axum::body::Bytes) -> impl IntoResponse {
+        let req: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+        let requests: Vec<Value> = match req.as_array() {
+            Some(batch) => batch.clone(),
+            None => vec![req.clone()],
+        };
+
+        let mut responses = Vec::new();
+        for r in &requests {
+            let id = r.get("id").cloned().unwrap_or(json!(1));
+            let method = r.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let params = r.get("params").cloned().unwrap_or(json!([]));
+            let tag = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+
+            let result = match method {
+                "eth_chainId" => json!("0x1"),
+                "eth_getBlockByNumber" => {
+                    if tag == "latest" || tag == "finalized" {
+                        Value::Null
+                    } else {
+                        s.headers.fetch_add(1, Ordering::SeqCst);
+                        make_rpc_block(
+                            50,
+                            "0xaaaa000000000000000000000000000000000000000000000000000000000042",
+                            "0x0000000000000000000000000000000000000000000000000000000000000000",
+                        )
+                    }
+                }
+                // The by-tag call is the by-block/by-tx capability probe.
+                "eth_getBlockReceipts" if tag == "latest" => json!([]),
+                "eth_getBlockReceipts" => {
+                    if s.receipts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Value::Null
+                    } else {
+                        json!([])
+                    }
+                }
+                "trace_replayBlockTransactions" => {
+                    s.replays.fetch_add(1, Ordering::SeqCst);
+                    json!([])
+                }
+                _ => Value::Null,
+            };
+            responses.push(json!({"jsonrpc":"2.0","id":id,"result":result}));
+        }
+
+        let body = if responses.len() == 1 && !req.is_array() {
+            serde_json::to_vec(&responses[0]).unwrap()
+        } else {
+            serde_json::to_vec(&responses).unwrap()
+        };
+        (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+    }
+
+    let counters = Counters {
+        headers: Arc::new(AtomicUsize::new(0)),
+        receipts: Arc::new(AtomicUsize::new(0)),
+        replays: Arc::new(AtomicUsize::new(0)),
+    };
+    let app = Router::new()
+        .route("/", post(handler))
+        .with_state(counters.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let url = format!("http://127.0.0.1:{}", addr.port());
+
+    let rpc = Arc::new(Rpc::new(make_client(&url), RpcOptions::default()));
+
+    let raw_block_json = make_rpc_block(
+        50,
+        block_hash,
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    let rpc_block: evm_source::rpc_data::RpcBlock = serde_json::from_value(raw_block_json).unwrap();
+    let body = evm_source::rpc_data::RawRpcBlock::new(50, block_hash.to_string(), rpc_block);
+
+    let req = DataRequest {
+        receipts: true,
+        traces: true,
+        state_diffs: true,
+        use_trace_api: true,
+        ..Default::default()
+    };
+    let enriched = tokio::time::timeout(
+        Duration::from_secs(10),
+        rpc.enrich_block_with_retry(body, &req),
+    )
+    .await
+    .expect("enrich timed out")
+    .expect("enrichment succeeds");
+
+    assert!(!enriched.is_invalid);
+    assert!(enriched.receipts.is_some(), "receipts present after retry");
+
+    assert_eq!(
+        counters.receipts.load(Ordering::SeqCst),
+        2,
+        "the lagging leg is the one retried"
+    );
+    assert_eq!(
+        counters.replays.load(Ordering::SeqCst),
+        1,
+        "the replay answered on the first attempt and must not be re-issued"
+    );
+    assert_eq!(
+        counters.headers.load(Ordering::SeqCst),
+        0,
+        "the speculative header is uncontested, so no re-fetch"
+    );
+}
+
 /// Test that when receipts are initially null (not ready), we retry and succeed.
 #[tokio::test]
 async fn test_enrich_retry_on_null_receipts() {
