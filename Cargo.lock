@@ -826,7 +826,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "data-service-core"
-version = "0.2.1"
+version = "0.2.2-rc1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "evm-data-service"
-version = "0.2.1"
+version = "0.2.2-rc1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "evm-source"
-version = "0.2.1"
+version = "0.2.2-rc1"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.2.1"
+version = "0.2.2-rc1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1810,7 +1810,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "latency-bench"
-version = "0.2.1"
+version = "0.2.2-rc1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2492,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "rpc-client"
-version = "0.2.1"
+version = "0.2.2-rc1"
 dependencies = [
  "anyhow",
  "async-recursion",
