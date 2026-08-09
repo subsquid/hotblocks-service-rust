@@ -15,7 +15,7 @@ use crate::mapping::map_raw_block;
 use crate::normalization::MappingOptions as NormOptions;
 use crate::rpc_data::RawRpcBlock;
 use crate::types::DataRequest;
-use data_service_core::{Block, BlockRef};
+use data_service_core::{Block, BlockRef, EnrichProfile};
 
 /// A batch of blocks with optional finalized head info.
 #[derive(Debug)]
@@ -124,7 +124,7 @@ impl Default for CadencePredictor {
 async fn map_blocks_cpu(
     raw_blocks: Vec<RawRpcBlock>,
     options: Arc<NormOptions>,
-    timings: Option<Vec<(std::time::Instant, std::time::Instant)>>,
+    timings: Option<Vec<(std::time::Instant, std::time::Instant, EnrichProfile)>>,
 ) -> Result<Vec<Block>> {
     if raw_blocks.is_empty() {
         return Ok(vec![]);
@@ -478,10 +478,11 @@ pub async fn ingest_range(
                     let req2 = req.clone();
                     let opts2 = mapping_options.clone();
                     tokio::spawn(async move {
-                        let enriched = rpc2.enrich_block_with_retry(body, &req2).await?;
+                        let (enriched, profile) =
+                            rpc2.enrich_block_with_retry(body, &req2).await?;
                         let timings = body_received.map(|br| {
                             let enrich_done = Instant::now();
-                            vec![(br, enrich_done)]
+                            vec![(br, enrich_done, profile)]
                         });
                         map_blocks_cpu(vec![enriched], opts2, timings).await
                     })

@@ -2,7 +2,7 @@
 /// Mirrors evm-data-service/src/data-source/mapping.ts.
 use anyhow::Result;
 use bytes::Bytes;
-use data_service_core::{Block, BlockTimings};
+use data_service_core::{Block, BlockTimings, EnrichProfile};
 
 use crate::normalization::{map_rpc_block, MappingOptions};
 use crate::rpc_data::RawRpcBlock;
@@ -16,7 +16,7 @@ use crate::types::qty2_u64;
 pub fn map_raw_block(
     raw: &RawRpcBlock,
     options: &MappingOptions,
-    timings_in: Option<(std::time::Instant, std::time::Instant)>,
+    timings_in: Option<(std::time::Instant, std::time::Instant, EnrichProfile)>,
 ) -> Result<Block> {
     let normalized = map_rpc_block(raw, options);
 
@@ -43,10 +43,11 @@ pub fn map_raw_block(
     let number = qty2_u64(&raw.block.number);
     let timestamp = qty2_u64(&raw.block.timestamp) * 1000;
 
-    let timings = timings_in.and_then(|(body_received, enrich_done)| {
+    let timings = timings_in.and_then(|(body_received, enrich_done, enrich_profile)| {
         Some(BlockTimings {
             body_received,
             enrich_done,
+            enrich_profile,
             normalize_done: normalize_done?,
             compress_duration,
         })

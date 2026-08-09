@@ -2,9 +2,11 @@
 #![allow(clippy::ptr_arg)]
 use std::future::Future;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use data_service_core::metrics::{EnrichmentRetry, Metrics};
+use data_service_core::EnrichProfile;
 use futures::future::Either;
 use rpc_client::{CallOptions, RpcClient, RpcError, RpcErrorInfo};
 
@@ -127,6 +129,17 @@ pub const NOT_READY_DELAY: std::time::Duration = std::time::Duration::from_milli
 /// Consecutive legs-only re-acquisitions before falling back to the whole
 /// block. Bounds how long an unrecognised stale header can go unrefreshed.
 const LEGS_ONLY_RETRIES: u32 = 3;
+
+/// How long each leg of one acquisition round took upstream. The legs are
+/// issued concurrently, so these overlap: the round costs the largest of them,
+/// and whatever `enrich_ms` holds beyond that is parsing, verification and the
+/// ladder rather than the provider.
+#[derive(Clone, Copy, Debug, Default)]
+struct LegDurations {
+    logs: Duration,
+    receipts: Duration,
+    traces: Duration,
+}
 
 /// The legs of `req` a block still lacks. The traces leg is kept or dropped
 /// whole: its sub-legs share one method selection — the replay carries traces
@@ -550,16 +563,18 @@ impl Rpc {
     }
 
     /// Enrich a single block with retry for not-ready conditions.
-    /// Returns the enriched block once consistent data is available.
+    /// Returns the enriched block once consistent data is available, with a
+    /// profile of where the time went — `enrich_ms` on its own cannot tell a
+    /// slow upstream from a ladder that ran four times.
     /// This is the per-block retry loop for the pipeline overlap path.
     pub async fn enrich_block_with_retry(
         self: &Arc<Self>,
         body: RawRpcBlock,
         req: &crate::types::DataRequest,
-    ) -> Result<RawRpcBlock> {
+    ) -> Result<(RawRpcBlock, EnrichProfile)> {
         let needs_enrichment = req.logs || req.receipts || req.traces || req.state_diffs;
         if !needs_enrichment {
-            return Ok(body);
+            return Ok((body, EnrichProfile::default()));
         }
 
         // The first attempt reuses the speculatively-fetched header (`body`), so
@@ -604,14 +619,24 @@ impl Rpc {
         // Network/RPC errors propagate (the client already retries transient
         // ones internally via batch_call_reduce_on_retry).
         let mut blocks = vec![body];
-        self.add_requested_data(&mut blocks, req).await?;
+        let mut legs = self.add_requested_data(&mut blocks, req).await?;
+        let mut profile = EnrichProfile {
+            attempts: 1,
+            ..Default::default()
+        };
 
         loop {
             // Enrichment only populates logs/receipts once they match the header
             // hash (see add_logs/add_receipts), so a ready block is simply one
             // that exists and wasn't marked invalid.
             if blocks.first().is_some_and(|b| !b.is_invalid) {
-                return Ok(blocks.remove(0));
+                // The legs of the round that succeeded. After a legs-only
+                // retry the legs it did not re-fetch read zero, which is why
+                // `attempts` has to be read alongside them.
+                profile.logs = legs.logs;
+                profile.receipts = legs.receipts;
+                profile.traces = legs.traces;
+                return Ok((blocks.remove(0), profile));
             }
 
             // A block gone absent on re-fetch is not-ready too: not produced,
@@ -681,6 +706,9 @@ impl Rpc {
                 "block enrichment not ready, re-acquiring"
             );
 
+            profile.attempts = profile.attempts.saturating_add(1);
+            profile.waited = profile.waited.saturating_add(delay);
+
             // An empty whole-block result (not produced yet / chain break)
             // leaves `blocks` empty and we keep retrying until the bound.
             let acquire = async move {
@@ -691,16 +719,16 @@ impl Rpc {
                         if let Some(head) = retained.first_mut() {
                             head.clear_invalid();
                         }
-                        self.fetch_and_apply(&mut retained, &residual).await?;
-                        Ok(retained)
+                        let legs = self.fetch_and_apply(&mut retained, &residual).await?;
+                        Ok((retained, legs))
                     }
-                    None => {
-                        self.get_block_batch(std::slice::from_ref(&number), req)
-                            .await
-                    }
+                    None => self
+                        .get_block_batch(std::slice::from_ref(&number), req)
+                        .await
+                        .map(|fetched| (fetched, LegDurations::default())),
                 }
             };
-            blocks = match deadline {
+            (blocks, legs) = match deadline {
                 // Dropping the in-flight fetch at the deadline is safe: the
                 // client's capacity-semaphore permit is released on drop.
                 Some(deadline) => match tokio::time::timeout_at(deadline, acquire).await {
@@ -988,7 +1016,7 @@ impl Rpc {
         &self,
         blocks: &mut Vec<RawRpcBlock>,
         req: &crate::types::DataRequest,
-    ) -> Result<()> {
+    ) -> Result<LegDurations> {
         self.options.validate_request(req)?;
         self.fetch_and_apply(blocks, req).await
     }
@@ -1000,53 +1028,74 @@ impl Rpc {
         &self,
         blocks: &mut Vec<RawRpcBlock>,
         req: &crate::types::DataRequest,
-    ) -> Result<()> {
+    ) -> Result<LegDurations> {
         // Each leg is one upstream round trip writing fields no other leg
         // touches, so the fetch halves overlap; the applies then run in the
         // legs' fixed order, which keeps error precedence and per-block marks
         // exactly as the serial implementation left them. A failing leg drops
         // the ones below it (`join_or_err`) — their answers can no longer be
         // read, so waiting them out would only delay the error.
+        //
+        // Each leg carries its own elapsed back rather than writing to shared
+        // state: these futures are spawned, so anything shared between them
+        // would have to be `Sync` for no reason. `enrich_ms` only ever shows
+        // the slowest of them, and which one that is decides where to look.
         let shared: &[RawRpcBlock] = blocks;
         let (logs_fetch, rest) = join_or_err(
             async {
                 if req.logs {
-                    self.fetch_logs(shared).await.map(Some)
+                    let started = Instant::now();
+                    self.fetch_logs(shared)
+                        .await
+                        .map(|v| (Some(v), started.elapsed()))
                 } else {
-                    Ok(None)
+                    Ok((None, Duration::ZERO))
                 }
             },
             join_or_err(
                 async {
                     if req.receipts {
-                        self.fetch_receipts(shared).await.map(Some)
+                        let started = Instant::now();
+                        self.fetch_receipts(shared)
+                            .await
+                            .map(|v| (Some(v), started.elapsed()))
                     } else {
-                        Ok(None)
+                        Ok((None, Duration::ZERO))
                     }
                 },
                 async {
                     if req.traces || req.state_diffs {
-                        self.fetch_traces(shared, req).await.map(Some)
+                        let started = Instant::now();
+                        self.fetch_traces(shared, req)
+                            .await
+                            .map(|v| (Some(v), started.elapsed()))
                     } else {
-                        Ok(None)
+                        Ok((None, Duration::ZERO))
                     }
                 },
             ),
         )
         .await?;
 
+        let (logs_fetch, logs_elapsed) = logs_fetch;
         if let Some(logs) = logs_fetch {
             self.apply_logs(blocks, logs).await?;
         }
         let (receipts_fetch, traces_fetch) = rest?;
+        let (receipts_fetch, receipts_elapsed) = receipts_fetch;
         if let Some(receipts) = receipts_fetch {
             self.apply_receipts(blocks, receipts).await?;
         }
-        if let Some(traces) = traces_fetch? {
+        let (traces_fetch, traces_elapsed) = traces_fetch?;
+        if let Some(traces) = traces_fetch {
             self.apply_traces(blocks, traces);
         }
 
-        Ok(())
+        Ok(LegDurations {
+            logs: logs_elapsed,
+            receipts: receipts_elapsed,
+            traces: traces_elapsed,
+        })
     }
 
     async fn fetch_logs(&self, blocks: &[RawRpcBlock]) -> Result<Vec<RpcLog>> {

@@ -866,10 +866,22 @@ impl<S: DataSource> DataService<S> {
                 let queue_ms = insert_start.duration_since(compress_done).as_secs_f64() * 1000.0;
                 let insert_ms = insert_elapsed.as_secs_f64() * 1000.0;
                 let total_ms = now.duration_since(t.body_received).as_secs_f64() * 1000.0;
+                let p = &t.enrich_profile;
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+                // Legs overlap, so the round cost the slowest of them. What is
+                // left of `enrich_ms` after that and the ladder's sleeps is
+                // ours: parsing the responses, verifying them, applying them.
+                let enrich_own_ms = (enrich_ms - ms(p.waited) - ms(p.slowest_leg())).max(0.0);
                 tracing::info!(
                     target: "block_timing",
                     block_number = block.number,
                     enrich_ms,
+                    enrich_attempts = p.attempts,
+                    enrich_waited_ms = ms(p.waited),
+                    leg_logs_ms = ms(p.logs),
+                    leg_receipts_ms = ms(p.receipts),
+                    leg_traces_ms = ms(p.traces),
+                    enrich_own_ms,
                     normalize_ms,
                     compress_ms,
                     queue_ms,
