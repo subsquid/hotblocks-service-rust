@@ -1,5 +1,6 @@
 /// Ingest layer — stride-parallel block fetching with speculative head polling.
 /// Ports evm-rpc/src/data-source/ingest.ts and poll-stream.ts.
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,66 +26,75 @@ pub struct IngestBatch {
 
 // ─── Cadence predictor ────────────────────────────────────────────────────────
 
-/// Exponential moving average cadence predictor.
-/// Tracks inter-block interval from wall-clock arrival times.
+/// Inter-block intervals kept for the floor estimate.
+const INTERVAL_WINDOW: usize = 8;
+/// How long before the predicted arrival the tight poll starts.
+const HOT_WINDOW_MS: u64 = 600;
+/// Poll grain inside the hot window.
+const HOT_POLL_MS: u64 = 25;
+/// Cap on a single quiet sleep, so a bad prediction cannot park us for a whole
+/// interval.
+const QUIET_SLEEP_CAP_MS: u64 = 1000;
+/// Grain before any interval has been observed.
+const NO_DATA_POLL_MS: u64 = 100;
+
+/// Predicts the next arrival from the *shortest* of the last
+/// [`INTERVAL_WINDOW`] inter-block intervals.
+///
+/// The floor rather than an average because the errors are not symmetric:
+/// under-prediction costs polls, over-prediction costs latency. An EMA absorbed
+/// every skipped slot and then over-predicted until it decayed — one doubled
+/// interval on a 5 s chain slept through the next six arrivals.
 pub struct CadencePredictor {
-    /// EMA of inter-block intervals in milliseconds.
-    ema_ms: Option<f64>,
-    /// Wall-clock time of last observed block arrival.
+    /// Inter-block intervals in milliseconds, oldest first.
+    intervals: VecDeque<u64>,
     last_arrival: Option<Instant>,
-    /// EMA smoothing factor (α). Lower = slower adaptation.
-    alpha: f64,
 }
 
 impl CadencePredictor {
     pub fn new() -> Self {
         CadencePredictor {
-            ema_ms: None,
+            intervals: VecDeque::with_capacity(INTERVAL_WINDOW),
             last_arrival: None,
-            alpha: 0.3,
         }
     }
 
     /// Record that a new block arrived now.
     pub fn record_block(&mut self, now: Instant) {
         if let Some(last) = self.last_arrival {
-            let interval_ms = now.duration_since(last).as_millis() as f64;
-            self.ema_ms = Some(match self.ema_ms {
-                None => interval_ms,
-                Some(prev) => self.alpha * interval_ms + (1.0 - self.alpha) * prev,
-            });
+            if self.intervals.len() == INTERVAL_WINDOW {
+                self.intervals.pop_front();
+            }
+            self.intervals.push_back(millis_since(now, last));
         }
         self.last_arrival = Some(now);
     }
 
-    /// How long to sleep before next poll attempt.
-    /// Returns 100ms if no prediction data yet.
+    /// How long to sleep before the next poll attempt.
     ///
-    /// Arrival times have significant jitter (provider propagation,
-    /// load-balanced nodes), so a single long sleep until the predicted
-    /// arrival risks sleeping through an early block. Instead we only stay
-    /// quiet while we're more than 600ms away from the predicted arrival,
-    /// and poll every 25ms inside that window. A tighter grain shaves the
-    /// detection tail but multiplies provider traffic (~24 → ~60 polls per
-    /// hot window at 10ms), so 25ms stands.
+    /// Arrival jitter exceeds the hot window (measured p90 ≈ 1.3 s above the
+    /// fastest arrival on a 5 s chain), so the window cannot be centred on a
+    /// prediction — the floor under-predicts by roughly the spread, opening it
+    /// early. A tighter grain inside shaves little and multiplies traffic.
     pub fn next_poll_delay(&self, now: Instant) -> Duration {
-        const HOT_WINDOW_MS: f64 = 600.0;
-        const HOT_POLL_MS: f64 = 25.0;
-
-        let (Some(ema), Some(last)) = (self.ema_ms, self.last_arrival) else {
-            return Duration::from_millis(100);
+        let (Some(last), Some(&floor_ms)) = (self.last_arrival, self.intervals.iter().min()) else {
+            return Duration::from_millis(NO_DATA_POLL_MS);
         };
 
-        let elapsed_ms = now.duration_since(last).as_millis() as f64;
-        let remaining = ema - elapsed_ms;
+        let remaining = floor_ms.saturating_sub(millis_since(now, last));
         let sleep_ms = if remaining > HOT_WINDOW_MS {
             // Quiet period: wake at the edge of the hot window.
-            (remaining - HOT_WINDOW_MS).min(1000.0)
+            (remaining - HOT_WINDOW_MS).min(QUIET_SLEEP_CAP_MS)
         } else {
             HOT_POLL_MS
         };
-        Duration::from_millis(sleep_ms.max(HOT_POLL_MS) as u64)
+        Duration::from_millis(sleep_ms.max(HOT_POLL_MS))
     }
+}
+
+/// Saturating, so a clock jump cannot wrap the prediction into a tight spin.
+fn millis_since(now: Instant, earlier: Instant) -> u64 {
+    u64::try_from(now.duration_since(earlier).as_millis()).unwrap_or(u64::MAX)
 }
 
 impl Default for CadencePredictor {
