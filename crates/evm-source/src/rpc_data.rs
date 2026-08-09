@@ -642,6 +642,10 @@ pub struct RawRpcBlock {
     /// `is_invalid`.
     #[serde(default = "default_false")]
     pub is_not_ready: bool,
+    /// The answer named a different block at our height, so our header may be
+    /// the stale side. Meaningful only when `is_not_ready`.
+    #[serde(default = "default_false")]
+    pub header_contested: bool,
     #[serde(default)]
     pub error_message: Option<String>,
 }
@@ -659,6 +663,7 @@ impl RawRpcBlock {
             debug_state_diffs: None,
             is_invalid: false,
             is_not_ready: false,
+            header_contested: false,
             error_message: None,
         }
     }
@@ -666,6 +671,7 @@ impl RawRpcBlock {
     pub fn mark_invalid(&mut self, msg: impl Into<String>) {
         self.is_invalid = true;
         self.is_not_ready = false;
+        self.header_contested = false;
         self.error_message = Some(msg.into());
     }
 
@@ -678,5 +684,23 @@ impl RawRpcBlock {
         self.is_invalid = true;
         self.is_not_ready = true;
         self.error_message = Some(msg.into());
+    }
+
+    /// Not-ready, but waiting alone will not heal it: only a re-acquired header
+    /// decides which side is stale.
+    pub fn mark_header_contested(&mut self, msg: impl Into<String>) {
+        if self.is_invalid && !self.is_not_ready {
+            return;
+        }
+        self.mark_not_ready(msg);
+        self.header_contested = true;
+    }
+
+    /// Drop the previous attempt's verdict before re-acquiring.
+    pub fn clear_invalid(&mut self) {
+        self.is_invalid = false;
+        self.is_not_ready = false;
+        self.header_contested = false;
+        self.error_message = None;
     }
 }
