@@ -15,10 +15,22 @@ slightly after the header.
 At the head, poll the *next block's existence* with a single header fetch; on a hit,
 acquire its components in a spawned task while immediately polling for the block
 after (bounded in-order pipeline, depth 3, emission strictly ordered —
-a stuck block holds emission rather than being skipped). Predict block cadence with
-an EMA and sleep until shortly before the predicted arrival, then poll on a tight
-interval — because arrival jitter (propagation, load-balanced fleets) makes a single
-long sleep risk missing an early block.
+a stuck block holds emission rather than being skipped). Predict block cadence and
+sleep until shortly before the predicted arrival, then poll on a tight interval —
+because arrival jitter (propagation, load-balanced fleets) makes a single long sleep
+risk missing an early block.
+
+**Amended 2026-08-09.** The predictor was an EMA of inter-block intervals. It averaged
+in every long interval and then over-predicted until it decayed, sleeping through
+arrivals: on a chain skipping 2.5% of slots this cost 200–600 ms on each of the six
+blocks after a gap, and jitter alone exceeded the hot window besides. It is now the
+floor of the last N intervals, which cannot be dragged upward by a late arrival.
+Under-prediction costs polls, over-prediction costs latency; the estimator now errs in
+the cheap direction. Only hits that follow an absent-block response train it;
+already-available catch-up blocks measure request throughput rather than chain
+cadence. Candidates — including the rejected ones — are scored by
+`crates/latency-bench` (`cadence`) against consecutive numbered arrival traces
+collected with the same full-block request shape as the production poller.
 
 ## Consequences
 

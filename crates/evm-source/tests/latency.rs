@@ -25,7 +25,7 @@ fn cadence_no_data_returns_100ms() {
 }
 
 #[test]
-fn cadence_predicts_reasonable_sleep() {
+fn cadence_caps_a_long_quiet_sleep() {
     let mut pred = CadencePredictor::new();
     let t0 = Instant::now();
 
@@ -36,11 +36,10 @@ fn cadence_predicts_reasonable_sleep() {
     let t2 = t1 + Duration::from_secs(12);
     pred.record_block(t2);
 
-    // Now query: 1s has elapsed since t2 — should sleep ~12-1-0.05 = ~10.95s
-    // but clamped to 1000ms max
+    // 1s in, the next arrival is still ~11s out. The sleep is capped so a wrong
+    // prediction cannot park the poller for a whole interval.
     let now = t2 + Duration::from_secs(1);
     let delay = pred.next_poll_delay(now);
-    // Must be clamped to 1000ms
     assert_eq!(delay, Duration::from_millis(1000));
 }
 
@@ -60,28 +59,81 @@ fn cadence_clamps_minimum_to_hot_poll() {
     assert_eq!(delay, Duration::from_millis(25));
 }
 
+/// The regression this estimator exists to prevent: on a chain that skips ~2.5%
+/// of its slots, an averaging predictor absorbs the doubled interval and then
+/// over-predicts — staying quiet through the arrival — for several blocks after.
 #[test]
-fn cadence_ema_adapts() {
+fn cadence_floor_ignores_a_skipped_slot() {
     let mut pred = CadencePredictor::new();
-    let t0 = Instant::now();
+    let mut t = Instant::now();
+    pred.record_block(t);
+    for _ in 0..3 {
+        t += Duration::from_millis(5000);
+        pred.record_block(t);
+    }
+    t += Duration::from_millis(10_000); // one slot skipped
+    pred.record_block(t);
 
-    // Two blocks 1000ms apart
-    pred.record_block(t0);
-    pred.record_block(t0 + Duration::from_millis(1000));
-    // Then one block 200ms later
-    pred.record_block(t0 + Duration::from_millis(1200));
+    // 4.5s on, the next block is inside the hot window and we must be polling
+    // for it. An EMA at α=0.3 would predict 6.5s here and sleep instead.
+    let delay = pred.next_poll_delay(t + Duration::from_millis(4500));
+    assert_eq!(delay, Duration::from_millis(25));
+}
 
-    // The EMA should have adapted toward 200ms (alpha=0.3)
-    // ema = 0.3*200 + 0.7*1000 = 60 + 700 = 760ms
-    // Query right after last block: elapsed=0, remaining=760 > 600 hot window
-    // → quiet sleep of 760-600 = 160ms.
-    let now = t0 + Duration::from_millis(1200);
-    let delay = pred.next_poll_delay(now);
-    let ms = delay.as_millis();
+/// Under-prediction costs polls, over-prediction costs latency — so the floor
+/// follows the chain downward with no smoothing at all.
+#[test]
+fn cadence_floor_follows_the_chain_down() {
+    let mut pred = CadencePredictor::new();
+    let mut t = Instant::now();
+    pred.record_block(t);
+    t += Duration::from_millis(5000);
+    pred.record_block(t);
+    t += Duration::from_millis(1000);
+    pred.record_block(t);
+
+    let delay = pred.next_poll_delay(t + Duration::from_millis(500));
+    assert_eq!(delay, Duration::from_millis(25));
+}
+
+#[test]
+fn cadence_floor_ages_out_a_stale_minimum() {
+    let mut pred = CadencePredictor::new();
+    let mut t = Instant::now();
+    pred.record_block(t);
+    t += Duration::from_millis(1000); // one anomalously short interval
+    pred.record_block(t);
+    for _ in 0..8 {
+        t += Duration::from_millis(5000);
+        pred.record_block(t);
+    }
+
+    // The outlier has left the window, so we go quiet right after a block
+    // instead of hot-polling the whole interval forever.
+    let delay = pred.next_poll_delay(t + Duration::from_millis(100));
     assert!(
-        (100..=250).contains(&ms),
-        "expected ~160ms quiet sleep, got {ms}ms"
+        delay > Duration::from_millis(25),
+        "expected a quiet sleep, got {delay:?}"
     );
+}
+
+#[test]
+fn cadence_ignores_rpc_spaced_catch_up_hits() {
+    let mut pred = CadencePredictor::new();
+    let mut t = Instant::now();
+    pred.record_block(t);
+    for _ in 0..8 {
+        t += Duration::from_secs(12);
+        pred.record_block(t);
+    }
+
+    // An already-available successor lands one RPC round trip later. This is
+    // catch-up throughput, not a 28 ms chain interval.
+    t += Duration::from_millis(28);
+    pred.record_polled_block(t, false);
+
+    let delay = pred.next_poll_delay(t + Duration::from_millis(100));
+    assert_eq!(delay, Duration::from_millis(1000));
 }
 
 // ─── Mock JSON-RPC server helpers ─────────────────────────────────────────────
