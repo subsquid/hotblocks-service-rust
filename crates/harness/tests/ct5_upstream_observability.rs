@@ -93,6 +93,16 @@ async fn drive(source: &EvmRpcDataSource, from: u64, want: usize) -> Option<Stri
     None
 }
 
+async fn wait_for_numbered_calls(upstream: &Upstream, block: u64, minimum: usize) {
+    tokio::time::timeout(BUDGET, async {
+        while upstream.calls_by_number("eth_getBlockByNumber", block) < minimum {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for block {block} to be polled"));
+}
+
 /// A healthy run still has to make the budget visible: round trips and calls
 /// are counted, batch items individually, and no failure class moves.
 #[tokio::test]
@@ -253,29 +263,36 @@ async fn head_detection_gap_and_interval_are_observed() {
         "a block that was already there was not waited for"
     );
 
-    // Same session, two arrivals: the second only exists after the head moves,
-    // so the poller parks on it and discovers it a poll interval later.
-    let (error, ()) = tokio::join!(drive(&wired.source, FIRST + 1, 2), async {
+    // In a new session FIRST+1 is catch-up, then two successors arrive only
+    // after the poller has observed them absent. Only those waited arrivals
+    // train cadence; the already-available seed must not create a short floor.
+    let first_missing_calls = upstream.calls_by_number("eth_getBlockByNumber", FIRST + 2);
+    let second_missing_calls = upstream.calls_by_number("eth_getBlockByNumber", FIRST + 3);
+    let (error, ()) = tokio::join!(drive(&wired.source, FIRST + 1, 3), async {
+        wait_for_numbered_calls(&upstream, FIRST + 2, first_missing_calls + 1).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
         upstream.set_head(FIRST + 2);
+        wait_for_numbered_calls(&upstream, FIRST + 3, second_missing_calls + 1).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        upstream.set_head(FIRST + 3);
     });
     assert!(error.is_none(), "the head moved, the session must not fail");
 
     assert_eq!(
         sample(&wired.metrics, "sqd_hotblocks_head_detection_gap_ms_count"),
-        1.0,
-        "exactly the one discovery that ended a wait is charged"
+        2.0,
+        "exactly the two discoveries that ended a wait are charged"
     );
     let gap = sample(&wired.metrics, "sqd_hotblocks_head_detection_gap_ms_sum");
     assert!(
-        (25.0..1000.0).contains(&gap),
+        (50.0..2000.0).contains(&gap),
         "the gap is the poll interval that hid the block, not the whole wait: {gap} ms"
     );
 
     assert_eq!(
         sample(&wired.metrics, "sqd_hotblocks_head_interval_ms_count"),
         1.0,
-        "one interval per consecutive pair of arrivals"
+        "only the consecutive pair of waited arrivals contributes an interval"
     );
     let interval = sample(&wired.metrics, "sqd_hotblocks_head_interval_ms_sum");
     assert!(

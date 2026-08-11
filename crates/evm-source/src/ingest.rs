@@ -1,5 +1,6 @@
 /// Ingest layer — stride-parallel block fetching with speculative head polling.
 /// Ports evm-rpc/src/data-source/ingest.ts and poll-stream.ts.
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,66 +26,87 @@ pub struct IngestBatch {
 
 // ─── Cadence predictor ────────────────────────────────────────────────────────
 
-/// Exponential moving average cadence predictor.
-/// Tracks inter-block interval from wall-clock arrival times.
+/// Inter-block intervals kept for the floor estimate.
+const INTERVAL_WINDOW: usize = 8;
+/// How long before the predicted arrival the tight poll starts.
+const HOT_WINDOW_MS: u64 = 600;
+/// Poll grain inside the hot window.
+const HOT_POLL_MS: u64 = 25;
+/// Cap on a single quiet sleep, so a bad prediction cannot park us for a whole
+/// interval.
+const QUIET_SLEEP_CAP_MS: u64 = 1000;
+/// Grain before any interval has been observed.
+const NO_DATA_POLL_MS: u64 = 100;
+
+/// Predicts the next arrival from the *shortest* of the last
+/// [`INTERVAL_WINDOW`] inter-block intervals.
+///
+/// The floor rather than an average because the errors are not symmetric:
+/// under-prediction costs polls, over-prediction costs latency. An EMA absorbed
+/// every skipped slot and then over-predicted until it decayed — one doubled
+/// interval on a 5 s chain slept through the next six arrivals.
 pub struct CadencePredictor {
-    /// EMA of inter-block intervals in milliseconds.
-    ema_ms: Option<f64>,
-    /// Wall-clock time of last observed block arrival.
+    /// Inter-block intervals in milliseconds, oldest first.
+    intervals: VecDeque<u64>,
     last_arrival: Option<Instant>,
-    /// EMA smoothing factor (α). Lower = slower adaptation.
-    alpha: f64,
 }
 
 impl CadencePredictor {
     pub fn new() -> Self {
         CadencePredictor {
-            ema_ms: None,
+            intervals: VecDeque::with_capacity(INTERVAL_WINDOW),
             last_arrival: None,
-            alpha: 0.3,
         }
     }
 
-    /// Record that a new block arrived now.
+    /// Record a known block-arrival observation.
     pub fn record_block(&mut self, now: Instant) {
         if let Some(last) = self.last_arrival {
-            let interval_ms = now.duration_since(last).as_millis() as f64;
-            self.ema_ms = Some(match self.ema_ms {
-                None => interval_ms,
-                Some(prev) => self.alpha * interval_ms + (1.0 - self.alpha) * prev,
-            });
+            if self.intervals.len() == INTERVAL_WINDOW {
+                self.intervals.pop_front();
+            }
+            self.intervals.push_back(millis_since(now, last));
         }
         self.last_arrival = Some(now);
     }
 
-    /// How long to sleep before next poll attempt.
-    /// Returns 100ms if no prediction data yet.
+    /// Record a successful numbered poll when it represents a block arrival.
     ///
-    /// Arrival times have significant jitter (provider propagation,
-    /// load-balanced nodes), so a single long sleep until the predicted
-    /// arrival risks sleeping through an early block. Instead we only stay
-    /// quiet while we're more than 600ms away from the predicted arrival,
-    /// and poll every 25ms inside that window. A tighter grain shaves the
-    /// detection tail but multiplies provider traffic (~24 → ~60 polls per
-    /// hot window at 10ms), so 25ms stands.
-    pub fn next_poll_delay(&self, now: Instant) -> Duration {
-        const HOT_WINDOW_MS: f64 = 600.0;
-        const HOT_POLL_MS: f64 = 25.0;
+    /// A block fetched immediately after the preceding hit is catch-up, not an
+    /// arrival observation: the interval between those responses measures RPC
+    /// throughput rather than chain cadence. Feeding it to a minimum estimator
+    /// would keep a slow chain on the hot polling grain for the whole window.
+    pub fn record_polled_block(&mut self, now: Instant, followed_empty_poll: bool) {
+        if followed_empty_poll {
+            self.record_block(now);
+        }
+    }
 
-        let (Some(ema), Some(last)) = (self.ema_ms, self.last_arrival) else {
-            return Duration::from_millis(100);
+    /// How long to sleep before the next poll attempt.
+    ///
+    /// Arrival jitter exceeds the hot window (measured p90 ≈ 1.3 s above the
+    /// fastest arrival on a 5 s chain), so the window cannot be centred on a
+    /// prediction — the floor under-predicts by roughly the spread, opening it
+    /// early. A tighter grain inside shaves little and multiplies traffic.
+    pub fn next_poll_delay(&self, now: Instant) -> Duration {
+        let (Some(last), Some(&floor_ms)) = (self.last_arrival, self.intervals.iter().min()) else {
+            return Duration::from_millis(NO_DATA_POLL_MS);
         };
 
-        let elapsed_ms = now.duration_since(last).as_millis() as f64;
-        let remaining = ema - elapsed_ms;
+        let remaining = floor_ms.saturating_sub(millis_since(now, last));
         let sleep_ms = if remaining > HOT_WINDOW_MS {
             // Quiet period: wake at the edge of the hot window.
-            (remaining - HOT_WINDOW_MS).min(1000.0)
+            (remaining - HOT_WINDOW_MS).min(QUIET_SLEEP_CAP_MS)
         } else {
             HOT_POLL_MS
         };
-        Duration::from_millis(sleep_ms.max(HOT_POLL_MS) as u64)
+        Duration::from_millis(sleep_ms.max(HOT_POLL_MS))
     }
+}
+
+/// Saturating, so a clock jump cannot wrap the prediction into a tight spin.
+fn millis_since(now: Instant, earlier: Instant) -> u64 {
+    u64::try_from(now.duration_since(earlier).as_millis()).unwrap_or(u64::MAX)
 }
 
 impl Default for CadencePredictor {
@@ -495,7 +517,12 @@ pub async fn ingest_range(
                     match rpc.get_single_block(next_num).await? {
                         Some(body) if !body.is_invalid => {
                             let now = Instant::now();
-                            cadence.record_block(now);
+                            // A hit without a preceding null is catch-up. Its
+                            // response spacing is RPC cadence, not block cadence,
+                            // and must not become the rolling minimum.
+                            let empty_at = last_empty_poll.take();
+                            let followed_empty_poll = empty_at.is_some();
+                            cadence.record_polled_block(now, followed_empty_poll);
                             hot_streak += 1;
                             incoherent_attempts = 0;
                             // OB-4: this path never reads the head tag, but a
@@ -504,21 +531,25 @@ pub async fn ingest_range(
                                 metrics.observe_upstream_head(next_num);
                                 // Only a poll that ended a wait bounds when the
                                 // block could have appeared; catching up does not.
-                                if let Some(empty_at) = last_empty_poll.take() {
+                                if let Some(empty_at) = empty_at {
                                     metrics.observe_head_detection_gap(
                                         poll_at
                                             .duration_since(empty_at)
                                             .saturating_sub(consumer_blocked),
                                     );
                                 }
-                                // The predictor's own input, detection error
-                                // included — which is what makes it readable
-                                // against the gap above.
-                                if let Some(prev) = last_arrival {
-                                    metrics.observe_head_interval(now.duration_since(prev));
+                                if followed_empty_poll {
+                                    // The predictor's own input, detection error
+                                    // included — which is what makes it readable
+                                    // against the gap above.
+                                    if let Some(prev) = last_arrival {
+                                        metrics.observe_head_interval(now.duration_since(prev));
+                                    }
                                 }
                             }
-                            last_arrival = Some(now);
+                            if followed_empty_poll {
+                                last_arrival = Some(now);
+                            }
                             let body_received = if profile_block_timings { Some(now) } else { None };
                             pending.push_back((next_num, spawn_enrich(body, body_received)));
                             next_num += 1;
