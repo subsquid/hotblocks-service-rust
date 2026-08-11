@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Result};
 use data_service_core::metrics::{EnrichmentRetry, Metrics};
 use data_service_core::EnrichProfile;
 use futures::future::Either;
-use rpc_client::{CallOptions, RpcClient, RpcError, RpcErrorInfo};
+use rpc_client::{CallOptions, RpcClient, RpcError, UpstreamSession};
 
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
@@ -20,6 +20,7 @@ use crate::rpc_data::{
     RpcWithdrawal, TraceTransactionReplay,
 };
 use crate::types::{qty2_u64, to_qty};
+use crate::upstream_faults::{self, Leg};
 use crate::verification::{check_call_frame_tree, check_debug_frame_structure};
 
 /// A component, or why the block is incoherent (DEF-15). The caller marks the
@@ -74,6 +75,10 @@ pub struct RpcOptions {
     /// Wall-clock budget for FM-16 not-ready retries on the head enrichment
     /// path. `None` → `NOT_READY_BUDGET`.
     pub not_ready_budget: Option<std::time::Duration>,
+    /// Serve a block's legs from the backend that showed its header, where the
+    /// upstream names one. `None` → on; the switch only forces it off. Whether
+    /// it engages is a property of the upstream's answers, not of this.
+    pub provider_affinity: Option<bool>,
     pub verify_block_hash: bool,
     pub verify_tx_sender: bool,
     pub verify_tx_root: bool,
@@ -176,6 +181,13 @@ fn traces_leg_in_hand(block: &RawRpcBlock, req: &crate::types::DataRequest) -> b
     (!wants_debug_frames || block.debug_frames.is_some())
         && (!wants_debug_diffs || block.debug_state_diffs.is_some())
         && (!wants_replays || block.trace_replays.is_some())
+}
+
+/// A numbered head poll: the block, if it existed yet, and the backend that
+/// answered.
+pub struct HeadPoll {
+    pub block: Option<RawRpcBlock>,
+    pub session: Option<UpstreamSession>,
 }
 
 /// A number-addressed replay poll running beside the body poll. Resolved by the
@@ -375,6 +387,17 @@ impl Rpc {
         self.options.not_ready_budget.unwrap_or(NOT_READY_BUDGET)
     }
 
+    /// An unbound binding for one acquisition; `None` with affinity off, and
+    /// then every request goes out as it did before. Never shared: the poller
+    /// may be asking a different backend for the next block while this one's
+    /// legs are still bound.
+    pub fn new_session(&self) -> Option<UpstreamSession> {
+        self.options
+            .provider_affinity
+            .unwrap_or(true)
+            .then(UpstreamSession::new)
+    }
+
     /// T1's read: replaces the cached view and opens a new epoch.
     ///
     /// A re-INIT may seed *below* the previous epoch (WP-20, ADR-14, FM-26), and
@@ -555,10 +578,21 @@ impl Rpc {
         Ok(height)
     }
 
+    /// One numbered head poll, and the backend that answered it. The winner is
+    /// carried to that block's legs and then forgotten: nothing is stored
+    /// between blocks.
+    pub async fn poll_head_block(&self, number: u64) -> Result<HeadPoll> {
+        let session = self.new_session();
+        let results = self.get_blocks(&[number], true, session.as_ref()).await?;
+        Ok(HeadPoll {
+            block: results.into_iter().next().flatten(),
+            session,
+        })
+    }
+
     /// Fetch a single block by number (body + txs). Returns None if not yet available.
     pub async fn get_single_block(&self, number: u64) -> Result<Option<RawRpcBlock>> {
-        let results = self.get_blocks(&[number], true).await?;
-        Ok(results.into_iter().next().flatten())
+        Ok(self.poll_head_block(number).await?.block)
     }
 
     /// Fetch finalized blocks for given numbers (used by finalizer).
@@ -613,14 +647,18 @@ impl Rpc {
     }
 
     /// Fetch a batch of blocks with optional transaction data and attachments.
+    ///
+    /// `session` binds the headers and their legs to one backend; an unbound
+    /// one still keeps them together on whoever serves the headers.
     pub async fn get_block_batch(
         &self,
         numbers: &[u64],
         req: &crate::types::DataRequest,
+        session: Option<UpstreamSession>,
     ) -> Result<Vec<RawRpcBlock>> {
         let with_txs = true; // always fetch transactions for normalization
 
-        let blocks = self.get_blocks(numbers, with_txs).await?;
+        let blocks = self.get_blocks(numbers, with_txs, session.as_ref()).await?;
 
         // Filter to contiguous chain
         let mut chain: Vec<RawRpcBlock> = Vec::new();
@@ -646,7 +684,8 @@ impl Rpc {
             }
         }
 
-        self.add_requested_data(&mut chain, req, None).await?;
+        self.add_requested_data(&mut chain, req, None, session.as_ref())
+            .await?;
         Ok(chain)
     }
 
@@ -658,9 +697,11 @@ impl Rpc {
         self: &Arc<Self>,
         blocks: Vec<RawRpcBlock>,
         req: &crate::types::DataRequest,
+        session: Option<UpstreamSession>,
     ) -> Result<Vec<RawRpcBlock>> {
         let mut blocks = blocks;
-        self.add_requested_data(&mut blocks, req, None).await?;
+        self.add_requested_data(&mut blocks, req, None, session.as_ref())
+            .await?;
         Ok(blocks)
     }
 
@@ -669,11 +710,14 @@ impl Rpc {
     /// profile of where the time went — `enrich_ms` on its own cannot tell a
     /// slow upstream from a ladder that ran four times.
     /// This is the per-block retry loop for the pipeline overlap path.
+    /// `session` is the backend that showed the header — the one node whose
+    /// receipts cannot be behind it.
     pub async fn enrich_block_with_retry(
         self: &Arc<Self>,
         body: RawRpcBlock,
         req: &crate::types::DataRequest,
         spec: Option<SpeculativeReplay>,
+        session: Option<UpstreamSession>,
     ) -> Result<(RawRpcBlock, EnrichProfile)> {
         let needs_enrichment = req.logs || req.receipts || req.traces || req.state_diffs;
         if !needs_enrichment {
@@ -717,6 +761,8 @@ impl Rpc {
         // escalates instead of spending the whole budget on a header it never
         // refreshes.
         let mut legs_only_streak: u32 = 0;
+        // The backend serving this block, redrawn whenever the header is.
+        let mut session = session;
 
         // First attempt: enrich the header we already fetched speculatively.
         // Network/RPC errors propagate (the client already retries transient
@@ -727,7 +773,9 @@ impl Rpc {
         // standalone.
         let first = missing_legs(&blocks[0], req);
         self.options.validate_request(req)?;
-        let mut legs = self.fetch_and_apply(&mut blocks, &first, spec).await?;
+        let mut legs = self
+            .fetch_and_apply(&mut blocks, &first, spec, session.as_ref())
+            .await?;
         let mut profile = EnrichProfile {
             attempts: 1,
             ..Default::default()
@@ -803,6 +851,14 @@ impl Rpc {
                 None => legs_only_streak = 0,
             }
 
+            // A whole-block round re-fetches the header, so it redraws: the
+            // old backend never showed the header the legs would belong to.
+            // The only place the binding is dropped — this round trip happens
+            // anyway, whereas an ask purely to change backend would not.
+            if residual.is_none() {
+                session = self.new_session();
+            }
+
             debug!(
                 block = number,
                 not_ready,
@@ -819,6 +875,7 @@ impl Rpc {
 
             // An empty whole-block result (not produced yet / chain break)
             // leaves `blocks` empty and we keep retrying until the bound.
+            let round = session.clone();
             let acquire = async move {
                 tokio::time::sleep(delay).await;
                 match residual {
@@ -827,11 +884,13 @@ impl Rpc {
                         if let Some(head) = retained.first_mut() {
                             head.clear_invalid();
                         }
-                        let legs = self.fetch_and_apply(&mut retained, &residual, None).await?;
+                        let legs = self
+                            .fetch_and_apply(&mut retained, &residual, None, round.as_ref())
+                            .await?;
                         Ok((retained, legs))
                     }
                     None => self
-                        .get_block_batch(std::slice::from_ref(&number), req)
+                        .get_block_batch(std::slice::from_ref(&number), req, round)
                         .await
                         .map(|fetched| (fetched, LegDurations::default())),
                 }
@@ -852,6 +911,7 @@ impl Rpc {
         &self,
         numbers: &[u64],
         with_transactions: bool,
+        session: Option<&UpstreamSession>,
     ) -> Result<Vec<Option<RawRpcBlock>>> {
         if numbers.is_empty() {
             return Ok(vec![]);
@@ -867,29 +927,9 @@ impl Rpc {
             })
             .collect();
 
-        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> =
-            Box::new(|info: &RpcErrorInfo| {
-                // Avalanche: out-of-range returns this error
-                if info.message.contains("cannot query unfinalized data") {
-                    return Ok(Value::Null);
-                }
-                // Hyperliquid: invalid block height — retry
-                if info.message.contains("invalid block height") {
-                    return Err(RpcError::RetryRequested("invalid block height".into()));
-                }
-                // Alchemy/Sei -32000 internal error — retry
-                if info.code == -32000 {
-                    return Err(RpcError::RetryRequested("internal error -32000".into()));
-                }
-                Err(RpcError::Rpc {
-                    code: info.code,
-                    message: info.message.clone(),
-                    data: info.data.clone(),
-                })
-            });
-
         let options = CallOptions {
-            validate_error: Some(validate_error),
+            validate_error: Some(upstream_faults::validator(Leg::Body)),
+            session: session.cloned(),
             ..Default::default()
         };
 
@@ -1125,19 +1165,23 @@ impl Rpc {
         blocks: &mut Vec<RawRpcBlock>,
         req: &crate::types::DataRequest,
         spec: Option<SpeculativeReplay>,
+        session: Option<&UpstreamSession>,
     ) -> Result<LegDurations> {
         self.options.validate_request(req)?;
-        self.fetch_and_apply(blocks, req, spec).await
+        self.fetch_and_apply(blocks, req, spec, session).await
     }
 
     /// The legs themselves. A retry's residual request is not valid standalone
     /// — `verify_receipts_root` demands `receipts`, which a block that already
     /// has them no longer asks for — so the check stays with the caller's own.
+    /// The legs run concurrently and so open connections beyond the poller's:
+    /// `session` travels in the request, never in the connection.
     async fn fetch_and_apply(
         &self,
         blocks: &mut Vec<RawRpcBlock>,
         req: &crate::types::DataRequest,
         spec: Option<SpeculativeReplay>,
+        session: Option<&UpstreamSession>,
     ) -> Result<LegDurations> {
         // Each leg is one upstream round trip writing fields no other leg
         // touches, so the fetch halves overlap; the applies then run in the
@@ -1155,7 +1199,7 @@ impl Rpc {
             async {
                 if req.logs {
                     let started = Instant::now();
-                    self.fetch_logs(shared)
+                    self.fetch_logs(shared, session)
                         .await
                         .map(|v| (Some(v), started.elapsed()))
                 } else {
@@ -1166,7 +1210,7 @@ impl Rpc {
                 async {
                     if req.receipts {
                         let started = Instant::now();
-                        self.fetch_receipts(shared)
+                        self.fetch_receipts(shared, session)
                             .await
                             .map(|v| (Some(v), started.elapsed()))
                     } else {
@@ -1176,7 +1220,7 @@ impl Rpc {
                 async {
                     if req.traces || req.state_diffs {
                         let started = Instant::now();
-                        self.fetch_traces(shared, req, spec)
+                        self.fetch_traces(shared, req, spec, session)
                             .await
                             .map(|v| (Some(v), started.elapsed()))
                     } else {
@@ -1208,24 +1252,16 @@ impl Rpc {
         })
     }
 
-    async fn fetch_logs(&self, blocks: &[RawRpcBlock]) -> Result<Vec<RpcLog>> {
+    async fn fetch_logs(
+        &self,
+        blocks: &[RawRpcBlock],
+        session: Option<&UpstreamSession>,
+    ) -> Result<Vec<RpcLog>> {
         if blocks.is_empty() {
             return Ok(Vec::new());
         }
         let from = &blocks[0].block.number;
         let to = &blocks[blocks.len() - 1].block.number;
-
-        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> =
-            Box::new(|info: &RpcErrorInfo| {
-                if info.message.contains("after last accepted block") {
-                    return Ok(json!([]));
-                }
-                Err(RpcError::Rpc {
-                    code: info.code,
-                    message: info.message.clone(),
-                    data: info.data.clone(),
-                })
-            });
 
         let result = self
             .client
@@ -1233,7 +1269,8 @@ impl Rpc {
                 "eth_getLogs",
                 Some(json!([{"fromBlock": from, "toBlock": to}])),
                 CallOptions {
-                    validate_error: Some(validate_error),
+                    validate_error: Some(upstream_faults::validator(Leg::Logs)),
+                    session: session.cloned(),
                     ..Default::default()
                 },
             )
@@ -1309,15 +1346,19 @@ impl Rpc {
         Ok(method)
     }
 
-    async fn fetch_receipts(&self, blocks: &[RawRpcBlock]) -> Result<ReceiptsFetch> {
+    async fn fetch_receipts(
+        &self,
+        blocks: &[RawRpcBlock],
+        session: Option<&UpstreamSession>,
+    ) -> Result<ReceiptsFetch> {
         let method = self.get_receipts_method().await?;
         match method {
             ReceiptsMethod::ByBlock => self
-                .fetch_receipts_by_block(blocks)
+                .fetch_receipts_by_block(blocks, session)
                 .await
                 .map(ReceiptsFetch::ByBlock),
             ReceiptsMethod::ByTx => self
-                .fetch_receipts_by_tx(blocks)
+                .fetch_receipts_by_tx(blocks, session)
                 .await
                 .map(ReceiptsFetch::ByTx),
         }
@@ -1337,6 +1378,7 @@ impl Rpc {
     async fn fetch_receipts_by_block(
         &self,
         blocks: &[RawRpcBlock],
+        session: Option<&UpstreamSession>,
     ) -> Result<Vec<std::result::Result<Value, RpcError>>> {
         let calls: Vec<(String, Option<Value>)> = blocks
             .iter()
@@ -1348,27 +1390,9 @@ impl Rpc {
             })
             .collect();
 
-        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> =
-            Box::new(|info: &RpcErrorInfo| {
-                if info.message.contains("invalid block height") {
-                    return Err(RpcError::RetryRequested("invalid block height".into()));
-                }
-                // Not found / unknown block — treat as not-ready (null)
-                if info.message.contains("unknown block")
-                    || info.message.contains("not found")
-                    || info.message.contains("header not found")
-                {
-                    return Ok(Value::Null);
-                }
-                Err(RpcError::Rpc {
-                    code: info.code,
-                    message: info.message.clone(),
-                    data: info.data.clone(),
-                })
-            });
-
         let options = CallOptions {
-            validate_error: Some(validate_error),
+            validate_error: Some(upstream_faults::validator(Leg::Receipts)),
+            session: session.cloned(),
             ..Default::default()
         };
 
@@ -1456,6 +1480,7 @@ impl Rpc {
     async fn fetch_receipts_by_tx(
         &self,
         blocks: &[RawRpcBlock],
+        session: Option<&UpstreamSession>,
     ) -> Result<Vec<std::result::Result<Value, RpcError>>> {
         let mut calls: Vec<(String, Option<Value>)> = Vec::new();
         for block in blocks.iter() {
@@ -1467,9 +1492,13 @@ impl Rpc {
             }
         }
 
+        let options = CallOptions {
+            session: session.cloned(),
+            ..Default::default()
+        };
         Ok(self
             .client
-            .batch_call_reduce_on_retry(calls, &CallOptions::default())
+            .batch_call_reduce_on_retry(calls, &options)
             .await?)
     }
 
@@ -1540,6 +1569,7 @@ impl Rpc {
         blocks: &[RawRpcBlock],
         req: &crate::types::DataRequest,
         spec: Option<SpeculativeReplay>,
+        session: Option<&UpstreamSession>,
     ) -> Result<TracesFetch> {
         // Skip genesis block (not traceable)
         let traceable: Vec<usize> = blocks
@@ -1576,7 +1606,9 @@ impl Rpc {
             async {
                 // Debug frames (callTracer)
                 if req.traces && !req.use_trace_api {
-                    self.fetch_debug_frames(&trace_blocks, req).await.map(Some)
+                    self.fetch_debug_frames(&trace_blocks, req, session)
+                        .await
+                        .map(Some)
                 } else {
                     Ok(None)
                 }
@@ -1585,7 +1617,7 @@ impl Rpc {
                 async {
                     // Debug state diffs (prestateTracer)
                     if req.state_diffs && req.use_debug_api_for_state_diffs {
-                        self.fetch_debug_state_diffs(&trace_blocks, req)
+                        self.fetch_debug_state_diffs(&trace_blocks, req, session)
                             .await
                             .map(Some)
                     } else {
@@ -1613,7 +1645,7 @@ impl Rpc {
                                     return Ok(Some(vec![Ok(replays)]));
                                 }
                             }
-                            self.fetch_trace_replays(&trace_blocks, &tracers)
+                            self.fetch_trace_replays(&trace_blocks, &tracers, session)
                                 .await
                                 .map(Some)
                         } else {
@@ -1623,7 +1655,9 @@ impl Rpc {
                     async {
                         // trace_block (use_trace_api without statediff)
                         if req.traces && req.use_trace_api && !need_replay_statediff {
-                            self.fetch_trace_block(&trace_blocks).await.map(Some)
+                            self.fetch_trace_block(&trace_blocks, session)
+                                .await
+                                .map(Some)
                         } else {
                             Ok(None)
                         }
@@ -1691,6 +1725,7 @@ impl Rpc {
         &self,
         blocks: &[&RawRpcBlock],
         req: &crate::types::DataRequest,
+        session: Option<&UpstreamSession>,
     ) -> Result<Vec<Component<Vec<Option<DebugFrameResult>>>>> {
         let timeout = req
             .debug_trace_timeout
@@ -1722,23 +1757,9 @@ impl Rpc {
             })
             .collect();
 
-        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> =
-            Box::new(|info: &RpcErrorInfo| {
-                if info.message.contains("not found") {
-                    return Ok(Value::Null);
-                }
-                if info.message.contains("cannot query unfinalized data") {
-                    return Ok(Value::Null);
-                }
-                Err(RpcError::Rpc {
-                    code: info.code,
-                    message: info.message.clone(),
-                    data: info.data.clone(),
-                })
-            });
-
         let options = CallOptions {
-            validate_error: Some(validate_error),
+            validate_error: Some(upstream_faults::validator(Leg::Trace)),
+            session: session.cloned(),
             ..Default::default()
         };
 
@@ -1794,6 +1815,7 @@ impl Rpc {
         &self,
         blocks: &[&RawRpcBlock],
         req: &crate::types::DataRequest,
+        session: Option<&UpstreamSession>,
     ) -> Result<Vec<Component<Vec<Option<DebugStateDiffResult>>>>> {
         let timeout = req
             .debug_trace_timeout
@@ -1825,23 +1847,9 @@ impl Rpc {
             })
             .collect();
 
-        let validate_error: Box<dyn Fn(&RpcErrorInfo) -> Result<Value, RpcError> + Send + Sync> =
-            Box::new(|info: &RpcErrorInfo| {
-                if info.message.contains("not found") {
-                    return Ok(Value::Null);
-                }
-                if info.message.contains("cannot query unfinalized data") {
-                    return Ok(Value::Null);
-                }
-                Err(RpcError::Rpc {
-                    code: info.code,
-                    message: info.message.clone(),
-                    data: info.data.clone(),
-                })
-            });
-
         let options = CallOptions {
-            validate_error: Some(validate_error),
+            validate_error: Some(upstream_faults::validator(Leg::Trace)),
+            session: session.cloned(),
             ..Default::default()
         };
 
@@ -1976,6 +1984,7 @@ impl Rpc {
         &self,
         blocks: &[&RawRpcBlock],
         tracers: &[&str],
+        session: Option<&UpstreamSession>,
     ) -> Result<Vec<Component<Vec<TraceTransactionReplay>>>> {
         let tracers_json: Vec<Value> = tracers.iter().map(|&t| json!(t)).collect();
 
@@ -1991,9 +2000,13 @@ impl Rpc {
             })
             .collect();
 
+        let options = CallOptions {
+            session: session.cloned(),
+            ..Default::default()
+        };
         let results = self
             .client
-            .batch_call_reduce_on_retry(calls, &CallOptions::default())
+            .batch_call_reduce_on_retry(calls, &options)
             .await?;
 
         let mut out = Vec::with_capacity(results.len());
@@ -2009,6 +2022,7 @@ impl Rpc {
     async fn fetch_trace_block(
         &self,
         blocks: &[&RawRpcBlock],
+        session: Option<&UpstreamSession>,
     ) -> Result<Vec<Component<Vec<TraceTransactionReplay>>>> {
         // Hash-addressed trace_block is not portable: some providers accept it
         // but return reward-only frames. Use the number, then bind every frame
@@ -2018,9 +2032,13 @@ impl Rpc {
             .map(|b| ("trace_block".to_string(), Some(json!([to_qty(b.number)]))))
             .collect();
 
+        let options = CallOptions {
+            session: session.cloned(),
+            ..Default::default()
+        };
         let results = self
             .client
-            .batch_call_reduce_on_retry(calls, &CallOptions::default())
+            .batch_call_reduce_on_retry(calls, &options)
             .await?;
 
         let mut out = Vec::with_capacity(results.len());

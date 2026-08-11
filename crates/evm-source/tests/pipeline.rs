@@ -133,7 +133,7 @@ async fn run_cassette(cassette: Value, req: DataRequest) -> NormalizedBlock {
     };
     let rpc = Arc::new(Rpc::new(client, RpcOptions::default()));
     let blocks = rpc
-        .get_block_batch(&[block_number], &req)
+        .get_block_batch(&[block_number], &req, None)
         .await
         .expect("get_block_batch");
     assert_eq!(blocks.len(), 1, "block fetched from cassette");

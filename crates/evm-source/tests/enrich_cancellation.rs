@@ -163,7 +163,7 @@ async fn enrich_error(
     };
     let rpc = Arc::new(Rpc::new(client, RpcOptions::default()));
 
-    match tokio::time::timeout(PATIENCE, rpc.enrich_blocks(blocks, &req)).await {
+    match tokio::time::timeout(PATIENCE, rpc.enrich_blocks(blocks, &req, None)).await {
         Err(_) => panic!("enrichment waited on a leg below the failure instead of returning"),
         Ok(Ok(_)) => panic!("expected the failing leg to surface an error"),
         Ok(Err(e)) => format!("{e:#}"),

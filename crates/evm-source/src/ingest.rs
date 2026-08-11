@@ -10,12 +10,13 @@ use futures::stream::StreamExt;
 use tokio::time::sleep;
 use tracing::warn;
 
-use crate::fetch::{Rpc, SpeculativeReplay, P_ENRICH_DELAY, P_ENRICH_RETRIES};
+use crate::fetch::{HeadPoll, Rpc, SpeculativeReplay, P_ENRICH_DELAY, P_ENRICH_RETRIES};
 use crate::mapping::{map_raw_block, AcquisitionTimings};
 use crate::normalization::MappingOptions as NormOptions;
 use crate::rpc_data::RawRpcBlock;
 use crate::types::DataRequest;
 use data_service_core::{Block, BlockRef};
+use rpc_client::UpstreamSession;
 
 /// A batch of blocks with optional finalized head info.
 #[derive(Debug)]
@@ -245,7 +246,7 @@ async fn acquire_range_stride(
         "range acquisition requires at least one block number"
     );
 
-    let initial = match rpc.get_block_batch(numbers, req).await {
+    let initial = match rpc.get_block_batch(numbers, req, rpc.new_session()).await {
         Ok(blocks) => blocks,
         Err(error) => {
             return RangeAcquisition {
@@ -299,7 +300,7 @@ async fn acquire_range_stride(
             }
 
             candidate = match rpc
-                .get_block_batch(std::slice::from_ref(&number), req)
+                .get_block_batch(std::slice::from_ref(&number), req, rpc.new_session())
                 .await
             {
                 Ok(blocks) => blocks.into_iter().next(),
@@ -501,14 +502,16 @@ pub async fn ingest_range(
 
                 let spawn_enrich = |body: RawRpcBlock,
                                     acquired: Option<(Instant, u32, Instant)>,
-                                    spec: Option<SpeculativeReplay>|
+                                    spec: Option<SpeculativeReplay>,
+                                    session: Option<UpstreamSession>|
                  -> EnrichTask {
                     let rpc2 = rpc.clone();
                     let req2 = req.clone();
                     let opts2 = mapping_options.clone();
                     tokio::spawn(async move {
-                        let (enriched, profile) =
-                            rpc2.enrich_block_with_retry(body, &req2, spec).await?;
+                        let (enriched, profile) = rpc2
+                            .enrich_block_with_retry(body, &req2, spec, session)
+                            .await?;
                         let timings = acquired.map(|(poll_issued, null_polls, body_received)| {
                             vec![AcquisitionTimings {
                                 poll_issued,
@@ -567,7 +570,10 @@ pub async fn ingest_range(
                     }
 
                     let poll_at = Instant::now();
-                    match rpc.get_single_block(next_num).await? {
+                    // The backend that answers is the one that showed the
+                    // header, and so the only one whose receipts cannot lag it.
+                    let HeadPoll { block, session } = rpc.poll_head_block(next_num).await?;
+                    match block {
                         Some(body) if !body.is_invalid => {
                             let now = Instant::now();
                             // Handed to enrichment, not awaited here: the traces
@@ -616,7 +622,8 @@ pub async fn ingest_range(
                             let acquired =
                                 profile_block_timings.then_some((poll_at, null_polls, now));
                             null_polls = 0;
-                            pending.push_back((next_num, spawn_enrich(body, acquired, spec)));
+                            pending
+                                .push_back((next_num, spawn_enrich(body, acquired, spec, session)));
                             next_num += 1;
                         }
                         Some(body) => {

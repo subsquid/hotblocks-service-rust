@@ -193,7 +193,7 @@ async fn enrich_with_bet(bet: Bet) -> (RawRpcBlock, usize) {
     tokio::time::sleep(Duration::from_millis(60)).await;
 
     let (enriched, _) = rpc
-        .enrich_block_with_retry(block, &req, Some(wager))
+        .enrich_block_with_retry(block, &req, Some(wager), None)
         .await
         .expect("enrichment");
     (enriched, replays.load(Ordering::SeqCst))
