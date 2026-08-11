@@ -347,7 +347,7 @@ async fn test_enrich_retry_on_receipt_hash_mismatch() {
         receipts: true,
         ..Default::default()
     };
-    let enriched = tokio::time::timeout(
+    let (enriched, _profile) = tokio::time::timeout(
         Duration::from_secs(10),
         rpc.enrich_block_with_retry(body, &req),
     )
@@ -482,7 +482,7 @@ async fn not_ready_receipts_retry_without_refetching_header_or_traces() {
         use_trace_api: true,
         ..Default::default()
     };
-    let enriched = tokio::time::timeout(
+    let (enriched, _profile) = tokio::time::timeout(
         Duration::from_secs(10),
         rpc.enrich_block_with_retry(body, &req),
     )
@@ -623,7 +623,7 @@ async fn test_enrich_retry_on_null_receipts() {
         receipts: true,
         ..Default::default()
     };
-    let enriched = tokio::time::timeout(
+    let (enriched, _profile) = tokio::time::timeout(
         Duration::from_secs(10),
         rpc.enrich_block_with_retry(body, &req),
     )

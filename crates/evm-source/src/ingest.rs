@@ -11,7 +11,7 @@ use tokio::time::sleep;
 use tracing::warn;
 
 use crate::fetch::{Rpc, P_ENRICH_DELAY, P_ENRICH_RETRIES};
-use crate::mapping::map_raw_block;
+use crate::mapping::{map_raw_block, AcquisitionTimings};
 use crate::normalization::MappingOptions as NormOptions;
 use crate::rpc_data::RawRpcBlock;
 use crate::types::DataRequest;
@@ -119,12 +119,12 @@ impl Default for CadencePredictor {
 
 /// Map raw rpc blocks to core blocks using spawn_blocking for CPU work.
 ///
-/// `timings`: optional per-block `(body_received, enrich_done)` pairs — must
-/// have the same length as `raw_blocks` when `Some`.
+/// `timings`: optional per-block acquisition stamps — must have the same length
+/// as `raw_blocks` when `Some`.
 async fn map_blocks_cpu(
     raw_blocks: Vec<RawRpcBlock>,
     options: Arc<NormOptions>,
-    timings: Option<Vec<(std::time::Instant, std::time::Instant)>>,
+    timings: Option<Vec<AcquisitionTimings>>,
 ) -> Result<Vec<Block>> {
     if raw_blocks.is_empty() {
         return Ok(vec![]);
@@ -472,16 +472,27 @@ pub async fn ingest_range(
                 // reset this per-block budget: mixed-version upstreams may
                 // alternate a contradictory block with "not produced yet".
                 let mut incoherent_attempts: u32 = 0;
+                // Nulls spent on `next_num`. Only some of them are the block not
+                // existing yet; the rest, if any, are the provider saying so
+                // after it does. Nothing here can tell the two apart — that is
+                // what `detect-race` measures from outside.
+                let mut null_polls: u32 = 0;
 
-                let spawn_enrich = |body: RawRpcBlock, body_received: Option<Instant>| -> EnrichTask {
+                let spawn_enrich = |body: RawRpcBlock, acquired: Option<(Instant, u32, Instant)>| -> EnrichTask {
                     let rpc2 = rpc.clone();
                     let req2 = req.clone();
                     let opts2 = mapping_options.clone();
                     tokio::spawn(async move {
-                        let enriched = rpc2.enrich_block_with_retry(body, &req2).await?;
-                        let timings = body_received.map(|br| {
-                            let enrich_done = Instant::now();
-                            vec![(br, enrich_done)]
+                        let (enriched, profile) =
+                            rpc2.enrich_block_with_retry(body, &req2).await?;
+                        let timings = acquired.map(|(poll_issued, null_polls, body_received)| {
+                            vec![AcquisitionTimings {
+                                poll_issued,
+                                null_polls,
+                                body_received,
+                                enrich_done: Instant::now(),
+                                enrich_profile: profile,
+                            }]
                         });
                         map_blocks_cpu(vec![enriched], opts2, timings).await
                     })
@@ -550,8 +561,10 @@ pub async fn ingest_range(
                             if followed_empty_poll {
                                 last_arrival = Some(now);
                             }
-                            let body_received = if profile_block_timings { Some(now) } else { None };
-                            pending.push_back((next_num, spawn_enrich(body, body_received)));
+                            let acquired =
+                                profile_block_timings.then_some((poll_at, null_polls, now));
+                            null_polls = 0;
+                            pending.push_back((next_num, spawn_enrich(body, acquired)));
                             next_num += 1;
                         }
                         Some(body) => {
@@ -619,6 +632,7 @@ pub async fn ingest_range(
                             // drain a completed front task.
                             hot_streak = 0;
                             last_empty_poll = Some(poll_at);
+                            null_polls = null_polls.saturating_add(1);
                             consumer_blocked = Duration::ZERO;
                             // An exact OB-4 observation, not an absence of one:
                             // N does not exist and N-1 was delivered, so the

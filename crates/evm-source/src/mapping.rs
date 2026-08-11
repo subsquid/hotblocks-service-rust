@@ -2,11 +2,23 @@
 /// Mirrors evm-data-service/src/data-source/mapping.ts.
 use anyhow::Result;
 use bytes::Bytes;
-use data_service_core::{Block, BlockTimings};
+use data_service_core::{Block, BlockTimings, EnrichProfile};
 
 use crate::normalization::{map_rpc_block, MappingOptions};
 use crate::rpc_data::RawRpcBlock;
 use crate::types::qty2_u64;
+
+/// What acquisition measured before the CPU stages take over. `poll_issued` and
+/// `null_polls` describe the detecting call itself, which is the one segment
+/// the service never reported.
+#[derive(Clone, Copy, Debug)]
+pub struct AcquisitionTimings {
+    pub poll_issued: std::time::Instant,
+    pub null_polls: u32,
+    pub body_received: std::time::Instant,
+    pub enrich_done: std::time::Instant,
+    pub enrich_profile: EnrichProfile,
+}
 
 /// Map a raw RPC block to a core Block with zstd-compressed JSON line.
 ///
@@ -16,7 +28,7 @@ use crate::types::qty2_u64;
 pub fn map_raw_block(
     raw: &RawRpcBlock,
     options: &MappingOptions,
-    timings_in: Option<(std::time::Instant, std::time::Instant)>,
+    timings_in: Option<AcquisitionTimings>,
 ) -> Result<Block> {
     let normalized = map_rpc_block(raw, options);
 
@@ -43,10 +55,13 @@ pub fn map_raw_block(
     let number = qty2_u64(&raw.block.number);
     let timestamp = qty2_u64(&raw.block.timestamp) * 1000;
 
-    let timings = timings_in.and_then(|(body_received, enrich_done)| {
+    let timings = timings_in.and_then(|t| {
         Some(BlockTimings {
-            body_received,
-            enrich_done,
+            poll_issued: t.poll_issued,
+            null_polls: t.null_polls,
+            body_received: t.body_received,
+            enrich_done: t.enrich_done,
+            enrich_profile: t.enrich_profile,
             normalize_done: normalize_done?,
             compress_duration,
         })

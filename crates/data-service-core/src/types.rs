@@ -2,15 +2,49 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
+/// Where an enrichment spent its time.
+///
+/// `enrich_ms` alone cannot distinguish an upstream that is slow from a ladder
+/// that ran several times, nor say which leg the round waited on. Legs are
+/// issued concurrently, so their durations overlap and the largest is what the
+/// round actually cost; `waited` is ours, not the upstream's.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EnrichProfile {
+    /// Acquisition rounds. 1 means the first answer was usable.
+    pub attempts: u32,
+    /// Time slept between rounds, the retry ladder's own cost.
+    pub waited: Duration,
+    /// Per-leg elapsed of the round that finally succeeded. A leg not requested
+    /// stays zero.
+    pub logs: Duration,
+    pub receipts: Duration,
+    pub traces: Duration,
+}
+
+impl EnrichProfile {
+    /// What the round actually waited for, the legs being concurrent.
+    pub fn slowest_leg(&self) -> Duration {
+        self.logs.max(self.receipts).max(self.traces)
+    }
+}
+
 /// Per-block pipeline timing stamps.
 /// All fields are wall-clock `Instant` values except `compress_duration` which
 /// is measured inside `map_raw_block` and stored as a pre-computed `Duration`.
 #[derive(Clone, Debug)]
 pub struct BlockTimings {
+    /// When the poll that carried the body was issued. Everything before this
+    /// is the block not existing yet — or the provider saying so after it does,
+    /// which is what `null_polls` counts and no instrument here can separate.
+    pub poll_issued: Instant,
+    /// Null answers spent on this block's number before the body came back.
+    pub null_polls: u32,
     /// When the block body was returned by `get_single_block`.
     pub body_received: Instant,
     /// When `enrich_block_with_retry` finished.
     pub enrich_done: Instant,
+    /// How the span between the two above was spent.
+    pub enrich_profile: EnrichProfile,
     /// When JSON serialization + normalization finished (before zstd).
     pub normalize_done: Instant,
     /// How long the zstd compression step inside `map_raw_block` took.
