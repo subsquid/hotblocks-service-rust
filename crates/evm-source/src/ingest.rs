@@ -7,11 +7,10 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 #[cfg(test)]
 use futures::stream::StreamExt;
-use serde_json::Value;
 use tokio::time::sleep;
 use tracing::warn;
 
-use crate::fetch::{Rpc, P_ENRICH_DELAY, P_ENRICH_RETRIES};
+use crate::fetch::{Rpc, SpeculativeReplay, P_ENRICH_DELAY, P_ENRICH_RETRIES};
 use crate::mapping::{map_raw_block, AcquisitionTimings};
 use crate::normalization::MappingOptions as NormOptions;
 use crate::rpc_data::RawRpcBlock;
@@ -480,26 +479,23 @@ pub async fn ingest_range(
                 // what `detect-race` measures from outside.
                 let mut null_polls: u32 = 0;
 
-                // The replay asked by number from before the block exists. The
-                // window it is trying to hit closes ~30-50 ms after the head tag
-                // admits the block, so it has to be in flight before the body
-                // poll that detects it returns — hence one task per awaited
-                // number, started on the first poll for it rather than on
-                // arrival. `SPEC_BUDGET` bounds a bet that never pays off (a
-                // provider that answers only after the body lands); the join
-                // below bounds how long a late one may hold the pipeline.
+                // The window closes ~30-50 ms after the head tag admits the
+                // block, so the ask must already be in flight when the detecting
+                // poll returns — one task per awaited number, started on the
+                // first poll for it. The budget bounds a bet that never pays.
                 const SPEC_BUDGET: Duration = Duration::from_millis(600);
-                const SPEC_JOIN_WAIT: Duration = Duration::from_millis(100);
-                let spec_tracers = Rpc::replay_tracers(&req);
-                let mut spec_task: Option<(u64, tokio::task::JoinHandle<Option<Value>>)> = None;
+                let mut spec_task: Option<(u64, SpeculativeReplay)> = None;
 
-                let spawn_enrich = |body: RawRpcBlock, acquired: Option<(Instant, u32, Instant)>| -> EnrichTask {
+                let spawn_enrich = |body: RawRpcBlock,
+                                    acquired: Option<(Instant, u32, Instant)>,
+                                    spec: Option<SpeculativeReplay>|
+                 -> EnrichTask {
                     let rpc2 = rpc.clone();
                     let req2 = req.clone();
                     let opts2 = mapping_options.clone();
                     tokio::spawn(async move {
                         let (enriched, profile) =
-                            rpc2.enrich_block_with_retry(body, &req2).await?;
+                            rpc2.enrich_block_with_retry(body, &req2, spec).await?;
                         let timings = acquired.map(|(poll_issued, null_polls, body_received)| {
                             vec![AcquisitionTimings {
                                 poll_issued,
@@ -539,9 +535,7 @@ pub async fn ingest_range(
                         break;
                     }
 
-                    // Start the speculative replay for whatever we are waiting
-                    // on, once per number: re-entering the loop for the same
-                    // block must not re-issue it.
+                    // Once per number: re-entering the loop must not re-issue it.
                     if let Some(grain) = speculative_replay_grain {
                         if spec_task.as_ref().map(|(n, _)| *n) != Some(next_num) {
                             if let Some((_, stale)) = spec_task.take() {
@@ -557,30 +551,16 @@ pub async fn ingest_range(
                     match rpc.get_single_block(next_num).await? {
                         Some(body) if !body.is_invalid => {
                             let now = Instant::now();
-                            let mut body = body;
-                            // Bind it to the body that actually arrived. A
-                            // rejection here is ordinary — the traces leg simply
-                            // runs as it does today.
-                            if let Some((n, handle)) = spec_task.take() {
-                                if n == next_num {
-                                    let abort = handle.abort_handle();
-                                    match tokio::time::timeout(SPEC_JOIN_WAIT, handle).await {
-                                        Ok(Ok(Some(replay))) => {
-                                            rpc.adopt_speculative_replay(
-                                                &mut body,
-                                                replay,
-                                                &spec_tracers,
-                                            );
-                                        }
-                                        Ok(_) => {}
-                                        // Still polling: the bet lost, and the
-                                        // block must not wait on it.
-                                        Err(_) => abort.abort(),
-                                    }
-                                } else {
-                                    handle.abort();
+                            // Handed to enrichment, not awaited here: the traces
+                            // leg resolves it beside the receipts leg.
+                            let spec = match spec_task.take() {
+                                Some((n, bet)) if n == next_num => Some(bet),
+                                Some((_, stale)) => {
+                                    stale.abort();
+                                    None
                                 }
-                            }
+                                None => None,
+                            };
                             // A hit without a preceding null is catch-up. Its
                             // response spacing is RPC cadence, not block cadence,
                             // and must not become the rolling minimum.
@@ -617,7 +597,7 @@ pub async fn ingest_range(
                             let acquired =
                                 profile_block_timings.then_some((poll_at, null_polls, now));
                             null_polls = 0;
-                            pending.push_back((next_num, spawn_enrich(body, acquired)));
+                            pending.push_back((next_num, spawn_enrich(body, acquired, spec)));
                             next_num += 1;
                         }
                         Some(body) => {

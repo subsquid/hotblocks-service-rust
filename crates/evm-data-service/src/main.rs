@@ -178,7 +178,8 @@ struct Args {
 
     /// Ask the trace replay by number from before the block exists, at this
     /// grain in ms. Costs extra upstream asks per block; unset leaves it off.
-    #[arg(long, value_name = "MS")]
+    /// Zero is rejected: it would spin the poll against the upstream.
+    #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
     speculative_replay_grain_ms: Option<u64>,
 }
 

@@ -349,7 +349,7 @@ async fn test_enrich_retry_on_receipt_hash_mismatch() {
     };
     let (enriched, _profile) = tokio::time::timeout(
         Duration::from_secs(10),
-        rpc.enrich_block_with_retry(body, &req),
+        rpc.enrich_block_with_retry(body, &req, None),
     )
     .await
     .expect("enrich timed out")
@@ -484,7 +484,7 @@ async fn not_ready_receipts_retry_without_refetching_header_or_traces() {
     };
     let (enriched, _profile) = tokio::time::timeout(
         Duration::from_secs(10),
-        rpc.enrich_block_with_retry(body, &req),
+        rpc.enrich_block_with_retry(body, &req, None),
     )
     .await
     .expect("enrich timed out")
@@ -625,7 +625,7 @@ async fn test_enrich_retry_on_null_receipts() {
     };
     let (enriched, _profile) = tokio::time::timeout(
         Duration::from_secs(10),
-        rpc.enrich_block_with_retry(body, &req),
+        rpc.enrich_block_with_retry(body, &req, None),
     )
     .await
     .expect("enrich timed out")

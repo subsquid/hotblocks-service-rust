@@ -110,6 +110,7 @@ symbols in 15.
 | `--http-retry-internal-server-errors` | off | widen retryable classification (FM-23) |
 | `--finality-confirmation <n>` | unset | finality policy `offset(n)` (DEF-23) |
 | `--auto-adjust-finalized-head` | off | DEF-24, WP-24 |
+| `--speculative-replay-grain-ms <ms>` | unset (off) | poll grain for the number-addressed replay (IB-14); must be ≥ 1 — zero would spin the poll |
 | `--with-receipts` / `--with-traces` / `--with-statediffs` | off | data selection (DEF-22); receipts and logs are mutually exclusive acquisitions — receipts off ⇒ logs on |
 | `--use-trace-api`, `--use-debug-api-for-statediffs`, `--use-debug-trace-block-by-number` | off | EVM acquisition method choices |
 | `--verify-block-hash`, `--verify-tx-sender`, `--verify-tx-root`, `--verify-receipts-root`, `--verify-withdrawals-root`, `--verify-logs-bloom` | off | verification policy (DEF-25); each is applied per block, and its failure is incoherence (WP-11.4) |
@@ -151,7 +152,7 @@ The set is closed: a series outside it is a defect, and so is a missing one.
 |---|---|
 | `sqd_hotblocks_first_block`, `sqd_hotblocks_last_block`, `sqd_hotblocks_finalized_block`, `sqd_hotblocks_stored_blocks`, `sqd_hotblocks_window_excess` | OB-1 |
 | `sqd_hotblocks_commits_total`, `sqd_hotblocks_last_commit_timestamp_ms` | OB-2 |
-| `sqd_hotblocks_last_block_lag_ms`, `sqd_hotblocks_block_lag_ms`, `sqd_hotblocks_head_detection_gap_ms`, `sqd_hotblocks_head_interval_ms`, `sqd_hotblocks_enrichment_retries_total{reason=data_lagging\|header_contested\|incoherent}`, `sqd_hotblocks_speculative_replays_total{outcome=adopted\|rejected}` | OB-3 |
+| `sqd_hotblocks_last_block_lag_ms`, `sqd_hotblocks_block_lag_ms`, `sqd_hotblocks_head_detection_gap_ms`, `sqd_hotblocks_head_interval_ms`, `sqd_hotblocks_enrichment_retries_total{reason=data_lagging\|header_contested\|incoherent}`, `sqd_hotblocks_speculative_replays_total{outcome=adopted\|no_answer\|too_late\|unbound\|mismatch}` | OB-3 |
 | `sqd_hotblocks_upstream_head`, `sqd_hotblocks_upstream_finalized_head`, each with a `_timestamp_ms` companion; `sqd_hotblocks_upstream_requests_total{kind=single\|batch}`, `sqd_hotblocks_upstream_calls_total`, `sqd_hotblocks_upstream_errors_total{class}`, `sqd_hotblocks_upstream_retries_total{class}` | OB-4 |
 | `sqd_hotblocks_processing_time_ms`; `sqd_hotblocks_query_outcomes_total{class=window\|wait_empty\|backfill\|conflict\|error}` and `sqd_hotblocks_query_duration_ms{class}`; `sqd_hotblocks_response_truncations_total{cause=budget\|error\|disconnect}` | OB-5 |
 | `sqd_hotblocks_over_window`, `sqd_hotblocks_force_advances_total`, `sqd_hotblocks_force_advanced_past` | OB-6 |
@@ -208,6 +209,7 @@ Diagnostics and error text MUST NOT leak endpoint credentials (GAP-26).
 | traces (debug) | `debug_traceBlockByHash\|ByNumber` with `callTracer {onlyTopCall:false, withLog:true}`, timeout `P-DEBUG-TIMEOUT` |
 | traces (trace API) | exactly one per selection (GAP-17): `trace_block(qty)` or `trace_replayBlockTransactions(hash, [trace])` |
 | state diffs (trace API) | `trace_replayBlockTransactions(hash, [stateDiff])` |
+| replay, speculative (opt-in) | `trace_replayBlockTransactions(qty, [tracers])` polled from before the block exists. Additive: costs extra asks per block, and either supplies the replay leg or is discarded — never both. Adopted only if it covers every transaction *and* its frames name this block hash, since competing blocks at one height can share transactions |
 | state diffs (debug) | `debug_traceBlock*` with `prestateTracer {diffMode:true}` |
 | identity | `eth_chainId` (once; SHOULD gate FM-52) |
 

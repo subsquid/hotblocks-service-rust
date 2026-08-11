@@ -730,12 +730,12 @@ impl Metrics {
         let speculative_replays_total = CounterVec::new(
             Opts::new(
                 "sqd_hotblocks_speculative_replays_total",
-                "Speculative trace replays by whether they validated against the body",
+                "Speculative trace replays by outcome; every non-adopted arm is traffic spent for nothing",
             ),
             &["outcome"],
         )
         .unwrap();
-        for outcome in ["adopted", "rejected"] {
+        for outcome in ["adopted", "no_answer", "too_late", "unbound", "mismatch"] {
             speculative_replays_total.with_label_values(&[outcome]);
         }
 
@@ -1125,9 +1125,12 @@ impl Metrics {
             .inc();
     }
 
-    pub fn observe_speculative_replay(&self, adopted: bool) {
+    /// `outcome` is `adopted` or one of the miss kinds. Every miss is traffic
+    /// already spent, so the price of speculating is all of them together, not
+    /// the contradicted answers alone.
+    pub fn observe_speculative_replay(&self, outcome: &str) {
         self.speculative_replays_total
-            .with_label_values(&[if adopted { "adopted" } else { "rejected" }])
+            .with_label_values(&[outcome])
             .inc();
     }
 
