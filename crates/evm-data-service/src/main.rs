@@ -175,6 +175,30 @@ struct Args {
     /// Emit per-block pipeline timing logs (target=block_timing) for latency profiling
     #[arg(long)]
     profile_block_timings: bool,
+
+    /// Serve a block's logs/receipts/traces from the backend that answered
+    /// the poll which found it, where the upstream names one. An upstream that
+    /// names none runs exactly as it does with this off; `off` forces it.
+    #[arg(long, value_name = "mode", value_enum, default_value = "on")]
+    provider_affinity: ToggleArg,
+
+    /// Ask the trace replay by number from before the block exists, at this
+    /// grain in ms. Costs extra upstream asks per block; unset leaves it off.
+    /// Zero is rejected: it would spin the poll against the upstream.
+    #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(1..))]
+    speculative_replay_grain_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ToggleArg {
+    On,
+    Off,
+}
+
+impl ToggleArg {
+    fn is_on(self) -> bool {
+        self == ToggleArg::On
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -221,6 +245,7 @@ impl Args {
             finality_confirmation: self.finality_confirmation,
             finalized_head_ttl: None,
             not_ready_budget: None,
+            provider_affinity: Some(self.provider_affinity.is_on()),
             verify_block_hash: self.verify_block_hash,
             verify_tx_sender: self.verify_tx_sender,
             verify_tx_root: self.verify_tx_root,
@@ -297,6 +322,9 @@ async fn main() -> anyhow::Result<()> {
             stride_size: args.http_rpc_stride_size,
             stride_concurrency: args.http_rpc_stride_concurrency,
             profile_block_timings: args.profile_block_timings,
+            speculative_replay_grain: args
+                .speculative_replay_grain_ms
+                .map(std::time::Duration::from_millis),
         },
         Arc::clone(&metrics),
     );

@@ -24,6 +24,7 @@ covers the batch; individual ratifications link their ADR). `—` = no distinct 
 | P-ENRICH-DELAY | delay between re-acquisitions | 50 ms; the first individual fetch after a short batch is immediate | — |
 | P-NOT-READY-BUDGET | wall-clock budget for a head block whose data legitimately lags its header — null/short/foreign-hash receipts, empty logs against a non-zero bloom, a block gone absent on re-fetch (GAP-40) | 30 s (`RpcOptions::not_ready_budget`, no CLI); a hard bound — an in-flight re-fetch is cancelled at the deadline; exhaustion keeps the fail-loud session error | 30 s ⚠ |
 | P-NOT-READY-DELAY | delay between not-ready re-acquisitions | 100 ms (predecessor parity) | — |
+| P-PROVIDER-AFFINITY | serve a block's components from the backend that answered the poll which found it, where the upstream names one | on (`--provider-affinity on\|off`); whether it engages is a property of the upstream's answers, not of this switch, which only forces it off. Adds no request: the binding rides existing ones, and is redrawn only where a re-acquisition already re-fetches the header | — |
 | P-STALL-FREE-RETRIES | stalled-session restarts before backoff (WP-9) | 1 | — |
 | P-SESSION-BACKOFF | delay between stalled sessions | 30 s | — |
 | P-STALL-REINIT | stalled sessions before T1 re-seed | 6 (code gate `stalled > 5`) | — |

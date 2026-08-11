@@ -173,7 +173,7 @@ async fn try_acquire(
     }));
 
     Rpc::new(client, options)
-        .get_block_batch(&[NUMBER], &req)
+        .get_block_batch(&[NUMBER], &req, None)
         .await
 }
 

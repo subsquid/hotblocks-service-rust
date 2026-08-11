@@ -13,6 +13,7 @@ pub mod observability;
 pub mod rpc_data;
 pub mod source;
 pub mod types;
+pub mod upstream_faults;
 pub mod verification;
 
 pub use observability::MetricsRpcObserver;

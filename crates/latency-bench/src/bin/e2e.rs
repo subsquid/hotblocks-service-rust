@@ -131,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
             stride_size: 5,
             stride_concurrency: 5,
             profile_block_timings: true,
+            speculative_replay_grain: None,
         },
     );
 

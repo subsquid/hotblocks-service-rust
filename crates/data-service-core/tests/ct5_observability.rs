@@ -30,6 +30,7 @@ const REQUIRED_SERIES: &[&str] = &[
     "sqd_hotblocks_head_detection_gap_ms",
     "sqd_hotblocks_head_interval_ms",
     "sqd_hotblocks_enrichment_retries_total",
+    "sqd_hotblocks_speculative_replays_total",
     // OB-4 upstream
     "sqd_hotblocks_upstream_head",
     "sqd_hotblocks_upstream_head_timestamp_ms",
