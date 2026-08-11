@@ -102,6 +102,18 @@ impl CadencePredictor {
         };
         Duration::from_millis(sleep_ms.max(HOT_POLL_MS))
     }
+
+    /// Whether the next arrival is close enough to be worth watching for. A bet
+    /// on the block has to be in flight when it appears, and one opened outside
+    /// this window expires before then — spending its whole budget a full
+    /// interval early.
+    pub fn in_hot_window(&self, now: Instant) -> bool {
+        let (Some(last), Some(&floor_ms)) = (self.last_arrival, self.intervals.iter().min()) else {
+            // No cadence learned yet: every poll is a guess, so treat it as open.
+            return true;
+        };
+        floor_ms.saturating_sub(millis_since(now, last)) <= HOT_WINDOW_MS
+    }
 }
 
 /// Saturating, so a clock jump cannot wrap the prediction into a tight spin.
@@ -479,11 +491,12 @@ pub async fn ingest_range(
                 // what `detect-race` measures from outside.
                 let mut null_polls: u32 = 0;
 
-                // The window closes ~30-50 ms after the head tag admits the
-                // block, so the ask must already be in flight when the detecting
-                // poll returns — one task per awaited number, started on the
-                // first poll for it. The budget bounds a bet that never pays.
-                const SPEC_BUDGET: Duration = Duration::from_millis(600);
+                // The cheap window closes ~30-50 ms after the head tag admits the
+                // block, so the bet must already be polling when it appears. It
+                // therefore has to span the arrival, whose jitter runs p90 ≈ 1.3 s
+                // past the floor — this is what the extra asks per block buy, and
+                // the budget is the cap on them when a block never arrives.
+                const SPEC_BUDGET: Duration = Duration::from_millis(HOT_WINDOW_MS + 900);
                 let mut spec_task: Option<(u64, SpeculativeReplay)> = None;
 
                 let spawn_enrich = |body: RawRpcBlock,
@@ -535,15 +548,21 @@ pub async fn ingest_range(
                         break;
                     }
 
-                    // Once per number: re-entering the loop must not re-issue it.
+                    // A bet outlives neither its number nor the hot window: opened
+                    // on the first poll after the previous block it would expire a
+                    // whole interval before this one appears, having spent its
+                    // budget for nothing. Once per number, and only once the
+                    // arrival is near.
+                    if spec_task.as_ref().is_some_and(|(n, _)| *n != next_num) {
+                        if let Some((_, stale)) = spec_task.take() {
+                            stale.abort();
+                        }
+                    }
                     if let Some(grain) = speculative_replay_grain {
-                        if spec_task.as_ref().map(|(n, _)| *n) != Some(next_num) {
-                            if let Some((_, stale)) = spec_task.take() {
-                                stale.abort();
-                            }
+                        if spec_task.is_none() && cadence.in_hot_window(Instant::now()) {
                             spec_task = rpc
                                 .spawn_speculative_replay(next_num, &req, grain, SPEC_BUDGET)
-                                .map(|h| (next_num, h));
+                                .map(|bet| (next_num, bet));
                         }
                     }
 

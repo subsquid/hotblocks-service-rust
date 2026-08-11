@@ -242,3 +242,202 @@ async fn a_zero_grain_starts_no_bet() {
         )
         .is_none());
 }
+
+// ─── The bet's lifecycle, driven through the real ingest loop ────────────────
+
+/// Withholds each block until `delay_ms` after the previous one was served, so
+/// the loop has to sit in its cadence sleep the way it does on a real chain.
+/// Counts number-addressed replays, which only the bet issues.
+mod chain {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    pub struct Counts {
+        pub spec_replays: AtomicUsize,
+        pub adopted_leg: AtomicUsize,
+    }
+
+    pub struct Chain {
+        pub url: String,
+        pub counts: Arc<Counts>,
+    }
+
+    struct Clock {
+        started: Instant,
+        interval: Duration,
+    }
+
+    /// Block N becomes visible N intervals in, so a bet opened a whole interval
+    /// early expires before the block it is betting on exists.
+    pub async fn serve(interval: Duration, first: u64) -> Chain {
+        let counts = Arc::new(Counts {
+            spec_replays: AtomicUsize::new(0),
+            adopted_leg: AtomicUsize::new(0),
+        });
+        let clock = Arc::new(Mutex::new(Clock {
+            started: Instant::now(),
+            interval,
+        }));
+
+        async fn handler(
+            State((clock, counts, first)): State<(Arc<Mutex<Clock>>, Arc<Counts>, u64)>,
+            body: axum::body::Bytes,
+        ) -> impl IntoResponse {
+            let req: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+            let calls: Vec<Value> = match req.as_array() {
+                Some(b) => b.clone(),
+                None => vec![req.clone()],
+            };
+            let visible_through = {
+                let c = clock.lock().unwrap();
+                first + (c.started.elapsed().as_millis() as u64 / c.interval.as_millis() as u64)
+            };
+            let block = gnosis_block();
+            let mut out = Vec::new();
+            for c in &calls {
+                let id = c.get("id").cloned().unwrap_or(json!(1));
+                let method = c.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let p0 = c.get("params").and_then(|p| p.get(0)).cloned();
+                let asked = p0
+                    .as_ref()
+                    .and_then(|v| v.as_str())
+                    .filter(|s| s.starts_with("0x") && s.len() < 20)
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+                let result = match method {
+                    "eth_chainId" => json!("0x64"),
+                    "eth_getBlockByNumber" => match asked {
+                        Some(n) if n <= visible_through => block_at(&block, n),
+                        _ => Value::Null,
+                    },
+                    "trace_replayBlockTransactions" => {
+                        let by_hash = p0
+                            .as_ref()
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| s.len() == 66);
+                        if !by_hash {
+                            counts.spec_replays.fetch_add(1, Ordering::SeqCst);
+                        }
+                        match asked {
+                            Some(n) if n > visible_through => Value::Null,
+                            _ => {
+                                if !by_hash {
+                                    counts.adopted_leg.fetch_add(1, Ordering::SeqCst);
+                                }
+                                replay_for(&block, true)
+                            }
+                        }
+                    }
+                    "eth_getBlockReceipts" => json!([]),
+                    _ => Value::Null,
+                };
+                out.push(json!({"jsonrpc":"2.0","id":id,"result":result}));
+            }
+            let body = if out.len() == 1 && !req.is_array() {
+                serde_json::to_vec(&out[0]).unwrap()
+            } else {
+                serde_json::to_vec(&out).unwrap()
+            };
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+        }
+
+        let app =
+            Router::new()
+                .route("/", post(handler))
+                .with_state((clock, counts.clone(), first));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Chain {
+            url: format!("http://127.0.0.1:{}", addr.port()),
+            counts,
+        }
+    }
+
+    fn block_at(template: &RawRpcBlock, n: u64) -> Value {
+        let mut v = serde_json::to_value(&template.block).unwrap();
+        v["number"] = json!(format!("0x{n:x}"));
+        v
+    }
+}
+
+/// The bug this catches: the bet was opened on the first poll after the previous
+/// block, so on a chain with a real interval it spent its whole budget while the
+/// block did not yet exist and had expired by the time it appeared. Asserted on
+/// the adoption counter, because "an ask reached the upstream" is true either
+/// way — only adoption distinguishes a bet that was still alive.
+#[tokio::test]
+async fn the_bet_is_in_flight_when_the_block_appears() {
+    use data_service_core::metrics::Metrics;
+    use evm_source::ingest::ingest_range;
+    use evm_source::normalization::MappingOptions;
+    use futures::StreamExt;
+
+    const INTERVAL: Duration = Duration::from_millis(700);
+    let first = gnosis_block().number;
+    let chain = chain::serve(INTERVAL, first).await;
+
+    let metrics = Arc::new(Metrics::new());
+    let client = Arc::new(RpcClient::new(RpcClientConfig {
+        url: chain.url,
+        ..RpcClientConfig::default()
+    }));
+    let rpc = Arc::new(Rpc::new(client, RpcOptions::default()).with_metrics(metrics.clone()));
+
+    let mut stream = Box::pin(
+        ingest_range(
+            rpc,
+            Arc::new(traced_request()),
+            Arc::new(MappingOptions {
+                with_traces: true,
+                with_state_diffs: true,
+            }),
+            first,
+            Some(first + 6),
+            5,
+            5,
+            "latest",
+            false,
+            Some(Duration::from_millis(50)),
+        )
+        .await,
+    );
+
+    let mut served = 0usize;
+    tokio::select! {
+        _ = async { while let Some(b) = stream.next().await { served += b.unwrap().blocks.len(); } } => {}
+        _ = tokio::time::sleep(Duration::from_secs(12)) => {}
+    }
+
+    let adopted = adopted_count(&metrics);
+    assert!(
+        served >= 4,
+        "the chain should have advanced, served {served}"
+    );
+    // Catch-up blocks are visible the instant they are asked for, so a couple of
+    // adoptions prove nothing — a bet opened an interval early still caught those.
+    // Nearly every block adopting is what says the bet is alive at the arrival.
+    assert!(
+        adopted + 2 >= served as u64,
+        "only {adopted} of {served} blocks adopted a bet: it is expiring before \
+         the block it bets on appears"
+    );
+}
+
+fn adopted_count(metrics: &data_service_core::metrics::Metrics) -> u64 {
+    metrics
+        .gather_text()
+        .unwrap()
+        .lines()
+        .find(|l| {
+            l.starts_with("sqd_hotblocks_speculative_replays_total{") && l.contains("adopted")
+        })
+        .and_then(|l| l.rsplit(' ').next().map(str::to_string))
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| v as u64)
+        .unwrap_or(0)
+}
