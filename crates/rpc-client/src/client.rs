@@ -10,6 +10,7 @@ use tracing::warn;
 use crate::error::{RpcError, RpcErrorInfo};
 use crate::observer::{RequestKind, RpcObserver};
 use crate::rate::RateMeter;
+use crate::session::UpstreamSession;
 use crate::transport::ws::{WsTransport, DEFAULT_POOL_SIZE};
 use crate::transport::{HttpTransport, OwnedRpcRequest, RpcResponse, RpcTransport};
 
@@ -93,6 +94,10 @@ pub struct CallOptions {
     /// Hook called on an RPC error; may return `Ok(Value)` to override the error, or
     /// `Err(RpcError::RetryRequested(...))` to force retry.
     pub validate_error: Option<ErrorValidator>,
+    /// Which backend must serve this call, and where a new assignment lands.
+    /// Shared by every round trip a split batch fans out to, so the split
+    /// cannot break the binding. `None` sends what an unbound call sends.
+    pub session: Option<UpstreamSession>,
 }
 
 // ─── Rate state (interior mutability) ────────────────────────────────────────
@@ -343,7 +348,10 @@ impl RpcClient {
         };
 
         self.observed(|o| o.on_request(RequestKind::Single, 1));
-        let resp = self.transport.send_single(req, timeout).await?;
+        let resp = self
+            .transport
+            .send_single(req, timeout, options.session.as_ref())
+            .await?;
         self.process_response(resp, options)
     }
 
@@ -419,7 +427,10 @@ impl RpcClient {
         self.observed(|o| o.on_request(RequestKind::Batch, count));
         // The transport returns responses in request order (HTTP reorders via an
         // id→response map + length check; WS guarantees order by construction).
-        let responses = self.transport.send_batch(requests, timeout).await?;
+        let responses = self
+            .transport
+            .send_batch(requests, timeout, options.session.as_ref())
+            .await?;
 
         let results: Vec<_> = responses
             .into_iter()

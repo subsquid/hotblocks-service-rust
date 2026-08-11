@@ -40,6 +40,7 @@ use tracing::{debug, warn};
 
 use super::{OwnedRpcRequest, RpcResponse, RpcTransport};
 use crate::error::RpcError;
+use crate::session::UpstreamSession;
 
 /// TCP keepalive on the underlying WS socket. Matches the HTTP client's 30s.
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
@@ -592,10 +593,13 @@ async fn await_with_timeout<T>(
 
 #[async_trait]
 impl RpcTransport for WsTransport {
+    /// A socket is already pinned to whoever accepted it, so `session` has
+    /// nothing to name and nothing to replay.
     async fn send_single(
         &self,
         req: OwnedRpcRequest,
         timeout: Duration,
+        _session: Option<&UpstreamSession>,
     ) -> Result<RpcResponse, RpcError> {
         let conn = self.pick();
         let active = conn.get_active().await?;
@@ -629,6 +633,7 @@ impl RpcTransport for WsTransport {
         &self,
         reqs: Vec<OwnedRpcRequest>,
         timeout: Duration,
+        _session: Option<&UpstreamSession>,
     ) -> Result<Vec<RpcResponse>, RpcError> {
         if reqs.is_empty() {
             return Ok(vec![]);
