@@ -81,6 +81,9 @@ pub struct EvmRpcDataSourceOptions {
     pub stride_concurrency: usize,
     /// Emit per-block pipeline timing logs (target=block_timing) for latency profiling.
     pub profile_block_timings: bool,
+    /// Poll grain for the speculative, number-addressed trace replay. `None`
+    /// disables it and the feed spends no extra upstream asks.
+    pub speculative_replay_grain: Option<Duration>,
 }
 
 impl Default for EvmRpcDataSourceOptions {
@@ -91,6 +94,7 @@ impl Default for EvmRpcDataSourceOptions {
             stride_size: 5,
             stride_concurrency: 5,
             profile_block_timings: false,
+            speculative_replay_grain: None,
         }
     }
 }
@@ -103,6 +107,7 @@ pub struct EvmRpcDataSource {
     stride_size: usize,
     stride_concurrency: usize,
     profile_block_timings: bool,
+    speculative_replay_grain: Option<Duration>,
 }
 
 impl EvmRpcDataSource {
@@ -142,6 +147,7 @@ impl EvmRpcDataSource {
             stride_size: options.stride_size.max(1),
             stride_concurrency: options.stride_concurrency.max(1),
             profile_block_timings: options.profile_block_timings,
+            speculative_replay_grain: options.speculative_replay_grain,
         }
     }
 
@@ -157,6 +163,7 @@ impl EvmRpcDataSource {
         let stride_concurrency = self.stride_concurrency;
         let commitment = commitment.to_string();
         let profile_block_timings = self.profile_block_timings;
+        let speculative_replay_grain = self.speculative_replay_grain;
 
         let s = stream! {
             let mut inner = Box::pin(ingest_range(
@@ -169,6 +176,7 @@ impl EvmRpcDataSource {
                 stride_concurrency,
                 &commitment,
                 profile_block_timings,
+                speculative_replay_grain,
             ).await);
 
             while let Some(item) = inner.next().await {

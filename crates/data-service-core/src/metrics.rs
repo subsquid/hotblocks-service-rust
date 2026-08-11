@@ -441,6 +441,7 @@ pub struct Metrics {
     integrity_violations_total: Counter,
     session_restarts_total: CounterVec,
     enrichment_retries_total: CounterVec,
+    speculative_replays_total: CounterVec,
     acquisition_retry_exhaustions_total: Counter,
     fork_rebases_total: Counter,
     watermark_regressions_total: Counter,
@@ -723,6 +724,21 @@ impl Metrics {
         )
         .unwrap();
 
+        // Adopted vs rejected. The rejected share is what the speculative ask
+        // costs for nothing, so it is the number that decides whether the
+        // extra upstream traffic is worth keeping on.
+        let speculative_replays_total = CounterVec::new(
+            Opts::new(
+                "sqd_hotblocks_speculative_replays_total",
+                "Speculative trace replays by whether they validated against the body",
+            ),
+            &["outcome"],
+        )
+        .unwrap();
+        for outcome in ["adopted", "rejected"] {
+            speculative_replays_total.with_label_values(&[outcome]);
+        }
+
         let acquisition_retry_exhaustions_total = Counter::with_opts(Opts::new(
             "sqd_hotblocks_acquisition_retry_exhaustions_total",
             "Blocks that exhausted their whole-block re-acquisition budget (WP-11.3)",
@@ -812,6 +828,7 @@ impl Metrics {
             Box::new(integrity_violations_total.clone()),
             Box::new(session_restarts_total.clone()),
             Box::new(enrichment_retries_total.clone()),
+            Box::new(speculative_replays_total.clone()),
             Box::new(acquisition_retry_exhaustions_total.clone()),
             Box::new(fork_rebases_total.clone()),
             Box::new(watermark_regressions_total.clone()),
@@ -884,6 +901,7 @@ impl Metrics {
             integrity_violations_total,
             session_restarts_total,
             enrichment_retries_total,
+            speculative_replays_total,
             acquisition_retry_exhaustions_total,
             fork_rebases_total,
             watermark_regressions_total,
@@ -1104,6 +1122,12 @@ impl Metrics {
     pub fn record_enrichment_retry(&self, reason: EnrichmentRetry) {
         self.enrichment_retries_total
             .with_label_values(&[reason.as_str()])
+            .inc();
+    }
+
+    pub fn observe_speculative_replay(&self, adopted: bool) {
+        self.speculative_replays_total
+            .with_label_values(&[if adopted { "adopted" } else { "rejected" }])
             .inc();
     }
 

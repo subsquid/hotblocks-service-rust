@@ -1768,6 +1768,127 @@ impl Rpc {
         Ok(out)
     }
 
+    /// The replay's tracer selection, shared with `fetch_traces` so a
+    /// speculatively-fetched replay is validated against the same tracer set it
+    /// would have been fetched with. Empty = the replay does not run for `req`.
+    pub fn replay_tracers(req: &crate::types::DataRequest) -> Vec<&'static str> {
+        let statediff = req.state_diffs && !req.use_debug_api_for_state_diffs;
+        let trace = req.traces && req.use_trace_api && statediff;
+        let mut tracers = Vec::new();
+        if trace {
+            tracers.push("trace");
+        }
+        if statediff {
+            tracers.push("stateDiff");
+        }
+        tracers
+    }
+
+    /// Poll `trace_replayBlockTransactions` by *number* from before the block
+    /// exists, returning the first answer that is a non-empty array.
+    ///
+    /// Number-addressed on purpose: there is no hash to bind to yet. That gives
+    /// up the reorg binding `fetch_trace_replays` relies on, which is why the
+    /// caller must put the answer through `replays_of` against the real body —
+    /// a replay of a different block fails its per-transaction hash check and
+    /// is discarded. An empty array is not distinguishable from not-imported,
+    /// so it is never adopted; empty blocks take the ordinary path and their
+    /// replay is trivial anyway.
+    async fn poll_speculative_replay(
+        &self,
+        number: u64,
+        tracers: &[&str],
+        grain: Duration,
+        budget: Duration,
+    ) -> Option<Value> {
+        let tracers_json: Vec<Value> = tracers.iter().map(|&t| json!(t)).collect();
+        let params = json!([format!("0x{number:x}"), tracers_json]);
+        let deadline = Instant::now() + budget;
+        loop {
+            // Fail fast: a pre-existence answer is an ordinary error and the
+            // grain below is our retry ladder. The client's own ladder would
+            // sleep past the window this is trying to hit.
+            let options = CallOptions {
+                retry_attempts: Some(0),
+                timeout: Some(budget),
+                ..CallOptions::default()
+            };
+            if let Ok(Value::Array(arr)) = self
+                .client
+                .call(
+                    "trace_replayBlockTransactions",
+                    Some(params.clone()),
+                    options,
+                )
+                .await
+            {
+                if !arr.is_empty() {
+                    return Some(Value::Array(arr));
+                }
+            }
+            let now = Instant::now();
+            if now + grain >= deadline {
+                return None;
+            }
+            tokio::time::sleep(grain).await;
+        }
+    }
+
+    /// Start the speculative replay for `number` beside the body poll. `None`
+    /// when the replay does not run for `req` at all, so the caller spends
+    /// nothing on chains configured without it.
+    pub fn spawn_speculative_replay(
+        self: &Arc<Self>,
+        number: u64,
+        req: &crate::types::DataRequest,
+        grain: Duration,
+        budget: Duration,
+    ) -> Option<tokio::task::JoinHandle<Option<Value>>> {
+        let tracers = Self::replay_tracers(req);
+        if tracers.is_empty() || number == 0 {
+            return None;
+        }
+        let rpc = self.clone();
+        Some(tokio::spawn(async move {
+            rpc.poll_speculative_replay(number, &tracers, grain, budget)
+                .await
+        }))
+    }
+
+    /// Bind a speculative replay to the body that finally arrived. Returns true
+    /// when it validated and was adopted, leaving the traces leg with nothing
+    /// left to fetch; false leaves `body` untouched and the ordinary
+    /// hash-addressed path runs.
+    pub fn adopt_speculative_replay(
+        &self,
+        body: &mut RawRpcBlock,
+        replay: Value,
+        tracers: &[&str],
+    ) -> bool {
+        match replays_of(Ok(replay), body, tracers, "speculative trace replays") {
+            Ok(replays) => {
+                body.trace_replays = Some(replays);
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.observe_speculative_replay(true);
+                }
+                true
+            }
+            Err(reason) => {
+                // Not an error: a miss costs only the asks already spent. The
+                // body is deliberately left clean so the ordinary path reruns.
+                tracing::debug!(
+                    block_number = body.number,
+                    reason,
+                    "speculative replay rejected, falling back"
+                );
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.observe_speculative_replay(false);
+                }
+                false
+            }
+        }
+    }
+
     async fn fetch_trace_replays(
         &self,
         blocks: &[&RawRpcBlock],

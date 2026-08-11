@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 #[cfg(test)]
 use futures::stream::StreamExt;
+use serde_json::Value;
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -323,6 +324,7 @@ pub async fn ingest_range(
     stride_concurrency: usize,
     commitment: &str, // "finalized" or "latest"
     profile_block_timings: bool,
+    speculative_replay_grain: Option<Duration>,
 ) -> impl futures::Stream<Item = Result<IngestBatch>> {
     let commitment = commitment.to_string();
 
@@ -478,6 +480,19 @@ pub async fn ingest_range(
                 // what `detect-race` measures from outside.
                 let mut null_polls: u32 = 0;
 
+                // The replay asked by number from before the block exists. The
+                // window it is trying to hit closes ~30-50 ms after the head tag
+                // admits the block, so it has to be in flight before the body
+                // poll that detects it returns — hence one task per awaited
+                // number, started on the first poll for it rather than on
+                // arrival. `SPEC_BUDGET` bounds a bet that never pays off (a
+                // provider that answers only after the body lands); the join
+                // below bounds how long a late one may hold the pipeline.
+                const SPEC_BUDGET: Duration = Duration::from_millis(600);
+                const SPEC_JOIN_WAIT: Duration = Duration::from_millis(100);
+                let spec_tracers = Rpc::replay_tracers(&req);
+                let mut spec_task: Option<(u64, tokio::task::JoinHandle<Option<Value>>)> = None;
+
                 let spawn_enrich = |body: RawRpcBlock, acquired: Option<(Instant, u32, Instant)>| -> EnrichTask {
                     let rpc2 = rpc.clone();
                     let req2 = req.clone();
@@ -524,10 +539,48 @@ pub async fn ingest_range(
                         break;
                     }
 
+                    // Start the speculative replay for whatever we are waiting
+                    // on, once per number: re-entering the loop for the same
+                    // block must not re-issue it.
+                    if let Some(grain) = speculative_replay_grain {
+                        if spec_task.as_ref().map(|(n, _)| *n) != Some(next_num) {
+                            if let Some((_, stale)) = spec_task.take() {
+                                stale.abort();
+                            }
+                            spec_task = rpc
+                                .spawn_speculative_replay(next_num, &req, grain, SPEC_BUDGET)
+                                .map(|h| (next_num, h));
+                        }
+                    }
+
                     let poll_at = Instant::now();
                     match rpc.get_single_block(next_num).await? {
                         Some(body) if !body.is_invalid => {
                             let now = Instant::now();
+                            let mut body = body;
+                            // Bind it to the body that actually arrived. A
+                            // rejection here is ordinary — the traces leg simply
+                            // runs as it does today.
+                            if let Some((n, handle)) = spec_task.take() {
+                                if n == next_num {
+                                    let abort = handle.abort_handle();
+                                    match tokio::time::timeout(SPEC_JOIN_WAIT, handle).await {
+                                        Ok(Ok(Some(replay))) => {
+                                            rpc.adopt_speculative_replay(
+                                                &mut body,
+                                                replay,
+                                                &spec_tracers,
+                                            );
+                                        }
+                                        Ok(_) => {}
+                                        // Still polling: the bet lost, and the
+                                        // block must not wait on it.
+                                        Err(_) => abort.abort(),
+                                    }
+                                } else {
+                                    handle.abort();
+                                }
+                            }
                             // A hit without a preceding null is catch-up. Its
                             // response spacing is RPC cadence, not block cadence,
                             // and must not become the rolling minimum.
@@ -916,6 +969,7 @@ mod tests {
             3,
             "finalized",
             false,
+            None,
         )
         .await
     }

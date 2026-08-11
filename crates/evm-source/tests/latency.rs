@@ -763,7 +763,7 @@ async fn test_speculative_two_blocks_emitted_in_order() {
     });
 
     let mut stream =
-        Box::pin(ingest_range(rpc, req, opts, 100, Some(101), 5, 5, "latest", false).await);
+        Box::pin(ingest_range(rpc, req, opts, 100, Some(101), 5, 5, "latest", false, None).await);
 
     let mut all_block_numbers: Vec<u64> = Vec::new();
     // Collect with timeout to avoid hanging
@@ -885,6 +885,7 @@ async fn absent_head_answers_do_not_reset_the_incoherence_budget() {
             5,
             "latest",
             false,
+            None,
         )
         .await,
     );
@@ -1010,6 +1011,7 @@ async fn head_incoherence_remains_the_primary_error_when_pending_enrichment_fail
             5,
             "latest",
             false,
+            None,
         )
         .await,
     );

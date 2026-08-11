@@ -151,7 +151,7 @@ The set is closed: a series outside it is a defect, and so is a missing one.
 |---|---|
 | `sqd_hotblocks_first_block`, `sqd_hotblocks_last_block`, `sqd_hotblocks_finalized_block`, `sqd_hotblocks_stored_blocks`, `sqd_hotblocks_window_excess` | OB-1 |
 | `sqd_hotblocks_commits_total`, `sqd_hotblocks_last_commit_timestamp_ms` | OB-2 |
-| `sqd_hotblocks_last_block_lag_ms`, `sqd_hotblocks_block_lag_ms`, `sqd_hotblocks_head_detection_gap_ms`, `sqd_hotblocks_head_interval_ms`, `sqd_hotblocks_enrichment_retries_total{reason=data_lagging\|header_contested\|incoherent}` | OB-3 |
+| `sqd_hotblocks_last_block_lag_ms`, `sqd_hotblocks_block_lag_ms`, `sqd_hotblocks_head_detection_gap_ms`, `sqd_hotblocks_head_interval_ms`, `sqd_hotblocks_enrichment_retries_total{reason=data_lagging\|header_contested\|incoherent}`, `sqd_hotblocks_speculative_replays_total{outcome=adopted\|rejected}` | OB-3 |
 | `sqd_hotblocks_upstream_head`, `sqd_hotblocks_upstream_finalized_head`, each with a `_timestamp_ms` companion; `sqd_hotblocks_upstream_requests_total{kind=single\|batch}`, `sqd_hotblocks_upstream_calls_total`, `sqd_hotblocks_upstream_errors_total{class}`, `sqd_hotblocks_upstream_retries_total{class}` | OB-4 |
 | `sqd_hotblocks_processing_time_ms`; `sqd_hotblocks_query_outcomes_total{class=window\|wait_empty\|backfill\|conflict\|error}` and `sqd_hotblocks_query_duration_ms{class}`; `sqd_hotblocks_response_truncations_total{cause=budget\|error\|disconnect}` | OB-5 |
 | `sqd_hotblocks_over_window`, `sqd_hotblocks_force_advances_total`, `sqd_hotblocks_force_advanced_past` | OB-6 |

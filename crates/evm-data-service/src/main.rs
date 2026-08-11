@@ -175,6 +175,11 @@ struct Args {
     /// Emit per-block pipeline timing logs (target=block_timing) for latency profiling
     #[arg(long)]
     profile_block_timings: bool,
+
+    /// Ask the trace replay by number from before the block exists, at this
+    /// grain in ms. Costs extra upstream asks per block; unset leaves it off.
+    #[arg(long, value_name = "MS")]
+    speculative_replay_grain_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -297,6 +302,9 @@ async fn main() -> anyhow::Result<()> {
             stride_size: args.http_rpc_stride_size,
             stride_concurrency: args.http_rpc_stride_concurrency,
             profile_block_timings: args.profile_block_timings,
+            speculative_replay_grain: args
+                .speculative_replay_grain_ms
+                .map(std::time::Duration::from_millis),
         },
         Arc::clone(&metrics),
     );
